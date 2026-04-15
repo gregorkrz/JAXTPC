@@ -153,6 +153,56 @@ signals = simulator.forward_segments(params, positions_mm, de, dx=5.0)
 - **Threaded production**: Overlapped GPU simulation with CPU save workers
 - **Production profiler**: Auto-tune total_pad, chunk sizes, max_keys from data
 
+## Sobolev Loss
+
+The Sobolev loss (`tools/losses.py`) is a spectral loss designed for gradient-based optimisation of physics parameters. It measures the $H^{-s}$ Sobolev norm of the normalised difference between a simulated signal $A$ and a target signal $B$.
+
+### Definition
+
+For a single wire plane the loss is computed via a single 2D FFT using Parseval's theorem:
+
+$$\mathcal{L}(A, B) = \frac{1}{N} \sum_{\mathbf{f}} \left|\hat{D}(\mathbf{f})\right|^2 W(\mathbf{f})$$
+
+where $D = (A - B)\,/\,\|B\|_1$ is the $\ell^1$-normalised difference (making the loss dimensionless), $\hat{D}$ is its 2D DFT, $N$ is the total number of frequency bins, and the spectral weight is:
+
+$$W(\mathbf{f}) = \frac{1}{\left(|\mathbf{f}|^2 + \varepsilon\right)^s}$$
+
+The default exponent is $s = 2$, giving an $H^{-2}$ norm. This approximates the squared Wasserstein-2 distance $W_2^2$ for small perturbations (Peyré 2018), making the loss sensitive to *spatial displacements* of charge rather than purely pointwise amplitude differences.
+
+### Screening length
+
+The regularisation parameter $\varepsilon$ is set by the zero-padding length $L = \texttt{max\_pad}/2$:
+
+$$\varepsilon = \frac{1}{\pi^2 L^2}$$
+
+This ensures the implicit spatial kernel decays to $\sim 2\%$ at the periodic boundary, preventing wrap-around artefacts. With `max_pad=128` (the optimisation default), the screening length is $L = 64$ pixels; the loss provides near-constant-magnitude gradients for mismatches up to distance $L$ and exponentially decaying gradients beyond.
+
+### Exponent guide
+
+| $s$ | Loss growth with displacement $d$ | Gradient magnitude | Analogy |
+|-----|-----------------------------------|--------------------|---------|
+| 1   | $\sim \log d$                     | $\sim 1/d$         | $H^{-1}$, Laplacian |
+| 3/2 | $\sim d$                          | constant           | $W_1$-like |
+| 2   | $\sim d^2$                        | $\sim d$           | $W_2^2$-like |
+
+### Parameter sensitivity
+
+Because the $H^{-s}$ weight amplifies low spatial frequencies, the Sobolev loss is strongly sensitive to **geometric shifts** (controlled by drift velocity) and relatively insensitive to **amplitude scaling** (controlled by electron lifetime). For lifetime recovery, MSE or L1 losses (which treat all frequencies equally) complement the Sobolev loss.
+
+### Usage
+
+```python
+from tools.losses import sobolev_loss_single, make_sobolev_weight
+
+# Precompute spectral weight once per plane shape (outside JIT)
+weight = make_sobolev_weight(H, W, max_pad=128, s=2.0)
+
+# Inside a differentiable loss function
+loss = sobolev_loss_single(pred_plane, target_plane, weight)
+```
+
+The total loss over all wire planes is `sum(sobolev_loss_single(...) for each plane)`.
+
 ## Architecture
 
 ### Local Coordinates
