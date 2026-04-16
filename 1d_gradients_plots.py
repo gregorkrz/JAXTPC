@@ -98,8 +98,8 @@ def make_figure(track_name, param_data, output_dir, N):
         return
 
     fig, axes = plt.subplots(
-        n_rows, 3,
-        figsize=(17, 4.5 * n_rows),
+        n_rows, 4,
+        figsize=(22, 4.5 * n_rows),
         squeeze=False,
     )
 
@@ -122,6 +122,7 @@ def make_figure(track_name, param_data, output_dir, N):
         ax_grad     = axes[row, 0]
         ax_grad_abs = axes[row, 1]
         ax_loss     = axes[row, 2]
+        ax_time     = axes[row, 3]
 
         param_gt = None
         for fi, (loss_name, result) in enumerate(sorted(loss_data.items())):
@@ -142,17 +143,14 @@ def make_figure(track_name, param_data, output_dir, N):
             abs_grads = np.abs(grads)
             pos_mask  = grads >= 0
             neg_mask  = ~pos_mask
-            # connecting line through all points
             ax_grad_abs.plot(xvals, abs_grads,
                              color=style['color'], ls=style['ls'],
                              lw=1.8, zorder=1)
-            # positive-gradient points
             if pos_mask.any():
                 ax_grad_abs.scatter(xvals[pos_mask], abs_grads[pos_mask],
                                     marker='^', s=55, color=style['color'],
                                     zorder=2,
                                     label=f'{style["label"]} (+)')
-            # negative-gradient points
             if neg_mask.any():
                 ax_grad_abs.scatter(xvals[neg_mask], abs_grads[neg_mask],
                                     marker='v', s=55, color=style['color'],
@@ -165,6 +163,15 @@ def make_figure(track_name, param_data, output_dir, N):
                          color=style['color'], ls=style['ls'],
                          marker='o', markersize=5, lw=1.8,
                          label=style['label'])
+
+            # Col 3: histogram of grad compute times (skip first = cold start)
+            raw_times = result.get('grad_times_s')
+            if raw_times and len(raw_times) > 1:
+                times_ms = np.array(raw_times[1:]) * 1e3
+                ax_time.hist(times_ms, bins='auto',
+                             color=style['color'], alpha=0.6,
+                             edgecolor='white', linewidth=0.5,
+                             label=style['label'])
 
         if param_gt is not None:
             for ax in (ax_grad, ax_grad_abs, ax_loss):
@@ -194,6 +201,12 @@ def make_figure(track_name, param_data, output_dir, N):
         ax_loss.set_title(f'{param_name}  —  loss')
         ax_loss.legend(fontsize=8)
         ax_loss.grid(True, which='both', alpha=0.3)
+
+        ax_time.set_xlabel('time  (ms)')
+        ax_time.set_ylabel('count')
+        ax_time.set_title(f'{param_name}  —  grad compute time\n(first point excluded)')
+        ax_time.legend(fontsize=8)
+        ax_time.grid(True, alpha=0.3)
 
     fig.tight_layout()
 
