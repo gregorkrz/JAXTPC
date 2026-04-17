@@ -1,10 +1,10 @@
 #!/usr/bin/env python
 """
-Two-parameter gradient-based optimization starting from a (2N+1)×(2N+1) grid
-of ±RANGE_FRAC starting points around the ground truth.
+Two-parameter gradient-based optimization with N random starting points
+sampled uniformly from [0.95, 1.05] × [0.95, 1.05] relative to the GT.
 
-For each grid point and M independent trials, runs a gradient-based optimizer
-and records the full parameter + loss trajectory at every step.
+For each random starting point, runs a gradient-based optimizer and records
+the full parameter + loss trajectory at every step.
 
 Default parameter pairs
 -----------------------
@@ -23,15 +23,15 @@ Supported optimizers
 
 Output (one file per pair × loss)
 ----------------------------------
-    results/2d_opt/{loss}_N{N}_M{M}_{optimizer}_{param1}+{param2}_{track}.pkl
+    results/2d_opt/{loss}_N{N}_{optimizer}_{param1}+{param2}_{track}.pkl
 
 Each pickle contains:
     param_names, param_gts, scales, p_n_gts,
-    optimizer, lr, max_steps, tol, patience, N, M,
+    optimizer, lr, max_steps, tol, patience, N,
     loss_name, track_name, direction, momentum_mev,
-    factor_grid,          # list of (f1, f2) relative-to-GT factor pairs
+    factor_grid,          # list of (f1, f2) relative-to-GT factor pairs (random)
     starting_p_n_values,  # list of (pn1, pn2) absolute p_n starting values
-    trials,               # list of (2N+1)^2 entries, each a list of M dicts:
+    trials,               # list of N dicts:
         param_trajectory  (max_steps+1, 2) — or shorter if early stopped
         loss_trajectory   (max_steps+1,)
         total_time_s, stopped_early, steps_run
@@ -123,7 +123,10 @@ def parse_args():
     p.add_argument('--optimizer', default='adam', choices=VALID_OPTIMIZERS,
                    help='Optimizer (default: adam)')
     p.add_argument('--lr', type=float, default=0.01,
-                   help='Learning rate (default: 0.01)')
+                   help='Peak learning rate (default: 0.01)')
+    p.add_argument('--lr-schedule', default='constant',
+                   choices=('constant', 'cosine'),
+                   help='LR schedule: constant or cosine decay to 0 (default: constant)')
     p.add_argument('--max-steps', type=int, default=100,
                    help='Max optimization steps per trial (default: 100)')
     p.add_argument('--tol', type=float, default=1e-5,
@@ -133,11 +136,9 @@ def parse_args():
     p.add_argument('--loss',
                    default='sobolev_loss,sobolev_loss_geomean_log1p',
                    help='Comma-separated list of losses (default: both Sobolev)')
-    p.add_argument('--N', type=int, default=2,
-                   help='Grid points on each side per parameter '
-                        '(default: 2, giving (2N+1)²=25 starting points)')
-    p.add_argument('--M', type=int, default=3,
-                   help='Trials per starting point (default: 3)')
+    p.add_argument('--N', type=int, default=25,
+                   help='Number of random trials (default: 25); each trial '
+                        'draws both parameters uniformly from [0.95, 1.05] × GT')
     p.add_argument('--results-dir', default='results/2d_opt',
                    help='Output directory (default: results/2d_opt)')
     p.add_argument('--track-name', default='diagonal',
@@ -259,10 +260,15 @@ def build_loss_fn(loss_name, fwd_fn, gt_arrays, weights):
 
 # ── Optimizer factory ──────────────────────────────────────────────────────────
 
-def make_optax_optimizer(optimizer_name, lr):
-    if optimizer_name == 'adam':         return optax.adam(lr)
-    if optimizer_name == 'sgd':          return optax.sgd(lr)
-    if optimizer_name == 'momentum_sgd': return optax.sgd(lr, momentum=MOMENTUM)
+def make_optax_optimizer(optimizer_name, lr, lr_schedule, max_steps):
+    if lr_schedule == 'cosine':
+        schedule = optax.cosine_decay_schedule(init_value=lr, decay_steps=max_steps)
+    else:
+        schedule = lr
+
+    if optimizer_name == 'adam':         return optax.adam(schedule)
+    if optimizer_name == 'sgd':          return optax.sgd(schedule)
+    if optimizer_name == 'momentum_sgd': return optax.sgd(schedule, momentum=MOMENTUM)
     raise ValueError(f'Unknown optimizer {optimizer_name!r}')
 
 # ── Single optimization trial ──────────────────────────────────────────────────
@@ -335,8 +341,7 @@ def main():
     print(f'Optimizer   : {args.optimizer}  lr={args.lr}')
     print(f'Max steps   : {args.max_steps}  tol={args.tol}  patience={args.patience}')
     print(f'Losses      : {loss_names}')
-    print(f'N           : {args.N}  ({(2*args.N+1)**2} starting points per pair)')
-    print(f'M           : {args.M}  (trials per starting point)')
+    print(f'N           : {args.N}  (random trials per pair, start range [0.95, 1.05])')
     print(f'Track name  : {args.track_name}  direction={direction}')
     print(f'Results dir : {args.results_dir}')
 
@@ -412,22 +417,16 @@ def main():
 
         fwd_fn = jax.jit(lambda p_n_vec: simulator.forward(setter(p_n_vec), deposits))
 
-        # ── Starting grid ─────────────────────────────────────────────────────
-        left   = np.linspace(1.0 - RANGE_FRAC, 1.0, args.N + 1)[:-1]
-        right  = np.linspace(1.0, 1.0 + RANGE_FRAC, args.N + 1)[1:]
-        rel_fs = np.concatenate([left, [1.0], right])   # 2N+1 relative factors
-
-        f1_grid, f2_grid = np.meshgrid(rel_fs, rel_fs, indexing='ij')
-        factor_grid = list(zip(f1_grid.ravel().tolist(), f2_grid.ravel().tolist()))
+        # ── Random starting points ────────────────────────────────────────────
+        rng = np.random.default_rng()
+        f1_vals = rng.uniform(1.0 - RANGE_FRAC, 1.0 + RANGE_FRAC, args.N)
+        f2_vals = rng.uniform(1.0 - RANGE_FRAC, 1.0 + RANGE_FRAC, args.N)
+        factor_grid = list(zip(f1_vals.tolist(), f2_vals.tolist()))
         p_n_starts  = [(p_n_gt1 * f1, p_n_gt2 * f2) for f1, f2 in factor_grid]
 
-        n_starts     = len(factor_grid)   # (2N+1)^2
-        n_total_jobs = n_starts * args.M
+        print(f'  Random trials: {args.N}  (factors drawn from [0.95, 1.05])')
 
-        print(f'  Grid: {2*args.N+1}×{2*args.N+1} = {n_starts} starting points')
-        print(f'  Total trials per loss: {n_total_jobs}')
-
-        optimizer = make_optax_optimizer(args.optimizer, args.lr)
+        optimizer = make_optax_optimizer(args.optimizer, args.lr, args.lr_schedule, args.max_steps)
 
         # ── Loop over losses ──────────────────────────────────────────────────
         for loss_name in loss_names:
@@ -443,36 +442,26 @@ def main():
             _ = val_and_grad_fn(_p0); jax.block_until_ready(_)
             print(f'  Done ({time.time() - t0:.1f} s)')
 
-            all_trials  = []
-            job_counter = 0
+            all_trials = []
 
             for gi, ((f1, f2), (pn1, pn2)) in enumerate(zip(factor_grid, p_n_starts)):
-                gt_marker = ' ← GT' if (f1 == 1.0 and f2 == 1.0) else ''
-                print(f'\n    Grid [{gi+1}/{n_starts}]  '
+                print(f'\n    Trial [{gi+1}/{args.N}]  '
                       f'factors=({f1:.4f},{f2:.4f})  '
-                      f'p_n=({pn1:.4f},{pn2:.4f}){gt_marker}')
+                      f'p_n=({pn1:.4f},{pn2:.4f})',
+                      end='', flush=True)
 
-                point_trials = []
-                for m in range(args.M):
-                    job_counter += 1
-                    print(f'      Trial {m+1}/{args.M} '
-                          f'(overall {job_counter}/{n_total_jobs}) ...',
-                          end='', flush=True)
+                trial = run_trial(
+                    [pn1, pn2], val_and_grad_fn, optimizer,
+                    args.max_steps, tol=args.tol, patience=args.patience,
+                )
+                all_trials.append(trial)
 
-                    trial = run_trial(
-                        [pn1, pn2], val_and_grad_fn, optimizer,
-                        args.max_steps, tol=args.tol, patience=args.patience,
-                    )
-                    point_trials.append(trial)
-
-                    final_pn  = trial['param_trajectory'][-1]
-                    early_tag = f'  [early@{trial["steps_run"]}]' if trial['stopped_early'] else ''
-                    print(f'  loss {trial["loss_trajectory"][0]:.3e} → '
-                          f'{trial["loss_trajectory"][-1]:.3e}  '
-                          f'p_n ({pn1:.3f},{pn2:.3f}) → ({final_pn[0]:.3f},{final_pn[1]:.3f})  '
-                          f'({trial["total_time_s"]:.1f} s){early_tag}')
-
-                all_trials.append(point_trials)
+                final_pn  = trial['param_trajectory'][-1]
+                early_tag = f'  [early@{trial["steps_run"]}]' if trial['stopped_early'] else ''
+                print(f'  loss {trial["loss_trajectory"][0]:.3e} → '
+                      f'{trial["loss_trajectory"][-1]:.3e}  '
+                      f'p_n ({pn1:.3f},{pn2:.3f}) → ({final_pn[0]:.3f},{final_pn[1]:.3f})  '
+                      f'({trial["total_time_s"]:.1f} s){early_tag}')
 
             pair_tag = f'{param1}+{param2}'
             result = dict(
@@ -486,7 +475,7 @@ def main():
                 tol                   = args.tol,
                 patience              = args.patience,
                 N                     = args.N,
-                M                     = args.M,
+                lr_schedule           = args.lr_schedule,
                 loss_name             = loss_name,
                 track_name            = args.track_name,
                 direction             = direction,
@@ -496,7 +485,8 @@ def main():
                 trials                = all_trials,
             )
 
-            pkl_name = (f'{loss_name}_N{args.N}_M{args.M}_{args.optimizer}_'
+            sched_tag = f'_cosine' if args.lr_schedule == 'cosine' else ''
+            pkl_name = (f'{loss_name}_N{args.N}_{args.optimizer}_lr{args.lr}{sched_tag}_'
                         f'{pair_tag}_{args.track_name}.pkl')
             pkl_path = os.path.join(args.results_dir, pkl_name)
             with open(pkl_path, 'wb') as f:
