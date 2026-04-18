@@ -1,0 +1,15 @@
+.git
+.gitignore
+.github
+.venv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.cache/
+notebooks/
+tmp/
+results/
+*.ipynb

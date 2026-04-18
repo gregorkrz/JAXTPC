@@ -1,0 +1,63 @@
+name: Build and Publish Docker image
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - Dockerfile
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Resolve next Docker tag
+        id: version
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import urllib.request
+
+          url = "https://hub.docker.com/v2/repositories/gkrz/jaxtpc/tags?page_size=100"
+          max_version = -1
+
+          while url:
+              with urllib.request.urlopen(url) as response:
+                  payload = json.load(response)
+              for item in payload.get("results", []):
+                  name = item.get("name", "")
+                  match = re.fullmatch(r"v(\d+)", name)
+                  if match:
+                      max_version = max(max_version, int(match.group(1)))
+              url = payload.get("next")
+
+          next_tag = f"v{max_version + 1}"
+          print(f"Next Docker tag: {next_tag}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+              fh.write(f"next_tag={next_tag}\n")
+          PY
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: gkrz/jaxtpc:${{ steps.version.outputs.next_tag }}
