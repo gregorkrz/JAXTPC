@@ -17,4 +17,4 @@ RUN python -m pip install --upgrade pip \
 
 COPY . /app
 
-CMD ["python", "run_light_sim.py", "muon.h5"]
+
