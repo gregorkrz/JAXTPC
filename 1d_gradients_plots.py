@@ -110,10 +110,13 @@ def make_figure(track_name, param_data, output_dir, N):
     direction    = first_result.get('direction', '?')
     momentum_mev = first_result.get('momentum_mev', '?')
 
+    fixed_param = first_result.get('fixed_param')
+    fixed_value = first_result.get('fixed_value')
+    fixed_str   = f'  |  {fixed_param}={fixed_value}' if fixed_param else ''
     fig.suptitle(
         f'1-D sweep  |  track: {track_name}  '
         f'direction={direction}  T={momentum_mev} MeV  '
-        f'N={N}',
+        f'N={N}{fixed_str}',
         fontsize=12, y=1.01,
     )
 
@@ -211,7 +214,8 @@ def make_figure(track_name, param_data, output_dir, N):
     fig.tight_layout()
 
     os.makedirs(output_dir, exist_ok=True)
-    out_path = os.path.join(output_dir, f'1d_gradients_N{N}_{track_name}.pdf')
+    fixed_tag = (f'_fixed_{fixed_param}{fixed_value}' if fixed_param else '')
+    out_path = os.path.join(output_dir, f'1d_gradients_N{N}_{track_name}{fixed_tag}.pdf')
     fig.savefig(out_path, bbox_inches='tight')
     plt.close(fig)
     print(f'Saved: {out_path}')

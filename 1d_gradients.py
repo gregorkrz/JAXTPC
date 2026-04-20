@@ -24,10 +24,12 @@ Usage examples
     python 1d_gradients.py --param lifetime_us --N 5
     python 1d_gradients.py --param recomb_alpha --N 4
     python 1d_gradients.py --direction 1,0,0 --track-name along_x --momentum 500
+    python 1d_gradients.py --param recomb_beta_90 --fixed-param recomb_alpha --fixed-value 0.905
 
 Output (one file per loss)
 --------------------------
     results/1d_gradients/{loss_name}_N{N}_{param_name}_{track_name}.pkl
+    results/1d_gradients/{loss_name}_N{N}_{param_name}_{track_name}_fixed_{fixed_param}{fixed_value}.pkl
 
 Each pickle contains a dict with keys:
     param_name, param_gt, param_values, factors,
@@ -120,6 +122,11 @@ def parse_args():
                    help='Muon direction as x,y,z (default: 1,1,1)')
     p.add_argument('--momentum', type=float, default=1000.0,
                    help='Muon kinetic energy in MeV (default: 1000.0)')
+    p.add_argument('--fixed-param', default=None, choices=VALID_PARAMS,
+                   help='Fix this parameter to --fixed-value instead of GT '
+                        'when evaluating the sweep (GT arrays still use true GT)')
+    p.add_argument('--fixed-value', type=float, default=None,
+                   help='Physical value to fix --fixed-param to')
     return p.parse_args()
 
 # ── Parameter setter factory ───────────────────────────────────────────────────
@@ -231,6 +238,9 @@ def main():
 
     os.makedirs(args.results_dir, exist_ok=True)
 
+    if (args.fixed_param is None) != (args.fixed_value is None):
+        raise ValueError('--fixed-param and --fixed-value must be given together')
+
     print(f'JAX devices : {jax.devices()}')
     print(f'Parameter   : {args.param}')
     print(f'Losses      : {loss_names}')
@@ -238,6 +248,8 @@ def main():
     print(f'Track name  : {args.track_name}')
     print(f'Direction   : {direction}')
     print(f'Momentum    : {args.momentum} MeV')
+    if args.fixed_param:
+        print(f'Fixed param : {args.fixed_param} = {args.fixed_value}')
     print(f'Results dir : {args.results_dir}')
 
     # ── Simulator ─────────────────────────────────────────────────────────────
@@ -295,6 +307,17 @@ def main():
     print(f'GT value    : {args.param} = {param_gt:.6g}  '
           f'(scale={scale:.6g},  p_n_gt={p_n_gt:.6g})')
 
+    # Optionally fix a second parameter to a non-GT value for the sweep
+    sweep_base_params = gt_params
+    if args.fixed_param is not None:
+        _fix_setter, _, _ = make_param_setter(args.fixed_param, gt_params, simulator.recomb_model)
+        fix_scale = TYPICAL_SCALES[args.fixed_param]
+        sweep_base_params = _fix_setter(args.fixed_value / fix_scale)
+        print(f'Sweep base  : {args.fixed_param} overridden to {args.fixed_value}')
+
+    _make_params, param_gt, scale = make_param_setter(
+        args.param, sweep_base_params, simulator.recomb_model
+    )
     fwd_fn = jax.jit(lambda p_n: simulator.forward(_make_params(p_n), deposits))
 
     # ── GT arrays and Sobolev weights ─────────────────────────────────────────
@@ -375,14 +398,30 @@ def main():
             track_name   = args.track_name,
             direction    = direction,
             momentum_mev = args.momentum,
+            fixed_param  = args.fixed_param,
+            fixed_value  = args.fixed_value,
         )
 
-        pkl_name = f'{loss_name}_N{args.N}_{args.param}_{args.track_name}.pkl'
+        fixed_tag = f'_fixed_{args.fixed_param}{args.fixed_value}' if args.fixed_param else ''
+        pkl_name = f'{loss_name}_N{args.N}_{args.param}_{args.track_name}{fixed_tag}.pkl'
         pkl_path = os.path.join(args.results_dir, pkl_name)
         with open(pkl_path, 'wb') as f:
             pickle.dump(result, f)
         print(f'Saved: {pkl_path}')
 
+    fixed_tag = f'_fixed_{args.fixed_param}{args.fixed_value}' if args.fixed_param else ''
+    fixed_args = (f' --fixed-param {args.fixed_param} --fixed-value {args.fixed_value}'
+                  if args.fixed_param else '')
+    print('\nCommand used:')
+    print(f'  python 1d_gradients.py'
+          f' --param {args.param}'
+          f' --N {args.N}'
+          f' --track-name {args.track_name}'
+          f' --direction {",".join(str(d) for d in direction)}'
+          f' --momentum {args.momentum}'
+          f' --loss {",".join(loss_names)}'
+          f'{fixed_args}'
+          f' --results-dir {args.results_dir}')
     print('\nDone.')
 
 
