@@ -323,3 +323,25 @@ def sobolev_loss_geomean_log1p(signals_a, signals_b, spectral_weights,
         lp = sobolev_loss_single(signals_a[p], signals_b[p], spectral_weights[p])
         log_sum = log_sum + jnp.log1p(lp)
     return jnp.expm1(log_sum / len(planes))
+
+
+# ---------------------------------------------------------------------------
+# Simple pixel-space losses (no spectral weighting)
+# ---------------------------------------------------------------------------
+
+def mse_loss(signals_a, signals_b):
+    """Normalised MSE summed over planes.  No spectral weights needed."""
+    total = jnp.zeros(())
+    for a, b in zip(signals_a, signals_b):
+        norm = jnp.sum(jnp.abs(b)) + 1e-12
+        total = total + jnp.mean(((a - b) / norm) ** 2)
+    return total
+
+
+def l1_loss(signals_a, signals_b):
+    """Normalised L1 (MAE) summed over planes.  No spectral weights needed."""
+    total = jnp.zeros(())
+    for a, b in zip(signals_a, signals_b):
+        norm = jnp.sum(jnp.abs(b)) + 1e-12
+        total = total + jnp.mean(jnp.abs((a - b) / norm))
+    return total

@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-N=3
+N=1
 M=3
 MAX_STEPS=200
 BASE_RESULTS_DIR="results/1d_opt"
@@ -25,8 +25,8 @@ LOSSES_DEFAULT="sobolev_loss,sobolev_loss_geomean_log1p"
 LOSSES_RECOMB_R="sobolev_loss,sobolev_loss_geomean_log1p"
 
 # ── sweep definitions ───────────────────────────────────────────────────────
-LRS=("0.1" "0.01" "0.001")
-OPTIMIZERS=("adam" "sgd" "momentum_sgd")
+LRS=("0.1" "0.001")
+OPTIMIZERS=("adam")
 
 # ── direction definitions ───────────────────────────────────────────────────
 declare -A DIRECTIONS
@@ -37,7 +37,7 @@ DIRECTIONS["Z"]="0,0,1"
 DIRECTIONS["U"]="0,0.866,0.5"     # +60° from z in y-z plane
 DIRECTIONS["V"]="0,-0.866,0.5"    # -60° from z in y-z plane
 
-TRACK_ORDER=("diagonal" "X" "Y" "Z" "U" "V")
+TRACK_ORDER=("diagonal")
 
 # ── parameter definitions ───────────────────────────────────────────────────
 # recomb_beta → modified_box model only; use recomb_beta_90 / recomb_R for emb
@@ -45,10 +45,6 @@ PARAMS=(
     "velocity_cm_us"
     "lifetime_us"
     "diffusion_trans_cm2_us"
-    "diffusion_long_cm2_us"
-    "recomb_alpha"
-    "recomb_beta_90"    # emb model (default); swap for recomb_beta if using modified_box
-    "recomb_R"          # emb model (default)
 )
 
 # ── skip helper ─────────────────────────────────────────────────────────────

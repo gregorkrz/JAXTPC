@@ -119,7 +119,7 @@ def load_results(results_dir, N, M, track_names, optimizers):
 
 def _starting_colormap(factors):
     """Return a list of RGBA colours, one per factor, diverging around GT=1."""
-    cmap = cm.RdBu_r
+    cmap = cm.RdYlBu
     f_min, f_max = min(factors), max(factors)
     # centre the normalisation so that 1.0 maps exactly to the midpoint
     half = max(abs(f_min - 1.0), abs(f_max - 1.0)) + 1e-9
@@ -325,22 +325,21 @@ def make_figure(track_name, optimizer, loss_name, param_data, output_dir, N, M):
         # ── param value axis ───────────────────────────────────────────────
         plabel = PARAM_LABELS.get(param_name, param_name)
         ax_pval.set_xlabel('step')
-        ax_pval.set_ylabel(f'p_n  (normalised, GT = 1)')
+        ax_pval.set_ylabel('p_n')
         ax_pval.set_title(f'{param_name}  —  {plabel} vs step')
         ax_pval.legend(fontsize=7, ncol=2)
         ax_pval.grid(True, alpha=0.25)
 
-    # colour bar showing starting factor
-    sm = cm.ScalarMappable(
-        cmap=cm.RdBu_r,
-        norm=mcolors.Normalize(
-            vmin=min(result['starting_factors']),
-            vmax=max(result['starting_factors']),
-        ),
-    )
-    sm.set_array([])
-    cbar = fig.colorbar(sm, ax=axes[:, 1], shrink=0.6, pad=0.02)
-    cbar.set_label('starting factor  (GT = 1.0)', fontsize=9)
+        # per-subplot colorbar
+        factors = result['starting_factors']
+        half    = max(abs(min(factors) - 1.0), abs(max(factors) - 1.0)) + 1e-9
+        sm = cm.ScalarMappable(
+            cmap=cm.RdYlBu,
+            norm=mcolors.Normalize(vmin=1.0 - half, vmax=1.0 + half),
+        )
+        sm.set_array([])
+        cbar = fig.colorbar(sm, ax=ax_pval, pad=0.02)
+        cbar.set_label('starting factor', fontsize=8)
 
     fig.tight_layout()
 

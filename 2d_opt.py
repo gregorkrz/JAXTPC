@@ -21,14 +21,27 @@ Supported optimizers
   sgd           Vanilla SGD
   momentum_sgd  SGD with momentum (momentum=0.9)
 
+Multi-track optimization
+------------------------
+  Use --tracks to optimize over multiple tracks simultaneously.  The loss at
+  each step is the sum of per-track losses.  Tracks are run sequentially in
+  the forward pass (no vmap).
+
+  Format: name:dx,dy,dz:momentum_mev  (comma-separated list of specs)
+  Example:
+    --tracks diagonal:1,1,1:1000,track2_100MeV:0.5,1.05,0.2:100
+
+  --track-name / --direction / --momentum are still accepted for single-track
+  runs and are ignored when --tracks is given.
+
 Output (one file per pair × loss)
 ----------------------------------
-    results/2d_opt/{loss}_N{N}_{optimizer}_{param1}+{param2}_{track}.pkl
+    results/2d_opt/{loss}_N{N}_{optimizer}_{param1}+{param2}_{track_tag}.pkl
 
 Each pickle contains:
     param_names, param_gts, scales, p_n_gts,
     optimizer, lr, max_steps, tol, patience, N,
-    loss_name, track_name, direction, momentum_mev,
+    loss_name, track_name, tracks,
     factor_grid,          # list of (f1, f2) relative-to-GT factor pairs (random)
     starting_p_n_values,  # list of (pn1, pn2) absolute p_n starting values
     trials,               # list of N dicts:
@@ -147,7 +160,43 @@ def parse_args():
                    help='Muon direction as x,y,z (default: 1,1,1)')
     p.add_argument('--momentum', type=float, default=1000.0,
                    help='Muon kinetic energy in MeV (default: 1000.0)')
+    p.add_argument('--tracks', default=None,
+                   help='Multi-track spec: name:dx,dy,dz:mom_mev comma-separated, '
+                        'e.g. diagonal:1,1,1:1000,track2_100MeV:0.5,1.05,0.2:100. '
+                        'Overrides --track-name/--direction/--momentum.')
     return p.parse_args()
+
+
+def parse_tracks(tracks_str, fallback_name, fallback_dir, fallback_mom):
+    """Parse --tracks spec or fall back to single-track args.
+
+    Returns list of dicts with keys: name, direction (tuple), momentum_mev.
+    """
+    if tracks_str is None:
+        return [dict(name=fallback_name, direction=fallback_dir,
+                     momentum_mev=fallback_mom)]
+    specs = []
+    for item in tracks_str.split(','):
+        item = item.strip()
+        parts = item.split(':')
+        if len(parts) != 3:
+            raise ValueError(
+                f'Each --tracks entry must be name:dx,dy,dz:momentum_mev, got {item!r}')
+        name = parts[0].strip()
+        try:
+            direction = tuple(float(x) for x in parts[1].split(','))
+        except ValueError:
+            raise ValueError(f'Bad direction in --tracks entry {item!r}')
+        if len(direction) != 3:
+            raise ValueError(f'Direction must have 3 components in {item!r}')
+        try:
+            momentum_mev = float(parts[2])
+        except ValueError:
+            raise ValueError(f'Bad momentum in --tracks entry {item!r}')
+        specs.append(dict(name=name, direction=direction, momentum_mev=momentum_mev))
+    if not specs:
+        raise ValueError('--tracks produced no entries')
+    return specs
 
 
 def parse_pairs(pairs_str):
@@ -330,9 +379,11 @@ def main():
         if name not in VALID_LOSSES:
             raise ValueError(f'Unknown loss {name!r}')
 
-    direction = tuple(float(x) for x in args.direction.split(','))
-    if len(direction) != 3:
-        raise ValueError(f'--direction must have 3 components')
+    fallback_dir = tuple(float(x) for x in args.direction.split(','))
+    if len(fallback_dir) != 3:
+        raise ValueError('--direction must have 3 components')
+    track_specs = parse_tracks(args.tracks, args.track_name, fallback_dir, args.momentum)
+    track_tag   = '+'.join(t['name'] for t in track_specs)
 
     os.makedirs(args.results_dir, exist_ok=True)
 
@@ -342,7 +393,7 @@ def main():
     print(f'Max steps   : {args.max_steps}  tol={args.tol}  patience={args.patience}')
     print(f'Losses      : {loss_names}')
     print(f'N           : {args.N}  (random trials per pair, start range [0.95, 1.05])')
-    print(f'Track name  : {args.track_name}  direction={direction}')
+    print(f'Tracks      : {[t["name"] for t in track_specs]}')
     print(f'Results dir : {args.results_dir}')
 
     # ── Simulator ─────────────────────────────────────────────────────────────
@@ -361,23 +412,27 @@ def main():
         track_config=None,
     )
 
-    # ── Track & deposits ──────────────────────────────────────────────────────
-    print(f'Generating muon track  direction={direction}  T={args.momentum} MeV...')
-    track = generate_muon_track(
-        start_position_mm=(0.0, 0.0, 0.0),
-        direction=direction,
-        kinetic_energy_mev=args.momentum,
-        step_size_mm=0.1,
-        track_id=1,
-        detector_bounds_mm=DETECTOR_BOUNDS_MM,
-    )
-    deposits = build_deposit_data(
-        track['position'], track['de'], track['dx'], simulator.config,
-        theta=track['theta'], phi=track['phi'],
-        track_ids=track['track_id'],
-    )
-    n_total = sum(v.n_actual for v in deposits.volumes)
-    print(f'Generated {n_total:,} deposits')
+    # ── Tracks & deposits ─────────────────────────────────────────────────────
+    all_deposits = []
+    for ts in track_specs:
+        print(f'Generating muon track  name={ts["name"]}  '
+              f'direction={ts["direction"]}  T={ts["momentum_mev"]} MeV...')
+        track = generate_muon_track(
+            start_position_mm=(0.0, 0.0, 0.0),
+            direction=ts['direction'],
+            kinetic_energy_mev=ts['momentum_mev'],
+            step_size_mm=0.1,
+            track_id=1,
+            detector_bounds_mm=DETECTOR_BOUNDS_MM,
+        )
+        deposits = build_deposit_data(
+            track['position'], track['de'], track['dx'], simulator.config,
+            theta=track['theta'], phi=track['phi'],
+            track_ids=track['track_id'],
+        )
+        n_total = sum(v.n_actual for v in deposits.volumes)
+        print(f'  {n_total:,} deposits')
+        all_deposits.append(deposits)
 
     print('Warming up JIT...')
     t0 = time.time()
@@ -389,12 +444,16 @@ def main():
         velocity_cm_us = jnp.array(GT_VELOCITY_CM_US),
     )
 
-    # ── GT arrays & Sobolev weights ───────────────────────────────────────────
-    print('Computing GT forward pass...')
+    # ── GT arrays & Sobolev weights (concatenated across all tracks) ──────────
+    print('Computing GT forward passes...')
     t0 = time.time()
-    gt_arrays = simulator.forward(gt_params, deposits)
-    jax.block_until_ready(gt_arrays)
-    print(f'Done ({time.time() - t0:.1f} s)  —  {len(gt_arrays)} plane arrays')
+    gt_arrays = []
+    for deposits in all_deposits:
+        arrs = simulator.forward(gt_params, deposits)
+        jax.block_until_ready(arrs)
+        gt_arrays.extend(arrs)
+    gt_arrays = tuple(gt_arrays)
+    print(f'Done ({time.time() - t0:.1f} s)  —  {len(gt_arrays)} plane arrays total')
 
     weights = tuple(
         make_sobolev_weight(arr.shape[0], arr.shape[1], max_pad=SOBOLEV_MAX_PAD)
@@ -415,7 +474,12 @@ def main():
         print(f'  {param1}: GT={gt_vals[0]:.6g}  scale={scales[0]:.6g}  p_n_gt={p_n_gt1:.6g}')
         print(f'  {param2}: GT={gt_vals[1]:.6g}  scale={scales[1]:.6g}  p_n_gt={p_n_gt2:.6g}')
 
-        fwd_fn = jax.jit(lambda p_n_vec: simulator.forward(setter(p_n_vec), deposits))
+        def _multi_fwd(p_n_vec, _deps=all_deposits, _setter=setter):
+            arrays = []
+            for dep in _deps:
+                arrays.extend(simulator.forward(_setter(p_n_vec), dep))
+            return tuple(arrays)
+        fwd_fn = jax.jit(_multi_fwd)
 
         # ── Random starting points ────────────────────────────────────────────
         rng = np.random.default_rng()
@@ -477,9 +541,8 @@ def main():
                 N                     = args.N,
                 lr_schedule           = args.lr_schedule,
                 loss_name             = loss_name,
-                track_name            = args.track_name,
-                direction             = direction,
-                momentum_mev          = args.momentum,
+                track_name            = track_tag,
+                tracks                = track_specs,
                 factor_grid           = factor_grid,
                 starting_p_n_values   = p_n_starts,
                 trials                = all_trials,
@@ -487,7 +550,7 @@ def main():
 
             sched_tag = f'_cosine' if args.lr_schedule == 'cosine' else ''
             pkl_name = (f'{loss_name}_N{args.N}_{args.optimizer}_lr{args.lr}{sched_tag}_'
-                        f'{pair_tag}_{args.track_name}.pkl')
+                        f'{pair_tag}_{track_tag}.pkl')
             pkl_path = os.path.join(args.results_dir, pkl_name)
             with open(pkl_path, 'wb') as f:
                 pickle.dump(result, f)

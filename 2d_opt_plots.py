@@ -24,7 +24,6 @@ import pickle
 
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
-import matplotlib.colors as mcolors
 import numpy as np
 
 
@@ -171,16 +170,6 @@ def make_figure(result, output_dir):
     ax_p2.set_title(f'{param2}  —  {p2_label}')
     ax_p2.legend(fontsize=8)
     ax_p2.grid(True, alpha=0.25)
-
-    # colour bar for trial index
-    sm = cm.ScalarMappable(
-        cmap=cm.tab10 if N <= 10 else cm.tab20,
-        norm=mcolors.Normalize(vmin=0, vmax=max(N - 1, 1)),
-    )
-    sm.set_array([])
-    cbar = fig.colorbar(sm, ax=axes, shrink=0.5, pad=0.02)
-    cbar.set_label('trial index', fontsize=9)
-    cbar.set_ticks(np.arange(N))
 
     fig.tight_layout()
 
