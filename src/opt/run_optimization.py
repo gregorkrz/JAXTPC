@@ -27,7 +27,7 @@ Named track presets
   track2    (0.5,1.05,0.2) 200 MeV
 
   Custom tracks: name:dx,dy,dz:momentum_mev  (mixed with presets is fine)
-  e.g. --tracks diagonal,mytrack:0.1,0.2,0.9:500
+  e.g. --tracks diagonal+mytrack:0.1,0.2,0.9:500
 
 Output
 ------
@@ -48,6 +48,9 @@ Each pickle contains:
       loss_trajectory    list of length steps+1
       total_time_s, stopped_early, steps_run
 """
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -70,6 +73,7 @@ from tools.losses import (
     mse_loss,
     l1_loss,
 )
+from tools.noise import generate_noise
 from tools.particle_generator import generate_muon_track
 from tools.simulation import DetectorSimulator
 
@@ -138,8 +142,9 @@ def parse_args():
     p.add_argument('--range', type=float, nargs=2, metavar=('LO', 'HI'), default=(0.95, 1.05),
                    help='Relative factor range for random starting points (default: 0.95 1.05)')
     p.add_argument('--tracks', default='diagonal',
-                   help='Comma-separated track presets or name:dx,dy,dz:mom_mev specs '
-                        f'(default: diagonal).  Presets: {", ".join(TRACK_PRESETS)}')
+                   help='"+"-separated track presets or name:dx,dy,dz:mom_mev specs '
+                        '("+" separates tracks, "," separates direction components). '
+                        f'Default: diagonal.  Presets: {", ".join(TRACK_PRESETS)}')
     p.add_argument('--loss', default='sobolev_loss_geomean_log1p', choices=VALID_LOSSES,
                    help='Loss function (default: sobolev_loss_geomean_log1p)')
     p.add_argument('--optimizer', default='adam', choices=VALID_OPTIMIZERS,
@@ -159,7 +164,14 @@ def parse_args():
     p.add_argument('--results-base', default='results',
                    help='Base directory; output goes to <results-base>/<folder>/ (default: results)')
     p.add_argument('--seed', type=int, default=None,
-                   help='RNG seed for starting points (default: random)')
+                   help='Master RNG seed (default: random). Seeds everything: '
+                        'trial starting points and GT noise draw. '
+                        'The resolved seed is printed and stored in the pkl.')
+    p.add_argument('--noise-scale', type=float, default=0.0,
+                   help='Noise amplitude as a multiple of the calibrated detector noise '
+                        '(MicroBooNE model, converted to signal units via electrons_per_adc). '
+                        '0.0 = no noise (default), 1.0 = realistic noise. '
+                        'Signal and noise RMS are printed at startup for reference.')
     return p.parse_args()
 
 
@@ -178,13 +190,14 @@ def parse_params(params_str):
 
 
 def parse_tracks(tracks_str):
-    """Parse comma-separated preset names or name:dx,dy,dz:mom_mev specs.
+    """Parse '+'-separated preset names or name:dx,dy,dz:mom_mev specs.
 
-    Mixed input is supported, e.g. 'diagonal,mytrack:0.1,0.2,0.9:500'.
+    '+' separates tracks; ',' is used only inside direction components.
+    Mixed input is supported, e.g. 'diagonal+mytrack:0.1,0.2,0.9:500'.
     Returns list of dicts: {name, direction (tuple), momentum_mev}.
     """
     specs = []
-    for item in tracks_str.split(','):
+    for item in tracks_str.split('+'):
         item = item.strip()
         if not item:
             continue
@@ -223,18 +236,25 @@ def parse_tracks(tracks_str):
 # ── Folder name ────────────────────────────────────────────────────────────────
 
 def make_folder_name(param_names, track_specs, loss_name, optimizer, lr,
-                     lr_schedule, max_steps, N, range_lo, range_hi):
+                     lr_schedule, max_steps, N, range_lo, range_hi, noise_scale=0.0):
     params_tag    = '+'.join(param_names)
     tracks_tag    = '+'.join(t['name'] for t in track_specs)
     sched_tag     = '_cosine' if lr_schedule == 'cosine' else ''
     range_tag     = f'r{range_lo:.3g}_{range_hi:.3g}'.replace('.', 'p')
+    noise_tag     = f'_noise{noise_scale:.3g}'.replace('.', 'p') if noise_scale > 0.0 else ''
     return (f'{params_tag}__{tracks_tag}__{loss_name}__'
-            f'{optimizer}_lr{lr}{sched_tag}_s{max_steps}_N{N}_{range_tag}')
+            f'{optimizer}_lr{lr}{sched_tag}_s{max_steps}_N{N}_{range_tag}{noise_tag}')
 
 
-def next_result_path(folder):
-    """Return results/<folder>/result_N.pkl where N is the lowest unused index."""
+def next_result_path(folder, seed=None):
+    """Return the output pkl path inside folder.
+
+    If seed is given: results/<folder>/result_<seed>.pkl (fixed, deterministic).
+    If seed is None:  results/<folder>/result_0.pkl, result_1.pkl, ... (first unused).
+    """
     os.makedirs(folder, exist_ok=True)
+    if seed is not None:
+        return os.path.join(folder, f'result_{seed}.pkl')
     i = 0
     while True:
         path = os.path.join(folder, f'result_{i}.pkl')
@@ -386,6 +406,33 @@ def run_trial(p0, val_and_grad_fn, optimizer, max_steps, tol=1e-5, patience=20):
     )
 
 
+# ── Noise ─────────────────────────────────────────────────────────────────────
+
+def apply_noise_to_gt(gt_arrays, simulator, noise_scale, noise_seed):
+    """Add calibrated detector noise to GT arrays once before optimization.
+
+    Uses generate_noise() (MicroBooNE model: series + white components) and
+    converts from ADC to signal units via config.electrons_per_adc.
+    noise_scale=1.0 gives the realistic detector noise amplitude.
+    The same draw is used for all trials so they all optimise against the
+    same fixed noisy target.
+    """
+    cfg = simulator.config
+    noise_dict = generate_noise(cfg, key=jax.random.PRNGKey(noise_seed))
+    e_per_adc  = cfg.electrons_per_adc
+
+    n_readouts = cfg.volumes[0].n_planes if simulator._readout_type == 'wire' else 1
+    noisy = []
+    for v in range(cfg.n_volumes):
+        for p in range(n_readouts):
+            gt = gt_arrays[v * n_readouts + p]
+            noise = noise_dict[(v, p)] * e_per_adc * noise_scale
+            if noise.shape[0] < gt.shape[0]:
+                noise = jnp.pad(noise, ((0, gt.shape[0] - noise.shape[0]), (0, 0)))
+            noisy.append(gt + noise)
+    return tuple(noisy)
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
@@ -395,12 +442,26 @@ def main():
     track_specs = parse_tracks(args.tracks)
     range_lo, range_hi = getattr(args, 'range')
 
+    # ── Seeding ───────────────────────────────────────────────────────────────
+    # SeedSequence(None) draws entropy from the OS; spawn gives independent
+    # child sequences so starting-point and noise draws never collide.
+    ss = np.random.SeedSequence(args.seed)
+    effective_seed   = int(ss.entropy) if args.seed is None else args.seed
+    start_ss, noise_ss = ss.spawn(2)
+    start_rng        = np.random.default_rng(start_ss)
+    noise_seed       = int(noise_ss.generate_state(1)[0])
+
     folder_name = make_folder_name(
         param_names, track_specs, args.loss, args.optimizer,
         args.lr, args.lr_schedule, args.max_steps, args.N, range_lo, range_hi,
+        noise_scale=args.noise_scale,
     )
     output_dir  = os.path.join(args.results_base, folder_name)
-    output_path = next_result_path(output_dir)
+    output_path = next_result_path(output_dir, seed=args.seed)
+
+    if args.seed is not None and os.path.exists(output_path):
+        print(f'Skipping: {output_path} already exists.')
+        return
 
     print(f'JAX devices  : {jax.devices()}')
     print(f'Params       : {param_names}')
@@ -410,6 +471,8 @@ def main():
     print(f'Optimizer    : {args.optimizer}  lr={args.lr}  schedule={args.lr_schedule}')
     print(f'Max steps    : {args.max_steps}  tol={args.tol}  patience={args.patience}')
     print(f'N            : {args.N}')
+    print(f'Seed         : {effective_seed}')
+    print(f'Noise scale  : {args.noise_scale}')
     print(f'Output       : {output_path}')
 
     # ── Simulator ─────────────────────────────────────────────────────────────
@@ -470,6 +533,18 @@ def main():
     gt_arrays = tuple(gt_arrays)
     print(f'Done ({time.time() - t0:.1f} s)  —  {len(gt_arrays)} plane arrays total')
 
+    # ── Optional noise on GT ──────────────────────────────────────────────────
+    signal_rms = float(np.mean([float(jnp.std(a)) for a in gt_arrays]))
+    if args.noise_scale > 0.0:
+        noisy_gt_arrays = apply_noise_to_gt(gt_arrays, simulator, args.noise_scale, noise_seed)
+        noise_rms = float(np.mean([float(jnp.std(n - c))
+                                   for n, c in zip(noisy_gt_arrays, gt_arrays)]))
+        gt_arrays = noisy_gt_arrays
+        print(f'  Signal RMS : {signal_rms:.4g}  (mean over planes)')
+        print(f'  Noise  RMS : {noise_rms:.4g}  (mean over planes,  SNR ≈ {signal_rms / max(noise_rms, 1e-30):.2f})')
+    else:
+        print(f'  Signal RMS : {signal_rms:.4g}  (mean over planes, use --noise-scale to add noise)')
+
     weights = tuple(
         make_sobolev_weight(arr.shape[0], arr.shape[1], max_pad=SOBOLEV_MAX_PAD)
         for arr in gt_arrays
@@ -490,7 +565,7 @@ def main():
     fwd_fn = jax.jit(_multi_fwd)
 
     # ── Random starting points ────────────────────────────────────────────────
-    rng = np.random.default_rng(args.seed)
+    rng = start_rng
     n_params = len(param_names)
     factors = rng.uniform(range_lo, range_hi, size=(args.N, n_params))   # (N, n_params)
     factor_grid   = factors.tolist()
@@ -546,6 +621,8 @@ def main():
         tracks              = track_specs,
         range_lo            = range_lo,
         range_hi            = range_hi,
+        seed                = effective_seed,
+        noise_scale         = args.noise_scale,
         factor_grid         = factor_grid,
         starting_p_n_values = p_n_starts,
         trials              = all_trials,

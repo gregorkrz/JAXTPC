@@ -16,6 +16,9 @@ Usage
     python 2d_loss_landscape.py --loss sobolev_loss --overlay results/2d_opt
     python 2d_loss_landscape.py --load-pkl results/2d_landscape/landscape_sobolev_loss_diagonal_10x10.pkl
 """
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -33,6 +36,7 @@ import matplotlib.colors as mcolors
 from tools.geometry import generate_detector
 from tools.loader import build_deposit_data
 from tools.losses import make_sobolev_weight, sobolev_loss, sobolev_loss_geomean_log1p, mse_loss, l1_loss
+from tools.noise import generate_noise
 from tools.particle_generator import generate_muon_track
 from tools.simulation import DetectorSimulator
 
@@ -94,6 +98,12 @@ def parse_args():
                    help='Skip computation and load a previously saved landscape pkl')
     p.add_argument('--gradients', action='store_true',
                    help='Also compute dL/dα and dL/dβ₉₀ at each grid point and store in pkl')
+    p.add_argument('--noise-scale', type=float, default=0.0,
+                   help='Noise amplitude as a multiple of the calibrated detector noise '
+                        '(MicroBooNE model, converted to signal units via electrons_per_adc). '
+                        '0.0 = no noise (default), 1.0 = realistic noise.')
+    p.add_argument('--noise-seed', type=int, default=0,
+                   help='Seed for the noise draw (default: 0)')
     return p.parse_args()
 
 
@@ -202,9 +212,8 @@ def plot_landscape_plotly(landscape, output_dir):
 
     loss_label = LOSS_LABELS.get(loss_name, loss_name)
 
-    log_grid = np.log10(np.clip(grid, 1e-12, None))
-    vmin = np.nanpercentile(log_grid, 2)
-    vmax = np.nanpercentile(log_grid, 98)
+    vmin = np.nanpercentile(grid, 2)
+    vmax = np.nanpercentile(grid, 98)
 
     grad_alpha  = np.array(landscape['grad_alpha'])  if 'grad_alpha'  in landscape else None
     grad_beta90 = np.array(landscape['grad_beta90']) if 'grad_beta90' in landscape else None
@@ -223,16 +232,14 @@ def plot_landscape_plotly(landscape, output_dir):
     heatmap = go.Heatmap(
         x=beta90_vals.tolist(),
         y=alpha_vals.tolist(),
-        z=log_grid.tolist(),
+        z=grid.tolist(),
         text=hover.tolist(),
         hovertemplate='%{text}<extra></extra>',
         colorscale='Viridis',
         zmin=vmin,
         zmax=vmax,
         colorbar=dict(
-            title=dict(text=f'log₁₀({loss_label})', side='right'),
-            tickvals=[round(v, 1) for v in np.linspace(vmin, vmax, 6)],
-            ticktext=[f'10^{v:.1f}' for v in np.linspace(vmin, vmax, 6)],
+            title=dict(text=loss_label, side='right'),
         ),
     )
 
@@ -287,8 +294,10 @@ def plot_landscape_plotly(landscape, output_dir):
         width=750, height=600,
     )
 
+    noise_scale = landscape.get('noise_scale', 0.0)
+    noise_tag   = f'_noise{noise_scale:.3g}'.replace('.', 'p') if noise_scale > 0.0 else ''
     os.makedirs(output_dir, exist_ok=True)
-    fname = f'landscape_{loss_name}_{track_name}_{grid_size}x{grid_size}.html'
+    fname = f'landscape_{loss_name}_{track_name}_{grid_size}x{grid_size}{noise_tag}.html'
     out_path = os.path.join(output_dir, fname)
     fig.write_html(out_path)
     print(f'  Saved: {out_path}')
@@ -315,12 +324,12 @@ def plot_landscape(landscape, output_dir, overlay_dir=None):
     # grid[i, j] = loss at (alpha_vals[i], beta90_vals[j])
     vmin = np.nanpercentile(grid, 2)
     vmax = np.nanpercentile(grid, 98)
-    norm = mcolors.LogNorm(vmin=max(vmin, 1e-10), vmax=vmax)
+    norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
 
     im = ax.pcolormesh(beta90_vals, alpha_vals, grid,
                        norm=norm, cmap='viridis', shading='auto')
     cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label(f'{loss_label}  (log scale)', fontsize=9)
+    cbar.set_label(f'{loss_label}', fontsize=9)
 
     # Contour overlay
     try:
@@ -370,14 +379,40 @@ def plot_landscape(landscape, output_dir, overlay_dir=None):
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.2)
 
+    noise_scale = landscape.get('noise_scale', 0.0)
+    noise_tag   = f'_noise{noise_scale:.3g}'.replace('.', 'p') if noise_scale > 0.0 else ''
     os.makedirs(output_dir, exist_ok=True)
-    fname = f'landscape_{loss_name}_{track_name}_{grid_size}x{grid_size}.pdf'
+    fname = f'landscape_{loss_name}_{track_name}_{grid_size}x{grid_size}{noise_tag}.pdf'
     out_path = os.path.join(output_dir, fname)
     fig.savefig(out_path, bbox_inches='tight')
     plt.close(fig)
     print(f'  Saved: {out_path}')
 
     plot_landscape_plotly(landscape, output_dir)
+
+
+# ── Noise ─────────────────────────────────────────────────────────────────────
+
+def apply_noise_to_gt(gt_arrays, simulator, noise_scale, noise_seed):
+    """Add calibrated detector noise to GT arrays (MicroBooNE model).
+
+    Converts ADC noise to signal units via electrons_per_adc.
+    noise_scale=1.0 gives realistic detector noise amplitude.
+    """
+    cfg       = simulator.config
+    noise_dict = generate_noise(cfg, key=jax.random.PRNGKey(noise_seed))
+    e_per_adc  = cfg.electrons_per_adc
+    n_readouts = cfg.volumes[0].n_planes if simulator._readout_type == 'wire' else 1
+    noisy = []
+    for v in range(cfg.n_volumes):
+        for p in range(n_readouts):
+            gt  = gt_arrays[v * n_readouts + p]
+            noise = noise_dict[(v, p)] * e_per_adc * noise_scale
+            # forward pads planes to max_wires; pad noise rows to match
+            if noise.shape[0] < gt.shape[0]:
+                noise = jnp.pad(noise, ((0, gt.shape[0] - noise.shape[0]), (0, 0)))
+            noisy.append(gt + noise)
+    return tuple(noisy)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
@@ -459,6 +494,17 @@ def main():
     jax.block_until_ready(gt_arrays)
     print(f'Done ({time.time() - t0:.1f} s)  —  {len(gt_arrays)} plane arrays')
 
+    signal_rms = float(np.mean([float(jnp.std(a)) for a in gt_arrays]))
+    if args.noise_scale > 0.0:
+        noisy_gt = apply_noise_to_gt(gt_arrays, simulator, args.noise_scale, args.noise_seed)
+        noise_rms = float(np.mean([float(jnp.std(n - c)) for n, c in zip(noisy_gt, gt_arrays)]))
+        gt_arrays = noisy_gt
+        print(f'  Noise applied  scale={args.noise_scale}  seed={args.noise_seed}')
+        print(f'  Signal RMS : {signal_rms:.4g}  Noise RMS : {noise_rms:.4g}'
+              f'  SNR ≈ {signal_rms / max(noise_rms, 1e-30):.2f}')
+    else:
+        print(f'  Signal RMS : {signal_rms:.4g}  (no noise; use --noise-scale to add noise)')
+
     weights = tuple(
         make_sobolev_weight(arr.shape[0], arr.shape[1], max_pad=SOBOLEV_MAX_PAD)
         for arr in gt_arrays
@@ -506,6 +552,7 @@ def main():
         else:
             grid = result
 
+        noise_tag = f'_noise{args.noise_scale:.3g}'.replace('.', 'p') if args.noise_scale > 0.0 else ''
         landscape = dict(
             loss_name    = loss_name,
             track_name   = args.track_name,
@@ -518,12 +565,14 @@ def main():
             alpha_vals   = alpha_vals.tolist(),
             beta90_vals  = beta90_vals.tolist(),
             grid         = grid.tolist(),
+            noise_scale  = args.noise_scale,
+            noise_seed   = args.noise_seed,
         )
         if args.gradients:
             landscape['grad_alpha']  = grad_alpha_grid.tolist()
             landscape['grad_beta90'] = grad_beta90_grid.tolist()
 
-        pkl_name = f'landscape_{loss_name}_{args.track_name}_{N}x{N}.pkl'
+        pkl_name = f'landscape_{loss_name}_{args.track_name}_{N}x{N}{noise_tag}.pkl'
         pkl_path = os.path.join(args.results_dir, pkl_name)
         with open(pkl_path, 'wb') as f_out:
             pickle.dump(landscape, f_out)

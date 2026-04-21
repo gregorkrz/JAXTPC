@@ -7,6 +7,9 @@ Usage:
 
 The pickle is saved as <output-dir>/optimization_results.pkl.
 """
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+
 from dotenv import load_dotenv
 load_dotenv()
 

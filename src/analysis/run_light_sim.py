@@ -1,6 +1,8 @@
 """Light-only simulation: extract per-segment Q, L, position, t0, ancestor_id."""
 
-import sys
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+
 import time
 import numpy as np
 import h5py

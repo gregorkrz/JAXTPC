@@ -7,6 +7,9 @@ Usage
     python edep_stats.py
     python edep_stats.py --output-dir results/my_vis
 """
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -76,7 +79,7 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, (ax_top, ax_bot) = plt.subplots(2, 1, figsize=(8, 10))
 
     for t in TRACKS:
         print(f"Generating {t['name']}  dir={t['direction']}  T={t['momentum_mev']} MeV ...")
@@ -93,18 +96,32 @@ def main():
         dedx = de / (dx / 10.0)      # MeV/cm
 
         label = f"{t['name']}  ({t['direction']}, {t['momentum_mev']:.0f} MeV)  n={len(dedx):,}"
-        ax.hist(dedx, bins=80, histtype='step', linewidth=1.5, label=label, density=True)
+        is_100mev = t['momentum_mev'] == 100.0
+
+        if not is_100mev:
+            ax_top.hist(dedx, bins=80, histtype='step', linewidth=1.5, label=label, density=True)
+        ax_bot.hist(dedx, bins=80, histtype='step', linewidth=1.5, label=label, density=True)
+
         print(f"  steps={len(dedx):,}  dE/dx: mean={dedx.mean():.3f}  median={np.median(dedx):.3f}"
               f"  min={dedx.min():.3f}  max={dedx.max():.3f}  MeV/cm")
 
         html_path = os.path.join(args.output_dir, f"edep_3d_{t['name']}.html")
         plot_edep_3d(t, track, html_path)
 
-    ax.set_xlabel('dE/dx  (MeV/cm)', fontsize=11)
-    ax.set_ylabel('density', fontsize=11)
-    ax.set_title('dE/dx distributions — muon tracks', fontsize=11)
-    ax.legend(fontsize=8)
-    ax.grid(True, alpha=0.3)
+    ax_top.set_xlabel('dE/dx  (MeV/cm)', fontsize=11)
+    ax_top.set_ylabel('density', fontsize=11)
+    ax_top.set_title('dE/dx distributions — without 100 MeV track  (linear)', fontsize=11)
+    ax_top.legend(fontsize=8)
+    ax_top.grid(True, alpha=0.3)
+
+    ax_bot.set_xlabel('dE/dx  (MeV/cm)', fontsize=11)
+    ax_bot.set_ylabel('density', fontsize=11)
+    ax_bot.set_title('dE/dx distributions — all tracks incl. 100 MeV  (log scale)', fontsize=11)
+    ax_bot.set_yscale('log')
+    ax_bot.legend(fontsize=8)
+    ax_bot.grid(True, alpha=0.3)
+
+    fig.tight_layout(pad=2.0)
 
     stats_path = os.path.join(args.output_dir, 'stats.pdf')
     fig.savefig(stats_path, bbox_inches='tight')
