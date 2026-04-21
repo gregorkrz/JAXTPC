@@ -86,7 +86,7 @@ for PARAM in "${PARAMS[@]}"; do
             LOSSES="${LOSSES_RECOMB_ALPHA}"
         fi
 
-        python 1d_gradients.py \
+        python src/analysis/1d_gradients.py \
             --param        "${PARAM}" \
             --N            "${N}" \
             --track-name   "${TRACK}" \
@@ -99,4 +99,4 @@ done
 echo ""
 echo "Done.  ${TOTAL} jobs total,  ${SKIPPED} skipped,  $(( TOTAL - SKIPPED )) run."
 echo "Results in ${RESULTS_DIR}/"
-python 1d_gradients_plots.py --N 5 --track-name diagonal,X,Y,Z,U,V
+python src/plots/1d_gradients_plots.py --N 5 --track-name diagonal,X,Y,Z,U,V

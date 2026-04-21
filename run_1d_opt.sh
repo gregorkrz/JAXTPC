@@ -93,7 +93,7 @@ for LR in "${LRS[@]}"; do
                     LOSSES="${LOSSES_RECOMB_R}"
                 fi
 
-                python 1d_opt.py \
+                python src/opt/1d_opt.py \
                     --param        "${PARAM}" \
                     --optimizer    "${OPTIMIZER}" \
                     --lr           "${LR}" \

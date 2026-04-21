@@ -1,6 +1,6 @@
 .env
 __pycache__/
 results/
-plots/
+/plots/
 .venv
 tools/data

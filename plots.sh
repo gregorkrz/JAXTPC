@@ -37,7 +37,7 @@ if [ $DO_1D_GRADIENTS -eq 1 ]; then
     echo "=========================================="
     for N in 3 5 10; do
         echo "--- N=$N ---"
-        $PY 1d_gradients_plots.py \
+        $PY src/plots/1d_gradients_plots.py \
             --N "$N" \
             --track-name diagonal,U,V,X,Y,Z \
             --results-dir results/1d_gradients \
@@ -51,7 +51,7 @@ if [ $DO_1D_OPT -eq 1 ]; then
     echo "=========================================="
     echo "  1d_opt plots  (root dir, N=3 M=3)"
     echo "=========================================="
-    $PY 1d_opt_plots.py \
+    $PY src/plots/1d_opt_plots.py \
         --N 3 --M 3 \
         --track-name diagonal \
         --results-dir results/1d_opt \
@@ -72,7 +72,7 @@ if [ $DO_1D_OPT -eq 1 ]; then
             for M in 1 3 5; do
                 if ls "$DIR"/*_N${N}_M${M}_*.pkl 2>/dev/null | grep -q .; then
                     echo "  N=$N M=$M"
-                    $PY 1d_opt_plots.py \
+                    $PY src/plots/1d_opt_plots.py \
                         --N "$N" --M "$M" \
                         --track-name diagonal \
                         --results-dir "$DIR" \
@@ -89,7 +89,7 @@ if [ $DO_2D_OPT -eq 1 ]; then
     echo "=========================================="
     echo "  2d_opt plots"
     echo "=========================================="
-    $PY 2d_opt_plots.py \
+    $PY src/plots/2d_opt_plots.py \
         --track-name diagonal \
         --results-dir results/2d_opt \
         --output-dir results/2d_opt
