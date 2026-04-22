@@ -582,7 +582,7 @@ def main():
             landscape['grad_alpha']  = grad_alpha_grid.tolist()
             landscape['grad_beta90'] = grad_beta90_grid.tolist()
 
-        pkl_name = f'landscape_{loss_name}_{args.track_name}_{N}x{N}{noise_tag}.pkl'
+        pkl_name = f'landscape_{loss_name}_{args.track_name}_T{args.momentum:.0f}MeV_{N}x{N}{noise_tag}.pkl'
         pkl_path = os.path.join(args.results_dir, pkl_name)
         with open(pkl_path, 'wb') as f_out:
             pickle.dump(landscape, f_out)

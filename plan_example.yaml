@@ -1,5 +1,5 @@
 time_limit: "00:25:00"   # salloc wall-clock limit (HH:MM:SS)
-command_timeout: 20       # per-command timeout in minutes
+command_timeout: 20      # per-command timeout in minutes
 
 gpus:
   0:
