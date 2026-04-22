@@ -10,7 +10,3 @@ gpus:
     - python src/analysis/2d_loss_landscape.py --direction 1,1,1 --track-name diagonal --momentum 100 --loss sobolev_loss_geomean_log1p --noise-scale 1.0 --results-dir $RESULTS_DIR/landscape/alpha_beta_90_noise --gradients --grid 40
   3:
     - python src/analysis/2d_loss_landscape.py --direction 1,1,1 --track-name diagonal --momentum 100 --loss sobolev_loss_geomean_log1p --results-dir $RESULTS_DIR/landscape/alpha_beta_90_no_noise --gradients --grid 40
-
-post_gpu_jobs:
-  - python src/analysis/combine_landscapes.py $RESULTS_DIR/landscape/alpha_beta_90_no_noise/landscape_sobolev_loss_geomean_log1p_diagonal_T1000MeV_40x40.pkl $RESULTS_DIR/landscape/alpha_beta_90_no_noise/landscape_sobolev_loss_geomean_log1p_diagonal_T100MeV_40x40.pkl --output-dir $RESULTS_DIR/landscape/combined_no_noise
-  - python src/analysis/combine_landscapes.py $RESULTS_DIR/landscape/alpha_beta_90_noise/landscape_sobolev_loss_geomean_log1p_diagonal_T1000MeV_40x40_noise1.pkl $RESULTS_DIR/landscape/alpha_beta_90_noise/landscape_sobolev_loss_geomean_log1p_diagonal_T100MeV_40x40_noise1.pkl --output-dir $RESULTS_DIR/landscape/combined_noise

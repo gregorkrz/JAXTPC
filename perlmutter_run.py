@@ -40,6 +40,7 @@ REMOTE        = "pm"
 REMOTE_DIR    = "/global/homes/g/gregork/jaxtpc"   # host path (for rsync, SSH outside container)
 CONTAINER_DIR = "/workspace/jaxtpc"                # same path inside container ($HOME → /workspace)
 REMOTE_TMP    = "$HOME/.jaxtpc_tmp"                # shared FS, visible from compute nodes + container
+CONTAINER_TMP = "/workspace/.jaxtpc_tmp"           # same path as seen from inside the container
 SLURM_ACCOUNT = "m3246"
 
 
@@ -51,30 +52,46 @@ def _log(msg, tag="[main]"):
 
 # ── Script builders ───────────────────────────────────────────────────────────
 
-def _gpu_script(gpu_id, commands, command_timeout_min, container_dir):
-    """Shell script that runs inside the container for one GPU."""
+def _gpu_script(gpu_id, commands, command_timeout_min, container_dir, pid):
+    """Shell script that runs inside the container for one GPU.
+
+    Commands run sequentially; each captures its own stdout/stderr.  A failing
+    command is logged (exit code appended to its stderr file) but does NOT abort
+    the remaining commands on this GPU.
+    """
     lines = [
         "#!/bin/bash",
-        "set -euo pipefail",
         f"cd {container_dir}",
         "source .env",
         f"export CUDA_VISIBLE_DEVICES={gpu_id}",
     ]
-    for cmd in commands:
-        lines.append(f"timeout {command_timeout_min}m {cmd}")
+    for idx, cmd in enumerate(commands):
+        stdout_f = f"{CONTAINER_TMP}/gpu_{gpu_id}_cmd_{idx}_stdout_{pid}.txt"
+        stderr_f = f"{CONTAINER_TMP}/gpu_{gpu_id}_cmd_{idx}_stderr_{pid}.txt"
+        lines += [
+            f"timeout {command_timeout_min}m {cmd} > {stdout_f} 2> {stderr_f}",
+            f'echo "EXIT:$?" >> {stderr_f}',
+        ]
     return "\n".join(lines) + "\n"
 
 
-def _post_gpu_script(commands, command_timeout_min, container_dir):
-    """Shell script that runs CPU-only post-GPU jobs inside the container (no GPU assigned)."""
+def _post_gpu_script(commands, command_timeout_min, container_dir, pid):
+    """Shell script that runs CPU-only post-GPU jobs inside the container (no GPU assigned).
+
+    Same error-tolerant pattern as _gpu_script.
+    """
     lines = [
         "#!/bin/bash",
-        "set -euo pipefail",
         f"cd {container_dir}",
         "source .env",
     ]
-    for cmd in commands:
-        lines.append(f"timeout {command_timeout_min}m {cmd}")
+    for idx, cmd in enumerate(commands):
+        stdout_f = f"{CONTAINER_TMP}/post_gpu_cmd_{idx}_stdout_{pid}.txt"
+        stderr_f = f"{CONTAINER_TMP}/post_gpu_cmd_{idx}_stderr_{pid}.txt"
+        lines += [
+            f"timeout {command_timeout_min}m {cmd} > {stdout_f} 2> {stderr_f}",
+            f'echo "EXIT:$?" >> {stderr_f}',
+        ]
     return "\n".join(lines) + "\n"
 
 
@@ -87,10 +104,8 @@ def _salloc_script(gpu_ids, pid, remote_tmp, has_post_gpu):
     """
     lines = [
         "#!/bin/bash",
-        "set -euo pipefail",
         'NODE=$(scontrol show hostnames "$SLURM_NODELIST" | head -1)',
         'echo "[salloc] allocated node: $NODE"',
-        # Start container once, detached — idempotent, safe to call even if running
         'echo "[salloc] ensuring container is running..."',
         'ssh "$NODE" "sh ~/jax_start.sh"',
         'echo "[salloc] container ready — launching GPU workers"',
@@ -160,9 +175,47 @@ def _write_remote(path, content):
     _ssh(f"cat > {path}", input=content)
 
 
+def collect_logs(pid, gpu_cmds, post_gpu_cmds, plan_path):
+    """Fetch per-command stdout/stderr from Perlmutter and write structured local log files."""
+    stem = os.path.splitext(plan_path)[0]
+
+    sections = []
+    for gpu_id, commands in sorted(gpu_cmds.items()):
+        for idx, cmd in enumerate(commands):
+            sections.append((
+                f"GPU {gpu_id} | CMD {idx}", cmd,
+                f"{REMOTE_TMP}/gpu_{gpu_id}_cmd_{idx}_stdout_{pid}.txt",
+                f"{REMOTE_TMP}/gpu_{gpu_id}_cmd_{idx}_stderr_{pid}.txt",
+            ))
+    for idx, cmd in enumerate(post_gpu_cmds):
+        sections.append((
+            f"POST GPU | CMD {idx}", cmd,
+            f"{REMOTE_TMP}/post_gpu_cmd_{idx}_stdout_{pid}.txt",
+            f"{REMOTE_TMP}/post_gpu_cmd_{idx}_stderr_{pid}.txt",
+        ))
+
+    sep = "=" * 60
+    all_stdout, all_stderr = [], []
+    for label, cmd, stdout_f, stderr_f in sections:
+        header = f"{sep}\n=== {label} ===\n# {cmd}\n{sep}\n"
+        stdout_text = _ssh(f"cat {stdout_f} 2>/dev/null || true", capture=True).stdout
+        stderr_text = _ssh(f"cat {stderr_f} 2>/dev/null || true", capture=True).stdout
+        all_stdout.append(header + stdout_text + "\n")
+        all_stderr.append(header + stderr_text + "\n")
+
+    for suffix, lines in (("_stdout.txt", all_stdout), ("_stderr.txt", all_stderr)):
+        path = stem + suffix
+        with open(path, "w") as f:
+            f.write("".join(lines))
+        _log(f"logs → {path}")
+
+
 def _cleanup(pid):
-    _ssh(f"rm -f {REMOTE_TMP}/gpu_*_{pid}.sh {REMOTE_TMP}/post_gpu_{pid}.sh {REMOTE_TMP}/salloc_{pid}.sh",
-         check=False)
+    _ssh(
+        f"rm -f {REMOTE_TMP}/gpu_*_{pid}.sh {REMOTE_TMP}/post_gpu_{pid}.sh "
+        f"{REMOTE_TMP}/salloc_{pid}.sh {REMOTE_TMP}/*_{pid}.txt",
+        check=False,
+    )
 
 
 # ── Sync ──────────────────────────────────────────────────────────────────────
@@ -237,7 +290,7 @@ def main():
         _ssh(f"mkdir -p {REMOTE_TMP}")
 
     for gpu_id, commands in sorted(gpu_cmds.items()):
-        script = _gpu_script(gpu_id, commands, command_timeout, CONTAINER_DIR)
+        script = _gpu_script(gpu_id, commands, command_timeout, CONTAINER_DIR, pid)
         path   = f"{REMOTE_TMP}/gpu_{gpu_id}_{pid}.sh"
         if args.dry_run:
             _log(f"dry-run: gpu_{gpu_id} script → {path}\n{script}")
@@ -247,7 +300,7 @@ def main():
             _log(f"wrote {path}")
 
     if post_gpu_cmds:
-        post_script = _post_gpu_script(post_gpu_cmds, command_timeout, CONTAINER_DIR)
+        post_script = _post_gpu_script(post_gpu_cmds, command_timeout, CONTAINER_DIR, pid)
         post_path   = f"{REMOTE_TMP}/post_gpu_{pid}.sh"
         if args.dry_run:
             _log(f"dry-run: post_gpu script → {post_path}\n{post_script}")
@@ -278,7 +331,9 @@ def main():
         try:
             _ssh(salloc_cmd)
         finally:
-            _log(f"salloc finished in {time.time() - t0:.0f}s — cleaning up temp files")
+            _log(f"salloc finished in {time.time() - t0:.0f}s — collecting logs")
+            collect_logs(pid, gpu_cmds, post_gpu_cmds, args.plan)
+            _log("cleaning up temp files")
             _cleanup(pid)
             close_control_connection()
 

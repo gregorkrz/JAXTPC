@@ -18,7 +18,7 @@
 set -euo pipefail
 
 N=1
-M=3
+M=4
 MAX_STEPS=200
 BASE_RESULTS_DIR="results/1d_opt"
 LOSSES_DEFAULT="sobolev_loss,sobolev_loss_geomean_log1p"
