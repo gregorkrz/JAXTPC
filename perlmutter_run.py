@@ -67,22 +67,27 @@ def _gpu_script(gpu_id, commands, command_timeout_min, remote_dir):
 def _salloc_script(gpu_ids, pid, remote_tmp):
     """
     Bash script that salloc runs on the login node.
-    It resolves the compute node and fans out to one ssh per GPU.
+    Ensures the container is running (detached) on the compute node first,
+    then fans out one ssh per GPU using exec (no race on container creation).
     """
     lines = [
         "#!/bin/bash",
         "set -euo pipefail",
         'NODE=$(scontrol show hostnames "$SLURM_NODELIST" | head -1)',
         'echo "[salloc] allocated node: $NODE"',
+        # Start container once, detached — idempotent, safe to call even if running
+        'echo "[salloc] ensuring container is running..."',
+        'ssh "$NODE" "sh ~/jax_start.sh"',
+        'echo "[salloc] container ready — launching GPU workers"',
     ]
     for gpu_id in gpu_ids:
-        script_path = f"{remote_tmp}/gpu_{gpu_id}_{pid}.sh"
         lines.append(
-            f'ssh "$NODE" "sh ~/jax.sh {script_path}" &'
+            f'ssh "$NODE" "podman-hpc exec jaxtpc /bin/bash /workspace/.jaxtpc_tmp/gpu_{gpu_id}_{pid}.sh" &'
         )
     lines += [
         "wait",
-        'echo "[salloc] all GPU workers finished"',
+        'echo "[salloc] all GPU workers finished — stopping container"',
+        'ssh "$NODE" "podman-hpc stop jaxtpc"',
     ]
     return "\n".join(lines) + "\n"
 

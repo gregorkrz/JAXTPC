@@ -1,10 +1,10 @@
-time_limit: "01:00:00"   # salloc wall-clock limit (HH:MM:SS)
+time_limit: "00:10:00"   # salloc wall-clock limit (HH:MM:SS)
 command_timeout: 20       # per-command timeout in minutes
 
 gpus:
   0:
-    - python src/analysis/2d_loss_landscape.py --direction 1,1,1 --track-name diagonal --momentum 1000 --loss sobolev_loss_geomean_log1p --results-dir results/landscape/alpha_beta_90_no_noise --gradients
-    - python src/analysis/2d_loss_landscape.py --direction 1,1,1 --track-name diagonal --momentum 1000 --loss sobolev_loss_geomean_log1p --noise-scale 1.0 --results-dir results/landscape/alpha_beta_90_noise --gradients
+    - python src/analysis/2d_loss_landscape.py --direction 1,1,1 --track-name diagonal --momentum 1000 --loss sobolev_loss_geomean_log1p --results-dir $RESULTS_DIR/landscape/alpha_beta_90_no_noise --gradients
+    - python src/analysis/2d_loss_landscape.py --direction 1,1,1 --track-name diagonal --momentum 1000 --loss sobolev_loss_geomean_log1p --noise-scale 1.0 --results-dir $RESULTS_DIR/landscape/alpha_beta_90_noise --gradients
   1:
     # - python src/analysis/...
   2:
