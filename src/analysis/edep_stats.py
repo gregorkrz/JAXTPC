@@ -22,7 +22,7 @@ import plotly.graph_objects as go
 
 from tools.particle_generator import generate_muon_track
 
-DETECTOR_BOUNDS_MM = ((-300, 300), (-300, 300), (-300, 300))
+#DETECTOR_BOUNDS_MM = ((-300, 300), (-300, 300), (-300, 300))
 
 TRACKS = [
     dict(name='diagonal',       direction=(1.0, 1.0, 1.0), momentum_mev=1000.0),
@@ -89,7 +89,7 @@ def main():
             kinetic_energy_mev=t['momentum_mev'],
             step_size_mm=0.1,
             track_id=1,
-            detector_bounds_mm=DETECTOR_BOUNDS_MM,
+            #detector_bounds_mm=DETECTOR_BOUNDS_MM,
         )
         de = np.array(track['de'])   # MeV
         dx = np.array(track['dx'])   # mm

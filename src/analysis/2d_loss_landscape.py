@@ -46,9 +46,9 @@ GT_VELOCITY_CM_US = 0.160
 SOBOLEV_MAX_PAD   = 128
 
 CONFIG_PATH        = 'config/cubic_wireplane_config.yaml'
-N_SEGMENTS         = 10_000
+N_SEGMENTS         = 50_000
 MAX_ACTIVE_BUCKETS = 1000
-DETECTOR_BOUNDS_MM = ((-300, 300), (-300, 300), (-300, 300))
+#DETECTOR_BOUNDS_MM = ((-300, 300), (-300, 300), (-300, 300))
 
 TYPICAL_SCALES = {
     'recomb_alpha':   1.0,
@@ -401,13 +401,12 @@ def apply_noise_to_gt(gt_arrays, simulator, noise_scale, noise_seed):
     """
     cfg       = simulator.config
     noise_dict = generate_noise(cfg, key=jax.random.PRNGKey(noise_seed))
-    e_per_adc  = cfg.electrons_per_adc
     n_readouts = cfg.volumes[0].n_planes if simulator._readout_type == 'wire' else 1
     noisy = []
     for v in range(cfg.n_volumes):
         for p in range(n_readouts):
             gt  = gt_arrays[v * n_readouts + p]
-            noise = noise_dict[(v, p)] * e_per_adc * noise_scale
+            noise = noise_dict[(v, p)] * noise_scale
             # forward pads planes to max_wires; pad noise rows to match
             if noise.shape[0] < gt.shape[0]:
                 noise = jnp.pad(noise, ((0, gt.shape[0] - noise.shape[0]), (0, 0)))
@@ -465,7 +464,7 @@ def main():
         kinetic_energy_mev=args.momentum,
         step_size_mm=0.1,
         track_id=1,
-        detector_bounds_mm=DETECTOR_BOUNDS_MM,
+        #detector_bounds_mm=DETECTOR_BOUNDS_MM,
     )
     deposits = build_deposit_data(
         track['position'], track['de'], track['dx'], simulator.config,

@@ -18,13 +18,13 @@ Usage
 
 Named track presets
 -------------------
-  diagonal  (1,1,1)       1000 MeV
-  X         (1,0,0)       1000 MeV
-  Y         (0,1,0)       1000 MeV
-  Z         (0,0,1)       1000 MeV
-  U         (0,0.866,0.5) 1000 MeV
-  V         (0,-0.866,0.5)1000 MeV
-  track2    (0.5,1.05,0.2) 200 MeV
+  diagonal  (1,1,1)        1000 MeV
+  X         (1,0,0)        1000 MeV
+  Y         (0,1,0)        1000 MeV
+  Z         (0,0,1)        1000 MeV
+  U         (0,0.866,0.5)  1000 MeV
+  V         (0,-0.866,0.5) 1000 MeV
+  track2    (0.5,1.05,0.2)  200 MeV
 
   Custom tracks: name:dx,dy,dz:momentum_mev  (mixed with presets is fine)
   e.g. --tracks diagonal+mytrack:0.1,0.2,0.9:500
@@ -59,6 +59,12 @@ import os
 import pickle
 import time
 
+try:
+    import wandb as _wandb
+    _WANDB_AVAILABLE = True
+except ImportError:
+    _WANDB_AVAILABLE = False
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -85,7 +91,7 @@ SOBOLEV_MAX_PAD   = 128
 CONFIG_PATH        = 'config/cubic_wireplane_config.yaml'
 N_SEGMENTS         = 10_000
 MAX_ACTIVE_BUCKETS = 1000
-DETECTOR_BOUNDS_MM = ((-300, 300), (-300, 300), (-300, 300))
+#DETECTOR_BOUNDS_MM = ((-300, 300), (-300, 300), (-300, 300))
 
 _JAX_CACHE_DIR = os.path.expanduser('~/.cache/jax_compilation_cache')
 jax.config.update('jax_compilation_cache_dir', _JAX_CACHE_DIR)
@@ -172,6 +178,12 @@ def parse_args():
                         '(MicroBooNE model, converted to signal units via electrons_per_adc). '
                         '0.0 = no noise (default), 1.0 = realistic noise. '
                         'Signal and noise RMS are printed at startup for reference.')
+    p.add_argument('--no-wandb', action='store_true',
+                   help='Disable Weights & Biases logging (enabled by default).')
+    p.add_argument('--wandb-project', default='jaxtpc-optimization',
+                   help='W&B project name (default: jaxtpc-optimization).')
+    p.add_argument('--log-interval', type=int, default=50,
+                   help='Log to W&B every this many steps (default: 50).')
     return p.parse_args()
 
 
@@ -350,7 +362,9 @@ def make_optax_optimizer(optimizer_name, lr, lr_schedule, max_steps):
 
 # ── Trial runner ───────────────────────────────────────────────────────────────
 
-def run_trial(p0, val_and_grad_fn, optimizer, max_steps, tol=1e-5, patience=20):
+def run_trial(p0, val_and_grad_fn, optimizer, max_steps, tol=1e-5, patience=20,
+              log_interval=50, param_names=None, scales=None, p_n_gts=None,
+              use_wandb=False, trial_idx=0):
     """Run one optimization trial from starting p_n vector p0 (any length).
 
     Records param, loss, and gradient at every step.
@@ -368,7 +382,8 @@ def run_trial(p0, val_and_grad_fn, optimizer, max_steps, tol=1e-5, patience=20):
     loss_traj  = []
     grad_traj  = []
 
-    t_start = time.time()
+    t_start    = time.time()
+    step_start = time.time()
 
     lv, gv = val_and_grad_fn(p)
     jax.block_until_ready((lv, gv))
@@ -376,17 +391,29 @@ def run_trial(p0, val_and_grad_fn, optimizer, max_steps, tol=1e-5, patience=20):
     loss_traj.append(float(lv))
     grad_traj.append(gv.tolist())
 
+    if use_wandb and _WANDB_AVAILABLE:
+        _wandb_log_step(0, float(lv), gv, p, param_names, scales, p_n_gts,
+                        step_time_s=0.0, trial_idx=trial_idx)
+
     stopped_early = False
     for step in range(max_steps):
+        step_start = time.time()
         lv, gv = val_and_grad_fn(p)
         jax.block_until_ready((lv, gv))
         updates, opt_state = optimizer.update(gv, opt_state)
         p = optax.apply_updates(p, updates)
         lv_new, gv_new = val_and_grad_fn(p)
         jax.block_until_ready((lv_new, gv_new))
+        step_time = time.time() - step_start
+
         param_traj.append(p.tolist())
         loss_traj.append(float(lv_new))
         grad_traj.append(gv_new.tolist())
+
+        if use_wandb and _WANDB_AVAILABLE and (step + 1) % log_interval == 0:
+            _wandb_log_step(step + 1, float(lv_new), gv_new, p,
+                            param_names, scales, p_n_gts,
+                            step_time_s=step_time, trial_idx=trial_idx)
 
         if step >= patience:
             p_now  = np.array(param_traj[-1])
@@ -406,6 +433,34 @@ def run_trial(p0, val_and_grad_fn, optimizer, max_steps, tol=1e-5, patience=20):
     )
 
 
+def _wandb_log_step(step, loss, gv, p, param_names, scales, p_n_gts,
+                    step_time_s, trial_idx):
+    """Log one step to W&B."""
+    p_np  = np.array(p)
+    gv_np = np.array(gv)
+
+    log = {
+        'trial':          trial_idx,
+        'loss':           loss,
+        'grad_norm':      float(np.linalg.norm(gv_np)),
+        'param_norm':     float(np.linalg.norm(p_np)),
+        'step_time_s':    step_time_s,
+    }
+
+    if param_names is not None:
+        for i, name in enumerate(param_names):
+            log[f'params/{name}_normalized'] = float(p_np[i])
+            if scales is not None:
+                log[f'params/{name}_physical'] = float(p_np[i] * scales[i])
+            if p_n_gts is not None:
+                rel_err = abs(float(p_np[i]) - p_n_gts[i]) / (abs(p_n_gts[i]) + 1e-30)
+                log[f'params/{name}_rel_err'] = rel_err
+            if gv_np is not None:
+                log[f'grads/{name}'] = float(gv_np[i])
+
+    _wandb.log(log, step=step)
+
+
 # ── Noise ─────────────────────────────────────────────────────────────────────
 
 def apply_noise_to_gt(gt_arrays, simulator, noise_scale, noise_seed):
@@ -418,15 +473,13 @@ def apply_noise_to_gt(gt_arrays, simulator, noise_scale, noise_seed):
     same fixed noisy target.
     """
     cfg = simulator.config
-    noise_dict = generate_noise(cfg, key=jax.random.PRNGKey(noise_seed))
-    e_per_adc  = cfg.electrons_per_adc
-
+    noise_dict   = generate_noise(cfg, key=jax.random.PRNGKey(noise_seed))
     n_readouts = cfg.volumes[0].n_planes if simulator._readout_type == 'wire' else 1
     noisy = []
     for v in range(cfg.n_volumes):
         for p in range(n_readouts):
             gt = gt_arrays[v * n_readouts + p]
-            noise = noise_dict[(v, p)] * e_per_adc * noise_scale
+            noise = noise_dict[(v, p)] * noise_scale
             if noise.shape[0] < gt.shape[0]:
                 noise = jnp.pad(noise, ((0, gt.shape[0] - noise.shape[0]), (0, 0)))
             noisy.append(gt + noise)
@@ -463,6 +516,10 @@ def main():
         print(f'Skipping: {output_path} already exists.')
         return
 
+    use_wandb = (not args.no_wandb) and _WANDB_AVAILABLE
+    if not args.no_wandb and not _WANDB_AVAILABLE:
+        print('Warning: wandb not installed — logging disabled. pip install wandb to enable.')
+
     print(f'JAX devices  : {jax.devices()}')
     print(f'Params       : {param_names}')
     print(f'Range        : [{range_lo}, {range_hi}] × GT')
@@ -473,7 +530,33 @@ def main():
     print(f'N            : {args.N}')
     print(f'Seed         : {effective_seed}')
     print(f'Noise scale  : {args.noise_scale}')
+    print(f'W&B          : {"enabled  project=" + args.wandb_project if use_wandb else "disabled"}')
+    print(f'Log interval : {args.log_interval} steps')
     print(f'Output       : {output_path}')
+
+    # ── W&B init ──────────────────────────────────────────────────────────────
+    if use_wandb:
+        _wandb.init(
+            project=args.wandb_project,
+            name=folder_name,
+            config=dict(
+                param_names   = param_names,
+                tracks        = [t['name'] for t in track_specs],
+                loss          = args.loss,
+                optimizer     = args.optimizer,
+                lr            = args.lr,
+                lr_schedule   = args.lr_schedule,
+                max_steps     = args.max_steps,
+                tol           = args.tol,
+                patience      = args.patience,
+                N             = args.N,
+                range_lo      = range_lo,
+                range_hi      = range_hi,
+                noise_scale   = args.noise_scale,
+                seed          = effective_seed,
+                log_interval  = args.log_interval,
+            ),
+        )
 
     # ── Simulator ─────────────────────────────────────────────────────────────
     print('\nBuilding differentiable simulator...')
@@ -501,7 +584,7 @@ def main():
             kinetic_energy_mev=ts['momentum_mev'],
             step_size_mm=0.1,
             track_id=1,
-            detector_bounds_mm=DETECTOR_BOUNDS_MM,
+            #detector_bounds_mm=DETECTOR_BOUNDS_MM,
         )
         deposits = build_deposit_data(
             track['position'], track['de'], track['dx'], simulator.config,
@@ -593,6 +676,9 @@ def main():
         trial = run_trial(
             pn_start, val_and_grad_fn, optimizer,
             args.max_steps, tol=args.tol, patience=args.patience,
+            log_interval=args.log_interval,
+            param_names=param_names, scales=scales, p_n_gts=p_n_gts,
+            use_wandb=use_wandb, trial_idx=gi,
         )
         all_trials.append(trial)
 
@@ -631,6 +717,9 @@ def main():
     with open(output_path, 'wb') as f:
         pickle.dump(result, f)
     print(f'\nSaved: {output_path}')
+
+    if use_wandb:
+        _wandb.finish()
 
 
 if __name__ == '__main__':
