@@ -27,4 +27,5 @@ jobs:
           python -m pip install pyyaml
 
       - name: Run viewer discovery tests
-        run: python -m unittest tests.test_viewer_serve -v
+        run: |
+          python -m unittest tests.test_optimization_run -v
