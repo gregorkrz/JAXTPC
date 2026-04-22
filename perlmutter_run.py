@@ -36,9 +36,10 @@ import time
 
 import yaml
 
-REMOTE       = "pm"
-REMOTE_DIR   = "/global/homes/g/gregork/jaxtpc"
-REMOTE_TMP   = "$HOME/.jaxtpc_tmp"           # on shared FS, visible from compute nodes
+REMOTE        = "pm"
+REMOTE_DIR    = "/global/homes/g/gregork/jaxtpc"   # host path (for rsync, SSH outside container)
+CONTAINER_DIR = "/workspace/jaxtpc"                # same path inside container ($HOME → /workspace)
+REMOTE_TMP    = "$HOME/.jaxtpc_tmp"                # shared FS, visible from compute nodes + container
 SLURM_ACCOUNT = "m3246"
 
 
@@ -50,12 +51,12 @@ def _log(msg, tag="[main]"):
 
 # ── Script builders ───────────────────────────────────────────────────────────
 
-def _gpu_script(gpu_id, commands, command_timeout_min, remote_dir):
+def _gpu_script(gpu_id, commands, command_timeout_min, container_dir):
     """Shell script that runs inside the container for one GPU."""
     lines = [
         "#!/bin/bash",
         "set -euo pipefail",
-        f"cd {remote_dir}",
+        f"cd {container_dir}",
         "source .env",
         f"export CUDA_VISIBLE_DEVICES={gpu_id}",
     ]
@@ -64,11 +65,25 @@ def _gpu_script(gpu_id, commands, command_timeout_min, remote_dir):
     return "\n".join(lines) + "\n"
 
 
-def _salloc_script(gpu_ids, pid, remote_tmp):
+def _post_gpu_script(commands, command_timeout_min, container_dir):
+    """Shell script that runs CPU-only post-GPU jobs inside the container (no GPU assigned)."""
+    lines = [
+        "#!/bin/bash",
+        "set -euo pipefail",
+        f"cd {container_dir}",
+        "source .env",
+    ]
+    for cmd in commands:
+        lines.append(f"timeout {command_timeout_min}m {cmd}")
+    return "\n".join(lines) + "\n"
+
+
+def _salloc_script(gpu_ids, pid, remote_tmp, has_post_gpu):
     """
     Bash script that salloc runs on the login node.
     Ensures the container is running (detached) on the compute node first,
     then fans out one ssh per GPU using exec (no race on container creation).
+    After all GPU workers finish, optionally runs CPU-only post-GPU jobs.
     """
     lines = [
         "#!/bin/bash",
@@ -84,26 +99,60 @@ def _salloc_script(gpu_ids, pid, remote_tmp):
         lines.append(
             f'ssh "$NODE" "podman-hpc exec jaxtpc /bin/bash /workspace/.jaxtpc_tmp/gpu_{gpu_id}_{pid}.sh" &'
         )
+    lines.append("wait")
+    lines.append('echo "[salloc] all GPU workers finished"')
+    if has_post_gpu:
+        lines += [
+            'echo "[salloc] running post-GPU CPU-only jobs..."',
+            f'ssh "$NODE" "podman-hpc exec jaxtpc /bin/bash /workspace/.jaxtpc_tmp/post_gpu_{pid}.sh"',
+            'echo "[salloc] post-GPU jobs finished"',
+        ]
     lines += [
-        "wait",
-        'echo "[salloc] all GPU workers finished — stopping container"',
+        'echo "[salloc] stopping container"',
         'ssh "$NODE" "podman-hpc stop jaxtpc"',
     ]
     return "\n".join(lines) + "\n"
 
 
+# ── SSH ControlMaster — one persistent connection for the whole run ───────────
+
+_control_socket = None
+
+
+def open_control_connection():
+    global _control_socket
+    _control_socket = f"/tmp/ssh_cm_{REMOTE}_{os.getpid()}"
+    _log(f"opening persistent SSH connection to {REMOTE} ...")
+    subprocess.run(
+        ["ssh", "-M", "-S", _control_socket, "-fN", REMOTE],
+        check=True,
+    )
+    _log("connection established")
+
+
+def close_control_connection():
+    if _control_socket:
+        subprocess.run(
+            ["ssh", "-S", _control_socket, "-O", "exit", REMOTE],
+            check=False, capture_output=True,
+        )
+        _log("SSH connection closed")
+
+
 # ── Remote helpers ────────────────────────────────────────────────────────────
 
 def _ssh(cmd, input=None, check=True, capture=False):
-    """Run a command on the login node via SSH."""
-    full = ["ssh", REMOTE, cmd]
+    """Run a command on the login node, reusing the ControlMaster socket."""
+    ssh_args = ["ssh"]
+    if _control_socket:
+        ssh_args += ["-S", _control_socket]
+    ssh_args += [REMOTE, cmd]
     kwargs = dict(text=True, check=check)
     if input is not None:
         kwargs["input"] = input
-        kwargs["stdin"] = subprocess.PIPE
     if capture:
         kwargs["capture_output"] = True
-    return subprocess.run(full, **kwargs)
+    return subprocess.run(ssh_args, **kwargs)
 
 
 def _write_remote(path, content):
@@ -112,7 +161,7 @@ def _write_remote(path, content):
 
 
 def _cleanup(pid):
-    _ssh(f"rm -f {REMOTE_TMP}/gpu_*_{pid}.sh {REMOTE_TMP}/salloc_{pid}.sh",
+    _ssh(f"rm -f {REMOTE_TMP}/gpu_*_{pid}.sh {REMOTE_TMP}/post_gpu_{pid}.sh {REMOTE_TMP}/salloc_{pid}.sh",
          check=False)
 
 
@@ -153,11 +202,12 @@ def main():
     time_limit       = raw.get("time_limit", "01:00:00")
     command_timeout  = int(raw.get("command_timeout", 20))
     gpu_section      = raw.get("gpus", {})
+    post_gpu_cmds    = [str(c) for c in raw.get("post_gpu_jobs", []) or []]
 
     gpu_cmds = {}
     for k, v in gpu_section.items():
         gpu_id = int(str(k).replace("gpu_", ""))
-        if v:
+        if v is not None and len(v) > 0:
             gpu_cmds[gpu_id] = list(v)
 
     if not gpu_cmds:
@@ -167,12 +217,18 @@ def main():
     n_cmds = sum(len(v) for v in gpu_cmds.values())
     _log(f"plan: {n_cmds} command(s) across GPU(s) {sorted(gpu_cmds)}  "
          f"salloc time={time_limit}  command_timeout={command_timeout}m")
+    if post_gpu_cmds:
+        _log(f"post-GPU jobs: {len(post_gpu_cmds)} command(s) (CPU-only, run after all GPUs finish)")
 
     pid = os.getpid()
 
     # ── Step 1: sync code ─────────────────────────────────────────────────────
     if not args.no_sync_code:
         sync_code(args.dry_run)
+
+    # ── Open persistent SSH connection ────────────────────────────────────────
+    if not args.dry_run:
+        open_control_connection()
 
     # ── Step 2: write scripts to Perlmutter shared FS ────────────────────────
     if args.dry_run:
@@ -181,7 +237,7 @@ def main():
         _ssh(f"mkdir -p {REMOTE_TMP}")
 
     for gpu_id, commands in sorted(gpu_cmds.items()):
-        script = _gpu_script(gpu_id, commands, command_timeout, REMOTE_DIR)
+        script = _gpu_script(gpu_id, commands, command_timeout, CONTAINER_DIR)
         path   = f"{REMOTE_TMP}/gpu_{gpu_id}_{pid}.sh"
         if args.dry_run:
             _log(f"dry-run: gpu_{gpu_id} script → {path}\n{script}")
@@ -190,7 +246,17 @@ def main():
             _ssh(f"chmod +x {path}")
             _log(f"wrote {path}")
 
-    salloc_script = _salloc_script(sorted(gpu_cmds), pid, REMOTE_TMP)
+    if post_gpu_cmds:
+        post_script = _post_gpu_script(post_gpu_cmds, command_timeout, CONTAINER_DIR)
+        post_path   = f"{REMOTE_TMP}/post_gpu_{pid}.sh"
+        if args.dry_run:
+            _log(f"dry-run: post_gpu script → {post_path}\n{post_script}")
+        else:
+            _write_remote(post_path, post_script)
+            _ssh(f"chmod +x {post_path}")
+            _log(f"wrote {post_path}")
+
+    salloc_script = _salloc_script(sorted(gpu_cmds), pid, REMOTE_TMP, has_post_gpu=bool(post_gpu_cmds))
     salloc_path   = f"{REMOTE_TMP}/salloc_{pid}.sh"
     if args.dry_run:
         _log(f"dry-run: salloc script → {salloc_path}\n{salloc_script}")
@@ -214,6 +280,7 @@ def main():
         finally:
             _log(f"salloc finished in {time.time() - t0:.0f}s — cleaning up temp files")
             _cleanup(pid)
+            close_control_connection()
 
     # ── Step 4: sync results ──────────────────────────────────────────────────
     if not args.no_sync_results:

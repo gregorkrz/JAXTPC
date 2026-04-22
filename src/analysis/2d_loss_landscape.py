@@ -299,19 +299,21 @@ def plot_landscape_plotly(landscape, output_dir):
 
     noise_scale = landscape.get('noise_scale', 0.0)
     noise_tag   = f'_noise{noise_scale:.3g}'.replace('.', 'p') if noise_scale > 0.0 else ''
+    mom_tag     = f'_T{mom_mev:.0f}MeV'
     os.makedirs(output_dir, exist_ok=True)
-    fname = f'landscape_{loss_name}_{track_name}_{grid_size}x{grid_size}{noise_tag}.html'
+    fname = f'landscape_{loss_name}_{track_name}{mom_tag}_{grid_size}x{grid_size}{noise_tag}.html'
     out_path = os.path.join(output_dir, fname)
     fig.write_html(out_path)
     print(f'  Saved: {out_path}')
 
 
-def plot_landscape(landscape, output_dir, overlay_dir=None):
+def _plot_landscape_single(landscape, output_dir, overlay_dir, norm, log_scale):
+    """Render one matplotlib landscape figure with the given norm."""
     loss_name   = landscape['loss_name']
     track_name  = landscape['track_name']
     alpha_vals  = np.array(landscape['alpha_vals'])
     beta90_vals = np.array(landscape['beta90_vals'])
-    grid        = np.array(landscape['grid'])        # shape (N_alpha, N_beta90)
+    grid        = np.array(landscape['grid'])
     gt_alpha    = landscape['gt_alpha']
     gt_beta90   = landscape['gt_beta90']
     direction   = landscape['direction']
@@ -323,18 +325,12 @@ def plot_landscape(landscape, output_dir, overlay_dir=None):
 
     fig, ax = plt.subplots(figsize=(8, 6))
 
-    # Heatmap — rows = alpha (y-axis), cols = beta_90 (x-axis) → transpose
-    # grid[i, j] = loss at (alpha_vals[i], beta90_vals[j])
-    vmin = np.nanpercentile(grid, 2)
-    vmax = np.nanpercentile(grid, 98)
-    norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
-
     im = ax.pcolormesh(beta90_vals, alpha_vals, grid,
                        norm=norm, cmap='viridis', shading='auto')
     cbar = fig.colorbar(im, ax=ax)
-    cbar.set_label(f'{loss_label}', fontsize=9)
+    scale_tag = ' (log)' if log_scale else ''
+    cbar.set_label(f'{loss_label}{scale_tag}', fontsize=9)
 
-    # Contour overlay
     try:
         ax.contour(beta90_vals, alpha_vals, grid, levels=12,
                    colors='white', linewidths=0.5, alpha=0.4,
@@ -342,25 +338,20 @@ def plot_landscape(landscape, output_dir, overlay_dir=None):
     except Exception:
         pass
 
-    # Gradient field lines (descent direction) if available
     if 'grad_alpha' in landscape and 'grad_beta90' in landscape:
-        ga = np.array(landscape['grad_alpha'])   # dL/d_alpha, shape (N_alpha, N_beta90)
-        gb = np.array(landscape['grad_beta90'])  # dL/d_beta90
-        # Normalise each component by its axis span so neither axis dominates visually
+        ga = np.array(landscape['grad_alpha'])
+        gb = np.array(landscape['grad_beta90'])
         span_a = alpha_vals[-1]  - alpha_vals[0]  or 1.0
         span_b = beta90_vals[-1] - beta90_vals[0] or 1.0
-        u = -gb / span_b   # descent in beta90 direction (x-axis), normalised
-        v = -ga / span_a   # descent in alpha direction   (y-axis), normalised
-        # streamplot requires a uniform 1-D grid; ours already is
+        u = -gb / span_b
+        v = -ga / span_a
         ax.streamplot(beta90_vals, alpha_vals, u, v,
                       color='white', linewidth=0.8, arrowsize=1.2,
                       density=1.2, minlength=0.05, zorder=3)
 
-    # GT marker
     ax.plot(gt_beta90, gt_alpha, '*', color='red', ms=14, zorder=5,
             label=f'GT  (α={gt_alpha:.4g}, β₉₀={gt_beta90:.4g})')
 
-    # Overlay trajectories
     if overlay_dir is not None:
         trajs = _load_overlay_trajectories(overlay_dir, loss_name, track_name)
         for k, traj in enumerate(trajs):
@@ -373,9 +364,10 @@ def plot_landscape(landscape, output_dir, overlay_dir=None):
 
     ax.set_xlabel('recomb β₉₀', fontsize=10)
     ax.set_ylabel('recomb α', fontsize=10)
+    title_scale = '  [log color scale]' if log_scale else ''
     ax.set_title(
         f'Loss landscape  |  {loss_label}  |  track: {track_name}  '
-        f'dir={direction}  T={mom_mev} MeV\n'
+        f'dir={direction}  T={mom_mev} MeV{title_scale}\n'
         f'{grid_size}×{grid_size} grid  ±{range_frac*100:.0f}%% around GT',
         fontsize=9,
     )
@@ -384,12 +376,28 @@ def plot_landscape(landscape, output_dir, overlay_dir=None):
 
     noise_scale = landscape.get('noise_scale', 0.0)
     noise_tag   = f'_noise{noise_scale:.3g}'.replace('.', 'p') if noise_scale > 0.0 else ''
+    log_suffix  = '_log' if log_scale else ''
+    mom_tag     = f'_T{mom_mev:.0f}MeV'
     os.makedirs(output_dir, exist_ok=True)
-    fname = f'landscape_{loss_name}_{track_name}_{grid_size}x{grid_size}{noise_tag}.pdf'
+    fname = f'landscape_{loss_name}_{track_name}{mom_tag}_{grid_size}x{grid_size}{noise_tag}{log_suffix}.pdf'
     out_path = os.path.join(output_dir, fname)
     fig.savefig(out_path, bbox_inches='tight')
     plt.close(fig)
     print(f'  Saved: {out_path}')
+
+
+def plot_landscape(landscape, output_dir, overlay_dir=None):
+    grid = np.array(landscape['grid'])
+
+    vmin = np.nanpercentile(grid, 2)
+    vmax = np.nanpercentile(grid, 98)
+
+    linear_norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
+    _plot_landscape_single(landscape, output_dir, overlay_dir, linear_norm, log_scale=False)
+
+    pos_min = grid[grid > 0].min() if np.any(grid > 0) else 1e-10
+    log_norm = mcolors.LogNorm(vmin=max(pos_min, vmax * 1e-6), vmax=vmax)
+    _plot_landscape_single(landscape, output_dir, overlay_dir, log_norm, log_scale=True)
 
     plot_landscape_plotly(landscape, output_dir)
 
