@@ -22,10 +22,16 @@ Usage
     python 1d_opt_plots.py --results-dir results/1d_opt --output-dir plots/1d_opt
 """
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import argparse
 import glob
 import os
 import pickle
+
+_RESULTS_DIR = os.environ.get('RESULTS_DIR', 'results')
+_PLOTS_DIR   = os.environ.get('PLOTS_DIR',   'plots')
 
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
@@ -69,7 +75,7 @@ def parse_args():
                         'default: all found in results dir')
     p.add_argument('--track-name', default='diagonal',
                    help='Comma-separated track name(s) to plot (default: diagonal)')
-    p.add_argument('--results-dir', default='results/1d_opt',
+    p.add_argument('--results-dir', default=os.path.join(_RESULTS_DIR, '1d_opt'),
                    help='Directory containing pkl files (default: results/1d_opt)')
     p.add_argument('--recursive', action='store_true',
                    help='Also scan subdirectories of --results-dir (e.g. lr_*/) '

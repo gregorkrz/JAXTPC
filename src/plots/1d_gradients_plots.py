@@ -15,10 +15,16 @@ Usage
     python 1d_gradients_plots.py --results-dir results/1d_gradients --output-dir plots
 """
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import argparse
 import glob
 import os
 import pickle
+
+_RESULTS_DIR = os.environ.get('RESULTS_DIR', 'results')
+_PLOTS_DIR   = os.environ.get('PLOTS_DIR',   'plots')
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -46,7 +52,7 @@ def parse_args():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('--N', type=int, default=2,
                    help='N used when running 1d_gradients.py (default: 2)')
-    p.add_argument('--results-dir', default='results/1d_gradients',
+    p.add_argument('--results-dir', default=os.path.join(_RESULTS_DIR, '1d_gradients'),
                    help='Directory containing pkl files '
                         '(default: results/1d_gradients)')
     p.add_argument('--track-name', default='diagonal',

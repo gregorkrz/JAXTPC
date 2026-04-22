@@ -55,8 +55,11 @@ TYPICAL_SCALES = {
     'recomb_beta_90': 0.2,
 }
 
-_JAX_CACHE_DIR = os.path.expanduser('~/.cache/jax_compilation_cache')
+_JAX_CACHE_DIR = os.environ.get('JAX_COMPILATION_CACHE_DIR',
+                                os.path.expanduser('~/.cache/jax_compilation_cache'))
 jax.config.update('jax_compilation_cache_dir', _JAX_CACHE_DIR)
+_RESULTS_DIR = os.environ.get('RESULTS_DIR', 'results')
+_PLOTS_DIR   = os.environ.get('PLOTS_DIR',   'plots')
 jax.config.update('jax_persistent_cache_min_compile_time_secs', 1.0)
 
 VALID_LOSSES = ('sobolev_loss', 'sobolev_loss_geomean_log1p', 'mse_loss', 'l1_loss')
@@ -90,7 +93,7 @@ def parse_args():
                    help='Muon direction as x,y,z (default: 1,1,1)')
     p.add_argument('--momentum', type=float, default=1000.0,
                    help='Muon kinetic energy in MeV (default: 1000.0)')
-    p.add_argument('--results-dir', default='results/2d_landscape',
+    p.add_argument('--results-dir', default=os.path.join(_RESULTS_DIR, '2d_landscape'),
                    help='Output directory for pkl and plots (default: results/2d_landscape)')
     p.add_argument('--overlay', default=None,
                    help='Path to a 2d_opt results dir; overlays matching trajectories on plot')

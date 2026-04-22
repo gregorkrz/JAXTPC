@@ -73,9 +73,12 @@ MAX_ACTIVE_BUCKETS = 1000
 DETECTOR_BOUNDS_MM = ((-300, 300), (-300, 300), (-300, 300))
 
 # Persist compiled XLA programs across runs
-_JAX_CACHE_DIR = os.path.expanduser('~/.cache/jax_compilation_cache')
+_JAX_CACHE_DIR = os.environ.get('JAX_COMPILATION_CACHE_DIR',
+                                os.path.expanduser('~/.cache/jax_compilation_cache'))
 jax.config.update('jax_compilation_cache_dir', _JAX_CACHE_DIR)
 jax.config.update('jax_persistent_cache_min_compile_time_secs', 1.0)
+_RESULTS_DIR = os.environ.get('RESULTS_DIR', 'results')
+_PLOTS_DIR   = os.environ.get('PLOTS_DIR',   'plots')
 
 VALID_PARAMS = (
     'velocity_cm_us',
@@ -116,7 +119,7 @@ def parse_args():
                    help='Comma-separated list of losses (default: both)')
     p.add_argument('--N', type=int, default=2,
                    help='Points on each side of GT (default: 2, giving 2N+1 total)')
-    p.add_argument('--results-dir', default='results/1d_gradients',
+    p.add_argument('--results-dir', default=os.path.join(_RESULTS_DIR, '1d_gradients'),
                    help='Output directory (default: results/1d_gradients)')
     p.add_argument('--track-name', default='diagonal',
                    help='Label for the track direction, used in the output '

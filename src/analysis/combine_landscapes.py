@@ -21,6 +21,9 @@ load_dotenv()
 
 import argparse
 import os
+
+_RESULTS_DIR = os.environ.get('RESULTS_DIR', 'results')
+_PLOTS_DIR   = os.environ.get('PLOTS_DIR',   'plots')
 import pickle
 
 import importlib.util
@@ -44,7 +47,7 @@ def parse_args():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument('pkls', nargs='+',
                    help='Two or more landscape pkl files to combine')
-    p.add_argument('--output-dir', default='results/2d_landscape_combined',
+    p.add_argument('--output-dir', default=os.path.join(_RESULTS_DIR, '2d_landscape_combined'),
                    help='Directory for combined pkl and plots')
     p.add_argument('--output-name', default=None,
                    help='Base filename (without extension) for outputs; '

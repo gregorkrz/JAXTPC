@@ -20,6 +20,12 @@ Usage
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
+from dotenv import load_dotenv
+load_dotenv()
+
+_RESULTS_DIR = os.environ.get('RESULTS_DIR', 'results')
+_PLOTS_DIR   = os.environ.get('PLOTS_DIR',   'plots')
+
 import argparse
 import glob
 import pickle
@@ -52,9 +58,9 @@ LOSS_LABELS = {
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--results-dir', default='results/opt',
+    p.add_argument('--results-dir', default=os.path.join(_RESULTS_DIR, 'opt'),
                    help='Directory (or tree) containing result_*.pkl files')
-    p.add_argument('--output-dir', default='plots/opt',
+    p.add_argument('--output-dir', default=os.path.join(_PLOTS_DIR, 'opt'),
                    help='Where to save PDFs')
     return p.parse_args()
 

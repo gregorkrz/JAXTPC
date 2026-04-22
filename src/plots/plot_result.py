@@ -14,6 +14,12 @@ Usage
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
+from dotenv import load_dotenv
+load_dotenv()
+
+_RESULTS_DIR = os.environ.get('RESULTS_DIR', 'results')
+_PLOTS_DIR   = os.environ.get('PLOTS_DIR',   'plots')
+
 import argparse
 import glob
 import pickle
@@ -50,7 +56,7 @@ def parse_args():
 
 
 def find_latest_pkl():
-    pkls = glob.glob('results/**/*.pkl', recursive=True) + glob.glob('results/*.pkl')
+    pkls = glob.glob(os.path.join(_RESULTS_DIR, '**', '*.pkl'), recursive=True) + glob.glob(os.path.join(_RESULTS_DIR, '*.pkl'))
     if not pkls:
         raise FileNotFoundError('No result_*.pkl found under results/')
     return max(pkls, key=os.path.getmtime)

@@ -16,6 +16,9 @@ load_dotenv()
 import argparse
 import gc
 import os
+
+_RESULTS_DIR = os.environ.get('RESULTS_DIR', 'results')
+_PLOTS_DIR   = os.environ.get('PLOTS_DIR',   'plots')
 import pickle
 import time
 
@@ -33,8 +36,8 @@ from tools.losses import sobolev_loss_single, make_sobolev_weight
 # =============================================================================
 
 parser = argparse.ArgumentParser(description='Run lifetime/velocity optimization')
-parser.add_argument('--output-dir', default='results',
-                    help='Directory to save results (default: results)')
+parser.add_argument('--output-dir', default=_RESULTS_DIR,
+                    help='Directory to save results (default: $RESULTS_DIR or results)')
 parser.add_argument('--output-file', default='optimization_results.pkl',
                     help='Filename for the pickle (default: optimization_results.pkl)')
 parser.add_argument('--n-tries', type=int, default=10,

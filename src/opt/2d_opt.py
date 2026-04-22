@@ -86,9 +86,12 @@ N_SEGMENTS         = 10_000
 MAX_ACTIVE_BUCKETS = 1000
 DETECTOR_BOUNDS_MM = ((-300, 300), (-300, 300), (-300, 300))
 
-_JAX_CACHE_DIR = os.path.expanduser('~/.cache/jax_compilation_cache')
+_JAX_CACHE_DIR = os.environ.get('JAX_COMPILATION_CACHE_DIR',
+                                os.path.expanduser('~/.cache/jax_compilation_cache'))
 jax.config.update('jax_compilation_cache_dir', _JAX_CACHE_DIR)
 jax.config.update('jax_persistent_cache_min_compile_time_secs', 1.0)
+_RESULTS_DIR = os.environ.get('RESULTS_DIR', 'results')
+_PLOTS_DIR   = os.environ.get('PLOTS_DIR',   'plots')
 
 VALID_PARAMS = (
     'velocity_cm_us',
@@ -155,7 +158,7 @@ def parse_args():
     p.add_argument('--N', type=int, default=25,
                    help='Number of random trials (default: 25); each trial '
                         'draws both parameters uniformly from [0.95, 1.05] × GT')
-    p.add_argument('--results-dir', default='results/2d_opt',
+    p.add_argument('--results-dir', default=os.path.join(_RESULTS_DIR, '2d_opt'),
                    help='Output directory (default: results/2d_opt)')
     p.add_argument('--track-name', default='diagonal',
                    help='Label for the track direction (default: diagonal)')

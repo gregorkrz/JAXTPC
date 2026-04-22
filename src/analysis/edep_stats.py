@@ -16,6 +16,9 @@ load_dotenv()
 import argparse
 import os
 
+_RESULTS_DIR = os.environ.get('RESULTS_DIR', 'results')
+_PLOTS_DIR   = os.environ.get('PLOTS_DIR',   'plots')
+
 import numpy as np
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
@@ -36,7 +39,7 @@ TRACKS = [
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--output-dir', default='results/muon_track_visualization',
+    p.add_argument('--output-dir', default=os.path.join(_RESULTS_DIR, 'muon_track_visualization'),
                    help='Output directory (default: results/muon_track_visualization)')
     return p.parse_args()
 

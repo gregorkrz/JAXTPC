@@ -93,9 +93,12 @@ N_SEGMENTS         = 10_000
 MAX_ACTIVE_BUCKETS = 1000
 #DETECTOR_BOUNDS_MM = ((-300, 300), (-300, 300), (-300, 300))
 
-_JAX_CACHE_DIR = os.path.expanduser('~/.cache/jax_compilation_cache')
+_JAX_CACHE_DIR = os.environ.get('JAX_COMPILATION_CACHE_DIR',
+                                os.path.expanduser('~/.cache/jax_compilation_cache'))
 jax.config.update('jax_compilation_cache_dir', _JAX_CACHE_DIR)
 jax.config.update('jax_persistent_cache_min_compile_time_secs', 1.0)
+_RESULTS_DIR = os.environ.get('RESULTS_DIR', 'results')
+_PLOTS_DIR   = os.environ.get('PLOTS_DIR',   'plots')
 
 VALID_PARAMS = (
     'velocity_cm_us',
@@ -167,8 +170,8 @@ def parse_args():
                    help='Steps over which relative change is checked (default: 20)')
     p.add_argument('--N', type=int, default=25,
                    help='Number of random trials (default: 25)')
-    p.add_argument('--results-base', default='results',
-                   help='Base directory; output goes to <results-base>/<folder>/ (default: results)')
+    p.add_argument('--results-base', default=_RESULTS_DIR,
+                   help='Base directory; output goes to <results-base>/<folder>/ (default: $RESULTS_DIR or results)')
     p.add_argument('--seed', type=int, default=None,
                    help='Master RNG seed (default: random). Seeds everything: '
                         'trial starting points and GT noise draw. '
