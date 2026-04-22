@@ -1,4 +1,5 @@
 import importlib.util
+import inspect
 import pathlib
 import sys
 import types
@@ -75,9 +76,14 @@ def _install_import_stubs() -> None:
     losses.make_sobolev_weight = lambda *args, **kwargs: None
     losses.sobolev_loss = lambda *args, **kwargs: None
     losses.sobolev_loss_geomean_log1p = lambda *args, **kwargs: None
+    losses.mse_loss = lambda *args, **kwargs: None
+    losses.l1_loss = lambda *args, **kwargs: None
 
     particle_generator = types.ModuleType("tools.particle_generator")
     particle_generator.generate_muon_track = lambda *args, **kwargs: None
+
+    noise = types.ModuleType("tools.noise")
+    noise.generate_noise = lambda *args, **kwargs: None
 
     simulation = types.ModuleType("tools.simulation")
     simulation.DetectorSimulator = object
@@ -89,47 +95,93 @@ def _install_import_stubs() -> None:
     sys.modules["tools.geometry"] = geometry
     sys.modules["tools.loader"] = loader
     sys.modules["tools.losses"] = losses
+    sys.modules["tools.noise"] = noise
     sys.modules["tools.particle_generator"] = particle_generator
     sys.modules["tools.simulation"] = simulation
 
 
-def _load_2d_opt_module():
+def _resolve_opt_module_path() -> pathlib.Path:
+    repo_root = pathlib.Path(__file__).resolve().parents[1]
+    candidates = [
+        repo_root / "src" / "opt" / "run_optimization.py",
+        repo_root / "run_optimization.py",
+        repo_root / "src" / "opt" / "2d_opt.py",
+        repo_root / "2d_opt.py",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(
+        "Could not locate optimization module. Checked: "
+        + ", ".join(str(path) for path in candidates)
+    )
+
+
+def _load_opt_module():
     _install_import_stubs()
-    module_path = pathlib.Path(__file__).resolve().parents[1] / "2d_opt.py"
-    spec = importlib.util.spec_from_file_location("two_d_opt_testable", module_path)
+    module_path = _resolve_opt_module_path()
+    spec = importlib.util.spec_from_file_location("opt_testable", module_path)
     module = importlib.util.module_from_spec(spec)
     assert spec is not None and spec.loader is not None
     spec.loader.exec_module(module)
     return module
 
 
-TWO_D_OPT = _load_2d_opt_module()
+OPT_MODULE = _load_opt_module()
+
+
+def _parse_params_for_test(valid_input: str):
+    if hasattr(OPT_MODULE, "parse_pairs"):
+        return OPT_MODULE.parse_pairs(valid_input)
+    if hasattr(OPT_MODULE, "parse_params"):
+        return OPT_MODULE.parse_params(valid_input)
+    raise AttributeError("No parse function found in optimization module")
 
 
 class TestOptimizationHelpers(unittest.TestCase):
-    def test_parse_pairs_valid(self):
-        pairs = TWO_D_OPT.parse_pairs(
+    def test_parse_params_valid(self):
+        parsed = _parse_params_for_test(
             "velocity_cm_us+lifetime_us,recomb_alpha+recomb_beta_90"
+            if hasattr(OPT_MODULE, "parse_pairs")
+            else "velocity_cm_us,recomb_alpha,recomb_beta_90"
         )
-        self.assertEqual(
-            pairs,
-            [
-                ("velocity_cm_us", "lifetime_us"),
-                ("recomb_alpha", "recomb_beta_90"),
-            ],
-        )
+        if hasattr(OPT_MODULE, "parse_pairs"):
+            self.assertEqual(
+                parsed,
+                [
+                    ("velocity_cm_us", "lifetime_us"),
+                    ("recomb_alpha", "recomb_beta_90"),
+                ],
+            )
+        else:
+            self.assertEqual(
+                parsed,
+                ["velocity_cm_us", "recomb_alpha", "recomb_beta_90"],
+            )
 
-    def test_parse_pairs_rejects_invalid_input(self):
+    def test_parse_params_rejects_invalid_input(self):
         with self.assertRaises(ValueError):
-            TWO_D_OPT.parse_pairs("velocity_cm_us+velocity_cm_us")
+            _parse_params_for_test(
+                "velocity_cm_us+velocity_cm_us"
+                if hasattr(OPT_MODULE, "parse_pairs")
+                else "velocity_cm_us,velocity_cm_us"
+            )
         with self.assertRaises(ValueError):
-            TWO_D_OPT.parse_pairs("unknown+lifetime_us")
+            _parse_params_for_test(
+                "unknown+lifetime_us"
+                if hasattr(OPT_MODULE, "parse_pairs")
+                else "unknown,lifetime_us"
+            )
         with self.assertRaises(ValueError):
-            TWO_D_OPT.parse_pairs("velocity_cm_us,lifetime_us")
+            _parse_params_for_test(
+                "velocity_cm_us,lifetime_us"
+                if hasattr(OPT_MODULE, "parse_pairs")
+                else ""
+            )
 
     def test_make_optax_optimizer_rejects_unknown_optimizer(self):
         with self.assertRaises(ValueError):
-            TWO_D_OPT.make_optax_optimizer("bad_optimizer", 0.01, "constant", 10)
+            OPT_MODULE.make_optax_optimizer("bad_optimizer", 0.01, "constant", 10)
 
     def test_run_trial_reduces_loss(self):
         def val_and_grad_fn(p):
@@ -137,15 +189,26 @@ class TestOptimizationHelpers(unittest.TestCase):
             grad = 2.0 * (p - 1.0)
             return loss, grad
 
-        optimizer = TWO_D_OPT.make_optax_optimizer("sgd", 0.2, "constant", 30)
-        trial = TWO_D_OPT.run_trial(
-            p0_pn_vec=[2.0, -1.0],
-            val_and_grad_fn=val_and_grad_fn,
-            optimizer=optimizer,
-            max_steps=10,
-            tol=1e-12,
-            patience=20,
-        )
+        optimizer = OPT_MODULE.make_optax_optimizer("sgd", 0.2, "constant", 30)
+        run_trial_params = inspect.signature(OPT_MODULE.run_trial).parameters
+        if "p0_pn_vec" in run_trial_params:
+            trial = OPT_MODULE.run_trial(
+                p0_pn_vec=[2.0, -1.0],
+                val_and_grad_fn=val_and_grad_fn,
+                optimizer=optimizer,
+                max_steps=10,
+                tol=1e-12,
+                patience=20,
+            )
+        else:
+            trial = OPT_MODULE.run_trial(
+                p0=[2.0, -1.0],
+                val_and_grad_fn=val_and_grad_fn,
+                optimizer=optimizer,
+                max_steps=10,
+                tol=1e-12,
+                patience=20,
+            )
 
         self.assertEqual(len(trial["param_trajectory"]), 11)
         self.assertEqual(len(trial["loss_trajectory"]), 11)
@@ -156,15 +219,26 @@ class TestOptimizationHelpers(unittest.TestCase):
         def val_and_grad_fn(p):
             return 0.0, np.zeros_like(p)
 
-        optimizer = TWO_D_OPT.make_optax_optimizer("sgd", 0.1, "constant", 30)
-        trial = TWO_D_OPT.run_trial(
-            p0_pn_vec=[1.0, 1.0],
-            val_and_grad_fn=val_and_grad_fn,
-            optimizer=optimizer,
-            max_steps=20,
-            tol=1e-8,
-            patience=1,
-        )
+        optimizer = OPT_MODULE.make_optax_optimizer("sgd", 0.1, "constant", 30)
+        run_trial_params = inspect.signature(OPT_MODULE.run_trial).parameters
+        if "p0_pn_vec" in run_trial_params:
+            trial = OPT_MODULE.run_trial(
+                p0_pn_vec=[1.0, 1.0],
+                val_and_grad_fn=val_and_grad_fn,
+                optimizer=optimizer,
+                max_steps=20,
+                tol=1e-8,
+                patience=1,
+            )
+        else:
+            trial = OPT_MODULE.run_trial(
+                p0=[1.0, 1.0],
+                val_and_grad_fn=val_and_grad_fn,
+                optimizer=optimizer,
+                max_steps=20,
+                tol=1e-8,
+                patience=1,
+            )
 
         self.assertTrue(trial["stopped_early"])
         self.assertLess(trial["steps_run"], 20)
