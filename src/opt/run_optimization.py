@@ -89,7 +89,7 @@ GT_VELOCITY_CM_US = 0.160
 SOBOLEV_MAX_PAD   = 128
 
 CONFIG_PATH        = 'config/cubic_wireplane_config.yaml'
-N_SEGMENTS         = 10_000
+N_SEGMENTS         = 50_000
 MAX_ACTIVE_BUCKETS = 1000
 #DETECTOR_BOUNDS_MM = ((-300, 300), (-300, 300), (-300, 300))
 

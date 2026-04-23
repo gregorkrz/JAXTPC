@@ -1,0 +1,18 @@
+time_limit: "02:00:00"   # salloc wall-clock limit — 10k steps over 3 tracks needs ~90 min
+command_timeout: 110      # per-command timeout in minutes
+
+gpus:
+  0:
+    - >-
+      python src/opt/run_optimization.py
+      --params velocity_cm_us,lifetime_us,diffusion_trans_cm2_us,diffusion_long_cm2_us,recomb_alpha,recomb_beta_90,recomb_R
+      --tracks diagonal+X+Z
+      --N 1
+      --max-steps 10000
+      --tol 1e-5
+      --patience 100
+      --range 0.90 1.10
+      --loss sobolev_loss_geomean_log1p
+      --optimizer adam
+      --lr 0.001
+      --no-wandb

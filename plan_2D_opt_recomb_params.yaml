@@ -1,0 +1,16 @@
+time_limit: "02:00:00"   # salloc wall-clock limit (HH:MM:SS)
+command_timeout: 110     # per-command timeout in minutes
+
+gpus:
+  0:
+    - python src/opt/run_optimization.py --params recomb_alpha,recomb_beta_90 --tracks diagonal_100MeV:1,1,1:100 --loss sobolev_loss_geomean_log1p --lr 0.001 --lr-schedule constant --max-steps 500 --N 10 --range 0.8 1.2 --results-base $RESULTS_DIR/opt/2D_recomb --no-wandb
+    - python src/opt/run_optimization.py --params recomb_alpha,recomb_beta_90 --tracks diagonal_100MeV:1,1,1:100 --loss sobolev_loss_geomean_log1p --lr 0.001 --lr-schedule constant --max-steps 500 --N 10 --range 0.8 1.2 --results-base $RESULTS_DIR/opt/2D_recomb --no-wandb --noise-scale 1.0
+  1:
+    - python src/opt/run_optimization.py --params recomb_alpha,recomb_beta_90 --tracks diagonal --loss sobolev_loss_geomean_log1p --lr 0.001 --lr-schedule constant --max-steps 500 --N 10 --range 0.8 1.2 --results-base $RESULTS_DIR/opt/2D_recomb --no-wandb
+    - python src/opt/run_optimization.py --params recomb_alpha,recomb_beta_90 --tracks diagonal --loss sobolev_loss_geomean_log1p --lr 0.001 --lr-schedule constant --max-steps 500 --N 10 --range 0.8 1.2 --results-base $RESULTS_DIR/opt/2D_recomb --no-wandb --noise-scale 1.0
+  2:
+    - python src/opt/run_optimization.py --params recomb_alpha,recomb_beta_90 --tracks diagonal_100MeV:1,1,1:100 --loss sobolev_loss_geomean_log1p --lr 0.001 --lr-schedule cosine --max-steps 500 --N 10 --range 0.8 1.2 --results-base $RESULTS_DIR/opt/2D_recomb --no-wandb
+    - python src/opt/run_optimization.py --params recomb_alpha,recomb_beta_90 --tracks diagonal_100MeV:1,1,1:100 --loss sobolev_loss_geomean_log1p --lr 0.001 --lr-schedule cosine --max-steps 500 --N 10 --range 0.8 1.2 --results-base $RESULTS_DIR/opt/2D_recomb --no-wandb --noise-scale 1.0
+  3:
+    - python src/opt/run_optimization.py --params recomb_alpha,recomb_beta_90 --tracks diagonal --loss sobolev_loss_geomean_log1p --lr 0.001 --lr-schedule cosine --max-steps 500 --N 10 --range 0.8 1.2 --results-base $RESULTS_DIR/opt/2D_recomb --no-wandb
+    - python src/opt/run_optimization.py --params recomb_alpha,recomb_beta_90 --tracks diagonal --loss sobolev_loss_geomean_log1p --lr 0.001 --lr-schedule cosine --max-steps 500 --N 10 --range 0.8 1.2 --results-base $RESULTS_DIR/opt/2D_recomb --no-wandb --noise-scale 1.0
