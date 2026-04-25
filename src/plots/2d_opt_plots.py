@@ -78,7 +78,7 @@ def load_results(results_dir, N, track_names, optimizers):
             r = pickle.load(f)
         if N is not None and r.get('N') != N:
             continue
-        if r.get('track_name') not in track_names:
+        if r.get('track_name') is not None and r.get('track_name') not in track_names:
             continue
         if optimizers is not None and r.get('optimizer') not in optimizers:
             continue
@@ -102,9 +102,11 @@ def make_figure(result, output_dir):
     lr         = result['lr']
     max_steps  = result['max_steps']
     loss_name  = result['loss_name']
-    track_name = result['track_name']
-    direction  = result.get('direction', '?')
-    mom_mev    = result.get('momentum_mev', '?')
+    # older results store track info inside a 'tracks' list
+    _track0    = (result.get('tracks') or [{}])[0]
+    track_name = result.get('track_name') or _track0.get('name', '?')
+    direction  = result.get('direction')  or _track0.get('direction', '?')
+    mom_mev    = result.get('momentum_mev') or _track0.get('momentum_mev', '?')
 
     loss_label = LOSS_LABELS.get(loss_name, loss_name)
     p1_label   = PARAM_LABELS.get(param1, param1)
