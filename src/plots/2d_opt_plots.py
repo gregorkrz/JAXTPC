@@ -102,8 +102,9 @@ def make_figure(result, output_dir):
     lr         = result['lr']
     max_steps  = result['max_steps']
     loss_name  = result['loss_name']
-    # older results store track info inside a 'tracks' list
-    _track0    = (result.get('tracks') or [{}])[0]
+    # older results store track info inside a 'tracks' list; newer results always use 'tracks'
+    _tracks = result.get('tracks') or [{}]
+    _track0 = _tracks[0]
     track_name = result.get('track_name') or _track0.get('name', '?')
     direction  = result.get('direction')  or _track0.get('direction', '?')
     mom_mev    = result.get('momentum_mev') or _track0.get('momentum_mev', '?')
@@ -118,13 +119,24 @@ def make_figure(result, output_dir):
     ax_phase, ax_loss, ax_p1, ax_p2 = (axes[0, 0], axes[0, 1],
                                         axes[1, 0], axes[1, 1])
 
-    fig.suptitle(
-        f'2-D optimisation  |  {param1} + {param2}  |  '
-        f'{optimizer}  lr={lr}  |  '
-        f'loss: {loss_label}  |  track: {track_name}  '
-        f'dir={direction}  T={mom_mev} MeV  |  N={N}  steps={max_steps}',
-        fontsize=9, y=1.01,
-    )
+    if len(_tracks) > 1:
+        tracks_lines = '  |  '.join(
+            f'{t.get("name", "?")}  dir={t.get("direction", "?")}  T={t.get("momentum_mev", "?")} MeV'
+            for t in _tracks
+        )
+        title = (
+            f'2-D optimisation  |  {param1} + {param2}  |  '
+            f'{optimizer}  lr={lr}  |  loss: {loss_label}  |  N={N}  steps={max_steps}\n'
+            f'tracks:  {tracks_lines}'
+        )
+    else:
+        title = (
+            f'2-D optimisation  |  {param1} + {param2}  |  '
+            f'{optimizer}  lr={lr}  |  '
+            f'loss: {loss_label}  |  track: {track_name}  '
+            f'dir={direction}  T={mom_mev} MeV  |  N={N}  steps={max_steps}'
+        )
+    fig.suptitle(title, fontsize=9, y=1.01)
 
     for i, trial in enumerate(trials):
         color = colors[i]

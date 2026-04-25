@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Ensure the jaxtpc container is running (detached). Idempotent.
 
-IMAGE="docker.io/gkrz/jaxtpc:v0"
+IMAGE="docker.io/gkrz/jaxtpc:v1"
 NAME="jaxtpc"
 WORKSPACE="$HOME"
 

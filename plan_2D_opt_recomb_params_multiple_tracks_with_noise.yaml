@@ -1,0 +1,37 @@
+time_limit: "04:00:00"   # Perlmutter interactive cap; 3-track jobs (~240 min) are tight — use --qos regular if they time out
+command_timeout: 220     # 3-track 500-step ≈ 3×80 min = 240 min; 220 leaves ~20 min for startup/JIT within the 4h wall clock
+
+# 4 jobs, 1 per GPU — all adam lr=0.001 constant, 500 steps, N=10, noise-scale 1.0
+# Mirror of plan_2D_opt_recomb_params_multiple_tracks.yaml with --noise-scale 1.0 added.
+#
+# Strategy:
+#   GPU 0 — 3×100 MeV, most promising direction combos (user's top pick)
+#   GPU 1 — 2×100 MeV pairs (how much do 3 tracks help vs 2?)
+#   GPU 2 — momentum lever arm: same direction at two T, or 100+200 MeV mixed direction
+#   GPU 3 — 100 MeV diagonal + high-T axes; third 3×100 MeV variant
+
+gpus:
+  0:
+    # 3 tracks at 100 MeV — diagonal + X + Z (well-spread directions)
+    - python src/opt/run_optimization.py --params recomb_alpha,recomb_beta_90 --tracks diagonal_100MeV:1,1,1:100+x100:1,0,0:100+z100:0,0,1:100 --loss sobolev_loss_geomean_log1p --lr 0.001 --lr-schedule constant --max-steps 500 --tol 1e-5 --N 10 --range 0.8 1.2 --results-base $RESULTS_DIR/opt/2D_recomb --noise-scale 1.0
+    # 3 tracks at 100 MeV — pure axial X+Y+Z (most orthogonal basis)
+    # - python src/opt/run_optimization.py --params recomb_alpha,recomb_beta_90 --tracks x100:1,0,0:100+y100:0,1,0:100+z100:0,0,1:100 --loss sobolev_loss_geomean_log1p --lr 0.001 --lr-schedule constant --max-steps 500 --tol 1e-5 --N 10 --range 0.8 1.2 --results-base $RESULTS_DIR/opt/2D_recomb --noise-scale 1.0
+
+  1:
+    # 2 tracks at 100 MeV — diagonal + X
+    - python src/opt/run_optimization.py --params recomb_alpha,recomb_beta_90 --tracks diagonal_100MeV:1,1,1:100+x100:1,0,0:100 --loss sobolev_loss_geomean_log1p --lr 0.001 --lr-schedule constant --max-steps 500 --tol 1e-5 --N 10 --range 0.8 1.2 --results-base $RESULTS_DIR/opt/2D_recomb --noise-scale 1.0
+    # 2 tracks at 100 MeV — diagonal + Z
+    # - python src/opt/run_optimization.py --params recomb_alpha,recomb_beta_90 --tracks diagonal_100MeV:1,1,1:100+z100:0,0,1:100 --loss sobolev_loss_geomean_log1p --lr 0.001 --lr-schedule constant --max-steps 500 --tol 1e-5 --N 10 --range 0.8 1.2 --results-base $RESULTS_DIR/opt/2D_recomb --noise-scale 1.0
+
+  2:
+    # Momentum lever arm: same diagonal direction at 100 + 1000 MeV
+    # (tests whether T-dependence of recomb alone can distinguish alpha vs beta_90)
+    - python src/opt/run_optimization.py --params recomb_alpha,recomb_beta_90 --tracks diagonal_100MeV:1,1,1:100+diagonal --loss sobolev_loss_geomean_log1p --lr 0.001 --lr-schedule constant --max-steps 500 --tol 1e-5 --N 10 --range 0.8 1.2 --results-base $RESULTS_DIR/opt/2D_recomb --noise-scale 1.0
+    # Mixed: 100 MeV diagonal + 200 MeV track2 (different direction and T)
+    # - python src/opt/run_optimization.py --params recomb_alpha,recomb_beta_90 --tracks diagonal_100MeV:1,1,1:100+track2 --loss sobolev_loss_geomean_log1p --lr 0.001 --lr-schedule constant --max-steps 500 --tol 1e-5 --N 10 --range 0.8 1.2 --results-base $RESULTS_DIR/opt/2D_recomb --noise-scale 1.0
+
+  3:
+    # 100 MeV diagonal + two 1000 MeV axial presets (mixed T strategy)
+    - python src/opt/run_optimization.py --params recomb_alpha,recomb_beta_90 --tracks diagonal_100MeV:1,1,1:100+X+Z --loss sobolev_loss_geomean_log1p --lr 0.001 --lr-schedule constant --max-steps 500 --tol 1e-5 --N 10 --range 0.8 1.2 --results-base $RESULTS_DIR/opt/2D_recomb --noise-scale 1.0
+    # 3 tracks at 100 MeV — diagonal + Y + Z (third direction variant)
+    # - python src/opt/run_optimization.py --params recomb_alpha,recomb_beta_90 --tracks diagonal_100MeV:1,1,1:100+y100:0,1,0:100+z100:0,0,1:100 --loss sobolev_loss_geomean_log1p --lr 0.001 --lr-schedule constant --max-steps 500 --tol 1e-5 --N 10 --range 0.8 1.2 --results-base $RESULTS_DIR/opt/2D_recomb --noise-scale 1.0

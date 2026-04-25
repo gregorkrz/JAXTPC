@@ -1,9 +1,5 @@
 #!/usr/bin/env bash
-
-IMAGE="docker.io/gkrz/jaxtpc:v0"
-NAME="jaxtpc"
-WORKSPACE="$HOME"
-
+d
 if [ -n "$1" ]; then
     # Non-interactive: run a script file inside the container.
     # $1 is a host path (e.g. ~/.jaxtpc_tmp/gpu_0.sh).

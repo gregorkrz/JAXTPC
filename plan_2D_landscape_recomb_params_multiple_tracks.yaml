@@ -35,3 +35,28 @@ gpus:
     # Y-axis at 100 MeV — completes the axial 100 MeV set (X+Y+Z combo on GPU 0 of opt plan)
     - python src/analysis/2d_loss_landscape.py --track-name y100 --direction 0,1,0 --momentum 100.0 --grid 30 --range-frac 0.2 --loss sobolev_loss_geomean_log1p --gradients --results-dir $RESULTS_DIR/2d_landscape
 
+# Runs on the login node after all GPU jobs finish.
+# Combines individual-track PKLs into joint loss surfaces matching the combos
+# used in plan_2D_opt_recomb_params_multiple_tracks.yaml.
+#
+# PKL names produced above (sobolev_loss_geomean_log1p, 30×30, no noise unless noted):
+#   diagonal_100MeV  → landscape_sobolev_loss_geomean_log1p_diagonal_100MeV_T100MeV_30x30.pkl
+#   x100             → landscape_sobolev_loss_geomean_log1p_x100_T100MeV_30x30.pkl
+#   z100             → landscape_sobolev_loss_geomean_log1p_z100_T100MeV_30x30.pkl
+#   diagonal@1000    → landscape_sobolev_loss_geomean_log1p_diagonal_T1000MeV_30x30.pkl
+#   X@1000           → landscape_sobolev_loss_geomean_log1p_X_T1000MeV_30x30.pkl
+#   Z@1000           → landscape_sobolev_loss_geomean_log1p_Z_T1000MeV_30x30.pkl
+
+post_gpu_jobs:
+  # diagonal_100MeV + x100  (GPU 1 of opt plan)
+  - python src/analysis/combine_landscapes.py $RESULTS_DIR/2d_landscape/landscape_sobolev_loss_geomean_log1p_diagonal_100MeV_T100MeV_30x30.pkl $RESULTS_DIR/2d_landscape/landscape_sobolev_loss_geomean_log1p_x100_T100MeV_30x30.pkl --output-dir $RESULTS_DIR/2d_landscape/combined_landscapes
+
+  # diagonal_100MeV + x100 + z100  (GPU 0 of opt plan)
+  - python src/analysis/combine_landscapes.py $RESULTS_DIR/2d_landscape/landscape_sobolev_loss_geomean_log1p_diagonal_100MeV_T100MeV_30x30.pkl $RESULTS_DIR/2d_landscape/landscape_sobolev_loss_geomean_log1p_x100_T100MeV_30x30.pkl $RESULTS_DIR/2d_landscape/landscape_sobolev_loss_geomean_log1p_z100_T100MeV_30x30.pkl --output-dir $RESULTS_DIR/2d_landscape/combined_landscapes
+
+  # diagonal_100MeV + diagonal@1000  (GPU 2 of opt plan — momentum lever arm)
+  - python src/analysis/combine_landscapes.py $RESULTS_DIR/2d_landscape/landscape_sobolev_loss_geomean_log1p_diagonal_100MeV_T100MeV_30x30.pkl $RESULTS_DIR/2d_landscape/landscape_sobolev_loss_geomean_log1p_diagonal_T1000MeV_30x30.pkl --output-dir $RESULTS_DIR/2d_landscape/combined_landscapes
+
+  # diagonal_100MeV + X@1000 + Z@1000  (GPU 3 of opt plan)
+  - python src/analysis/combine_landscapes.py $RESULTS_DIR/2d_landscape/landscape_sobolev_loss_geomean_log1p_diagonal_100MeV_T100MeV_30x30.pkl $RESULTS_DIR/2d_landscape/landscape_sobolev_loss_geomean_log1p_X_T1000MeV_30x30.pkl $RESULTS_DIR/2d_landscape/landscape_sobolev_loss_geomean_log1p_Z_T1000MeV_30x30.pkl --output-dir $RESULTS_DIR/2d_landscape/combined_landscapes
+
