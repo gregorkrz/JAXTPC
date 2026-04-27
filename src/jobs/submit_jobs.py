@@ -71,7 +71,7 @@ if __name__ == "__main__":
         max_steps=10000,
         tol=1e-6,
         patience=20,
-        N=10,
+        N=1,
         range_lo=0.9,
         range_hi=1.1,
         results_base="$RESULTS_DIR/opt/all_params",

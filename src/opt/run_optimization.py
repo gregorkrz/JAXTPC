@@ -380,15 +380,19 @@ def make_optax_optimizer(optimizer_name, lr, lr_schedule, max_steps, clip_grad_n
     elif optimizer_name == 'momentum_sgd': base = optax.sgd(schedule, momentum=MOMENTUM)
     else: raise ValueError(f'Unknown optimizer {optimizer_name!r}')
     if clip_grad_norm > 0.0:
-        return optax.chain(optax.clip_by_global_norm(clip_grad_norm), base)
-    return base
+        tx = optax.chain(optax.clip_by_global_norm(clip_grad_norm), base)
+    else:
+        tx = base
+    # Wrap schedule in a callable so callers can query lr at any step
+    schedule_fn = schedule if callable(schedule) else (lambda _s, _lr=schedule: _lr)
+    return tx, schedule_fn
 
 
 # ── Trial runner ───────────────────────────────────────────────────────────────
 
 def run_trial(p0, val_and_grad_fn, optimizer, max_steps, tol=1e-5, patience=20,
               log_interval=50, param_names=None, scales=None, p_n_gts=None,
-              use_wandb=False, trial_idx=0):
+              use_wandb=False, trial_idx=0, schedule_fn=None):
     """Run one optimization trial from starting p_n vector p0 (any length).
 
     Records param, loss, and gradient at every step.
@@ -417,7 +421,7 @@ def run_trial(p0, val_and_grad_fn, optimizer, max_steps, tol=1e-5, patience=20,
 
     if use_wandb and _WANDB_AVAILABLE:
         _wandb_log_step(0, float(lv), gv, p, param_names, scales, p_n_gts,
-                        step_time_s=0.0, trial_idx=trial_idx)
+                        step_time_s=0.0, trial_idx=trial_idx, schedule_fn=schedule_fn)
 
     stopped_early = False
     for step in range(max_steps):
@@ -437,7 +441,8 @@ def run_trial(p0, val_and_grad_fn, optimizer, max_steps, tol=1e-5, patience=20,
         if use_wandb and _WANDB_AVAILABLE and (step + 1) % log_interval == 0:
             _wandb_log_step(step + 1, float(lv_new), gv_new, p,
                             param_names, scales, p_n_gts,
-                            step_time_s=step_time, trial_idx=trial_idx)
+                            step_time_s=step_time, trial_idx=trial_idx,
+                            schedule_fn=schedule_fn)
 
         if step >= patience:
             p_now  = np.array(param_traj[-1])
@@ -458,7 +463,7 @@ def run_trial(p0, val_and_grad_fn, optimizer, max_steps, tol=1e-5, patience=20,
 
 
 def _wandb_log_step(step, loss, gv, p, param_names, scales, p_n_gts,
-                    step_time_s, trial_idx):
+                    step_time_s, trial_idx, schedule_fn=None):
     """Log one step to W&B."""
     p_np  = np.array(p)
     gv_np = np.array(gv)
@@ -470,6 +475,8 @@ def _wandb_log_step(step, loss, gv, p, param_names, scales, p_n_gts,
         'param_norm':     float(np.linalg.norm(p_np)),
         'step_time_s':    step_time_s,
     }
+    if schedule_fn is not None:
+        log['lr'] = float(schedule_fn(step))
 
     if param_names is not None:
         for i, name in enumerate(param_names):
@@ -697,9 +704,10 @@ def main():
     _ = val_and_grad_fn(_p0); jax.block_until_ready(_)
     print(f'Done ({time.time() - t0:.1f} s)')
 
-    optimizer = make_optax_optimizer(args.optimizer, args.lr, args.lr_schedule, args.max_steps,
-                                     clip_grad_norm=args.clip_grad_norm,
-                                     warmup_steps=args.warmup_steps)
+    optimizer, schedule_fn = make_optax_optimizer(args.optimizer, args.lr, args.lr_schedule,
+                                                  args.max_steps,
+                                                  clip_grad_norm=args.clip_grad_norm,
+                                                  warmup_steps=args.warmup_steps)
 
     # ── Trials ────────────────────────────────────────────────────────────────
     all_trials = []
@@ -740,7 +748,7 @@ def main():
             args.max_steps, tol=args.tol, patience=args.patience,
             log_interval=args.log_interval,
             param_names=param_names, scales=scales, p_n_gts=p_n_gts,
-            use_wandb=use_wandb, trial_idx=gi,
+            use_wandb=use_wandb, trial_idx=gi, schedule_fn=schedule_fn,
         )
         all_trials.append(trial)
 
