@@ -2,7 +2,7 @@
 # Ensure the jaxtpc container is running (detached). Idempotent.
 
 IMAGE="docker.io/gkrz/jaxtpc:v1"
-NAME="jaxtpc"
+NAME="jaxtpc_v1"
 WORKSPACE="$HOME"
 
 if podman-hpc container exists "$NAME"; then

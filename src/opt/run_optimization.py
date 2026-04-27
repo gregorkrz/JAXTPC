@@ -111,6 +111,10 @@ VALID_PARAMS = (
     'recomb_R',
 )
 
+# "All params" = all non-beta params + at least one beta variant (model-specific).
+_BETA_VARIANTS = frozenset({'recomb_beta', 'recomb_beta_90'})
+_BASE_PARAMS   = frozenset(VALID_PARAMS) - _BETA_VARIANTS
+
 VALID_LOSSES     = ('sobolev_loss', 'sobolev_loss_geomean_log1p', 'mse_loss', 'l1_loss')
 VALID_OPTIMIZERS = ('adam', 'sgd', 'momentum_sgd')
 
@@ -538,10 +542,14 @@ def main():
     print(f'Output       : {output_path}')
 
     # ── W&B init ──────────────────────────────────────────────────────────────
+    _is_all_params = (_BASE_PARAMS <= frozenset(param_names) and
+                      bool(frozenset(param_names) & _BETA_VARIANTS))
+    wandb_name = ('all_params__' + folder_name.split('__', 1)[1]) if _is_all_params else folder_name
+
     if use_wandb:
         _wandb.init(
             project=args.wandb_project,
-            name=folder_name,
+            name=wandb_name,
             config=dict(
                 param_names   = param_names,
                 tracks        = [t['name'] for t in track_specs],
