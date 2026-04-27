@@ -6,7 +6,7 @@ from pathlib import Path
 PARTITION  = "ampere"
 ACCOUNT    = "neutrino"
 REMOTE_DIR = "/sdf/home/g/gregork/jaxtpc"
-JOBS_DIR   = Path(__file__).parent / "jobs"
+JOBS_DIR   = Path(__file__).parents[2] / "jobs"
 
 LOGS_DIR = "/fs/ddn/sdf/group/atlas/d/gregork/logs"
 
@@ -30,7 +30,7 @@ def s3df_submit(command: str, *, time: str = "02:00:00", gpus: int = 1,
     stderr_log = f"{LOGS_DIR}/{name}_stderr.txt"
     path = JOBS_DIR / f"{name}.sh"
 
-    binds = " ".join(f"--bind {m}" for m in BIND_MOUNTS)    
+    binds = " ".join(f"--bind {m}" for m in BIND_MOUNTS)
     wrapped = f"apptainer exec --nv {binds} {APPTAINER_IMAGE} bash -c {shlex.quote(command)}"
 
     script = "\n".join([

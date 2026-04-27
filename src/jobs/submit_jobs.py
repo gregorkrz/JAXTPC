@@ -2,7 +2,7 @@
 """
 Helpers for building run_optimization.py commands and submitting them to S3DF.
 """
-from s3df_submit import s3df_submit
+from job_submission_tools import s3df_submit
 
 # All params compatible with the EMB recombination model
 ALL_PARAMS = (
@@ -22,7 +22,7 @@ def make_opt_command(
     loss="sobolev_loss_geomean_log1p",
     lr=0.001,
     lr_schedule="constant",
-    max_steps=200,
+    max_steps=5000,
     tol=1e-6,
     patience=20,
     N=10,
@@ -31,6 +31,7 @@ def make_opt_command(
     seed=None,
     noise_scale=0.0,
     results_base="$RESULTS_DIR/opt/all_params",
+    grad_clip=10.0
 ):
     """Return a run_optimization.py command string with the given settings."""
     parts = [
@@ -46,6 +47,7 @@ def make_opt_command(
         f"--N {N}",
         f"--range {range_lo} {range_hi}",
         f"--results-base {results_base}",
+        f"--clip-grad-norm {grad_clip}"
     ]
     if seed is not None:
         parts.append(f"--seed {seed}")
@@ -55,14 +57,10 @@ def make_opt_command(
 
 
 if __name__ == "__main__":
-    command = make_opt_command(
-        seed=42,
-        max_steps=10000,
-        N=1,
-        range_lo=0.9,
-        range_hi=1.1,
-    )
-    print("Command:")
-    print(f"  {command}")
-    print()
-    s3df_submit(command, time="01:00:00", submit=True)
+    for seed in [46, 47, 48, 49, 50]:
+        command = make_opt_command(seed=seed, grad_clip=10.0, max_steps=10000)
+        print("Command:")
+        print(f"  {command}")
+        print()
+        s3df_submit(command, time="01:00:00", submit=True)
+   

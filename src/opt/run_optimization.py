@@ -164,7 +164,7 @@ def parse_args():
                    help='Optimizer (default: adam)')
     p.add_argument('--lr', type=float, default=0.01,
                    help='Peak learning rate (default: 0.01)')
-    p.add_argument('--lr-schedule', default='constant', choices=('constant', 'cosine'),
+    p.add_argument('--lr-schedule', default='cosine', choices=('constant', 'cosine'),
                    help='LR schedule: constant or cosine decay over --max-steps (default: constant)')
     p.add_argument('--max-steps', type=int, default=200,
                    help='Max gradient steps per trial (default: 200)')
@@ -185,6 +185,12 @@ def parse_args():
                         '(MicroBooNE model, converted to signal units via electrons_per_adc). '
                         '0.0 = no noise (default), 1.0 = realistic noise. '
                         'Signal and noise RMS are printed at startup for reference.')
+    p.add_argument('--warmup-steps', type=int, default=100,
+                   help='Linear LR warmup from 0 to --lr over this many steps '
+                        '(default: 100, set to 0 to disable).')
+    p.add_argument('--clip-grad-norm', type=float, default=10.0,
+                   help='Clip gradient global norm to this value before optimizer update '
+                        '(default: 10.0, set to 0 to disable).')
     p.add_argument('--no-wandb', action='store_true',
                    help='Disable Weights & Biases logging (enabled by default).')
     p.add_argument('--wandb-project', default='jaxtpc-optimization',
@@ -326,12 +332,13 @@ def make_nparam_setter(param_names, gt_params, recomb_model):
     """
     scales  = [TYPICAL_SCALES[n] for n in param_names]
     gt_vals = [_get_gt_val(n, gt_params, recomb_model) for n in param_names]
-    p_n_gts = [v / s for v, s in zip(gt_vals, scales)]
+    # q[i] = log(physical[i] / scale[i]);  physical[i] = exp(q[i]) * scale[i]
+    p_n_gts = [float(np.log(v / s)) for v, s in zip(gt_vals, scales)]
 
     def setter(p_n_vec):
         params = gt_params
         for i, name in enumerate(param_names):
-            params = _apply_param(name, p_n_vec[i] * scales[i], params)
+            params = _apply_param(name, jnp.exp(p_n_vec[i]) * scales[i], params)
         return params
 
     return setter, gt_vals, scales, p_n_gts
@@ -356,15 +363,25 @@ def build_loss_fn(loss_name, fwd_fn, gt_arrays, weights):
 
 # ── Optimizer factory ──────────────────────────────────────────────────────────
 
-def make_optax_optimizer(optimizer_name, lr, lr_schedule, max_steps):
-    if lr_schedule == 'cosine':
+def make_optax_optimizer(optimizer_name, lr, lr_schedule, max_steps, clip_grad_norm=0.0, warmup_steps=0):
+    if warmup_steps > 0:
+        warmup = optax.linear_schedule(init_value=0.0, end_value=lr, transition_steps=warmup_steps)
+        if lr_schedule == 'cosine':
+            post = optax.cosine_decay_schedule(init_value=lr, decay_steps=max_steps - warmup_steps)
+        else:
+            post = optax.constant_schedule(lr)
+        schedule = optax.join_schedules([warmup, post], boundaries=[warmup_steps])
+    elif lr_schedule == 'cosine':
         schedule = optax.cosine_decay_schedule(init_value=lr, decay_steps=max_steps)
     else:
         schedule = lr
-    if optimizer_name == 'adam':         return optax.adam(schedule, b1=ADAM_BETA1, b2=ADAM_BETA2, eps=ADAM_EPS)
-    if optimizer_name == 'sgd':          return optax.sgd(schedule)
-    if optimizer_name == 'momentum_sgd': return optax.sgd(schedule, momentum=MOMENTUM)
-    raise ValueError(f'Unknown optimizer {optimizer_name!r}')
+    if optimizer_name == 'adam':         base = optax.adam(schedule, b1=ADAM_BETA1, b2=ADAM_BETA2, eps=ADAM_EPS)
+    elif optimizer_name == 'sgd':          base = optax.sgd(schedule)
+    elif optimizer_name == 'momentum_sgd': base = optax.sgd(schedule, momentum=MOMENTUM)
+    else: raise ValueError(f'Unknown optimizer {optimizer_name!r}')
+    if clip_grad_norm > 0.0:
+        return optax.chain(optax.clip_by_global_norm(clip_grad_norm), base)
+    return base
 
 
 # ── Trial runner ───────────────────────────────────────────────────────────────
@@ -458,9 +475,10 @@ def _wandb_log_step(step, loss, gv, p, param_names, scales, p_n_gts,
         for i, name in enumerate(param_names):
             log[f'params/{name}_normalized'] = float(p_np[i])
             if scales is not None:
-                log[f'params/{name}_physical'] = float(p_np[i] * scales[i])
+                log[f'params/{name}_physical'] = float(np.exp(p_np[i]) * scales[i])
             if p_n_gts is not None:
-                rel_err = abs(float(p_np[i]) - p_n_gts[i]) / (abs(p_n_gts[i]) + 1e-30)
+                # rel_err in physical space: |exp(q) - exp(q_gt)| / exp(q_gt) = |exp(q - q_gt) - 1|
+                rel_err = abs(float(np.exp(p_np[i] - p_n_gts[i])) - 1.0)
                 log[f'params/{name}_rel_err'] = rel_err
             if gv_np is not None:
                 log[f'grads/{name}'] = float(gv_np[i])
@@ -517,7 +535,7 @@ def main():
         noise_scale=args.noise_scale,
     )
     output_dir  = os.path.join(args.results_base, folder_name)
-    output_path = next_result_path(output_dir, seed=args.seed)
+    output_path = next_result_path(output_dir, seed=effective_seed)
 
     if args.seed is not None and os.path.exists(output_path):
         print(f'Skipping: {output_path} already exists.')
@@ -532,7 +550,10 @@ def main():
     print(f'Range        : [{range_lo}, {range_hi}] × GT')
     print(f'Tracks       : {[t["name"] for t in track_specs]}')
     print(f'Loss         : {args.loss}')
-    print(f'Optimizer    : {args.optimizer}  lr={args.lr}  schedule={args.lr_schedule}')
+    clip_tag   = f'{args.clip_grad_norm}' if args.clip_grad_norm > 0.0 else 'disabled'
+    warmup_tag = f'{args.warmup_steps}' if args.warmup_steps > 0 else 'disabled'
+    print(f'Optimizer    : {args.optimizer}  lr={args.lr}  schedule={args.lr_schedule}  '
+          f'warmup={warmup_tag}  clip_grad_norm={clip_tag}')
     print(f'Max steps    : {args.max_steps}  tol={args.tol}  patience={args.patience}')
     print(f'N            : {args.N}')
     print(f'Seed         : {effective_seed}')
@@ -564,6 +585,8 @@ def main():
                 range_lo      = range_lo,
                 range_hi      = range_hi,
                 noise_scale   = args.noise_scale,
+                warmup_steps  = args.warmup_steps,
+                clip_grad_norm = args.clip_grad_norm,
                 seed          = effective_seed,
                 log_interval  = args.log_interval,
             ),
@@ -649,7 +672,7 @@ def main():
         param_names, gt_params, simulator.recomb_model)
 
     for name, gt_val, scale, p_n_gt in zip(param_names, gt_vals, scales, p_n_gts):
-        print(f'  {name}: GT={gt_val:.6g}  scale={scale:.6g}  p_n_gt={p_n_gt:.6g}')
+        print(f'  {name}: GT={gt_val:.6g}  scale={scale:.6g}  log(GT/scale)={p_n_gt:.6g}')
 
     def _multi_fwd(p_n_vec, _deps=all_deposits, _setter=setter):
         arrays = []
@@ -663,7 +686,7 @@ def main():
     n_params = len(param_names)
     factors = rng.uniform(range_lo, range_hi, size=(args.N, n_params))   # (N, n_params)
     factor_grid   = factors.tolist()
-    p_n_starts    = (factors * np.array(p_n_gts)).tolist()
+    p_n_starts    = (np.log(factors) + np.array(p_n_gts)).tolist()
 
     # ── Compile ───────────────────────────────────────────────────────────────
     val_and_grad_fn = build_loss_fn(args.loss, fwd_fn, gt_arrays, weights)
@@ -674,34 +697,12 @@ def main():
     _ = val_and_grad_fn(_p0); jax.block_until_ready(_)
     print(f'Done ({time.time() - t0:.1f} s)')
 
-    optimizer = make_optax_optimizer(args.optimizer, args.lr, args.lr_schedule, args.max_steps)
+    optimizer = make_optax_optimizer(args.optimizer, args.lr, args.lr_schedule, args.max_steps,
+                                     clip_grad_norm=args.clip_grad_norm,
+                                     warmup_steps=args.warmup_steps)
 
     # ── Trials ────────────────────────────────────────────────────────────────
     all_trials = []
-    for gi, (factors_i, pn_start) in enumerate(zip(factor_grid, p_n_starts)):
-        factors_str = ', '.join(f'{f:.4f}' for f in factors_i)
-        pn_str      = ', '.join(f'{v:.4f}' for v in pn_start)
-        print(f'\nTrial [{gi+1}/{args.N}]  factors=({factors_str})  p_n=({pn_str})',
-              end='', flush=True)
-
-        trial = run_trial(
-            pn_start, val_and_grad_fn, optimizer,
-            args.max_steps, tol=args.tol, patience=args.patience,
-            log_interval=args.log_interval,
-            param_names=param_names, scales=scales, p_n_gts=p_n_gts,
-            use_wandb=use_wandb, trial_idx=gi,
-        )
-        all_trials.append(trial)
-
-        final_pn  = trial['param_trajectory'][-1]
-        early_tag = f'  [early@{trial["steps_run"]}]' if trial['stopped_early'] else ''
-        final_str = ', '.join(f'{v:.3f}' for v in final_pn)
-        print(f'  loss {trial["loss_trajectory"][0]:.3e} → '
-              f'{trial["loss_trajectory"][-1]:.3e}  '
-              f'p_n ({pn_str}) → ({final_str})  '
-              f'({trial["total_time_s"]:.1f} s){early_tag}')
-
-    # ── Save ──────────────────────────────────────────────────────────────────
     result = dict(
         param_names         = param_names,
         param_gts           = gt_vals,
@@ -725,6 +726,40 @@ def main():
         trials              = all_trials,
     )
 
+    cumulative_steps   = 0
+    last_save_at_step  = 0
+
+    for gi, (factors_i, pn_start) in enumerate(zip(factor_grid, p_n_starts)):
+        factors_str = ', '.join(f'{f:.4f}' for f in factors_i)
+        pn_str      = ', '.join(f'{v:.4f}' for v in pn_start)
+        print(f'\nTrial [{gi+1}/{args.N}]  factors=({factors_str})  p_n=({pn_str})',
+              end='', flush=True)
+
+        trial = run_trial(
+            pn_start, val_and_grad_fn, optimizer,
+            args.max_steps, tol=args.tol, patience=args.patience,
+            log_interval=args.log_interval,
+            param_names=param_names, scales=scales, p_n_gts=p_n_gts,
+            use_wandb=use_wandb, trial_idx=gi,
+        )
+        all_trials.append(trial)
+
+        final_pn  = trial['param_trajectory'][-1]
+        early_tag = f'  [early@{trial["steps_run"]}]' if trial['stopped_early'] else ''
+        final_str = ', '.join(f'{v:.3f}' for v in final_pn)
+        print(f'  loss {trial["loss_trajectory"][0]:.3e} → '
+              f'{trial["loss_trajectory"][-1]:.3e}  '
+              f'p_n ({pn_str}) → ({final_str})  '
+              f'({trial["total_time_s"]:.1f} s){early_tag}')
+
+        cumulative_steps += trial['steps_run']
+        if cumulative_steps - last_save_at_step >= 100:
+            last_save_at_step = cumulative_steps
+            with open(output_path, 'wb') as f:
+                pickle.dump(result, f)
+            print(f'  [checkpoint @ {cumulative_steps} steps → {output_path}]')
+
+    # ── Save ──────────────────────────────────────────────────────────────────
     with open(output_path, 'wb') as f:
         pickle.dump(result, f)
     print(f'\nSaved: {output_path}')
