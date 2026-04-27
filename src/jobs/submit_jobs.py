@@ -57,10 +57,48 @@ def make_opt_command(
 
 
 if __name__ == "__main__":
-    for seed in [46, 47, 48, 49, 50]:
-        command = make_opt_command(seed=seed, grad_clip=10.0, max_steps=10000)
-        print("Command:")
-        print(f"  {command}")
-        print()
-        s3df_submit(command, time="01:00:00", submit=True)
+    TRACKS_3 = "diagonal_100MeV:1,1,1:100+X+Z"
+    SEEDS = [46, 47, 48, 49, 50]
+
+    # 5 jobs without noise
+    for seed in SEEDS:
+        command = make_opt_command(
+            params=ALL_PARAMS,
+            tracks=TRACKS_3,
+            loss="sobolev_loss_geomean_log1p",
+            lr=0.001,
+            lr_schedule="constant",
+            max_steps=10000,
+            tol=1e-6,
+            patience=20,
+            N=10,
+            range_lo=0.9,
+            range_hi=1.1,
+            seed=seed,
+            noise_scale=0.0,
+            results_base="$RESULTS_DIR/opt/all_params",
+            grad_clip=10.0,
+        )
+        s3df_submit(command, time="05:00:00", submit=True)
+
+    # 5 jobs with noise
+    for seed in SEEDS:
+        command = make_opt_command(
+            params=ALL_PARAMS,
+            tracks=TRACKS_3,
+            loss="sobolev_loss_geomean_log1p",
+            lr=0.001,
+            lr_schedule="constant",
+            max_steps=10000,
+            tol=1e-6,
+            patience=20,
+            N=10,
+            range_lo=0.9,
+            range_hi=1.1,
+            seed=seed,
+            noise_scale=1.0,
+            results_base="$RESULTS_DIR/opt/all_params",
+            grad_clip=10.0,
+        )
+        s3df_submit(command, time="05:00:00", submit=True)
    

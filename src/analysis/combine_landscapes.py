@@ -102,6 +102,8 @@ def combine(landscapes, output_name_hint=None):
 
     directions = [ld['direction'] for ld in landscapes]
 
+    noise_scale = ref.get('noise_scale', 0.0)
+
     landscape = dict(
         loss_name    = ref['loss_name'],
         track_name   = combined_track,
@@ -115,6 +117,7 @@ def combine(landscapes, output_name_hint=None):
         beta90_vals  = ref['beta90_vals'],
         grid         = combined_grid.tolist(),
         n_tracks     = n,
+        noise_scale  = noise_scale,
         source_pkls  = [os.path.basename(ld.get('_source', '?')) for ld in landscapes],
     )
     if has_grads:
@@ -123,7 +126,9 @@ def combine(landscapes, output_name_hint=None):
 
     N = ref['grid_size']
     loss_name = ref['loss_name']
-    base = output_name_hint or f'landscape_{loss_name}_combined_{n}tracks_{N}x{N}'
+    noise_tag = f'_noise{noise_scale:.3g}'.replace('.', 'p') if noise_scale > 0.0 else ''
+    tracks_tag = '_'.join(track_names)
+    base = output_name_hint or f'landscape_{loss_name}_{tracks_tag}_{N}x{N}{noise_tag}'
     return landscape, base
 
 

@@ -34,3 +34,6 @@ gpus:
     - python src/opt/run_optimization.py --params recomb_alpha,recomb_beta_90 --tracks diagonal_100MeV:1,1,1:100+X+Z --loss sobolev_loss_geomean_log1p --lr 0.001 --lr-schedule constant --max-steps 500 --tol 1e-5 --N 10 --range 0.8 1.2 --results-base $RESULTS_DIR/opt/2D_recomb
     # 3 tracks at 100 MeV — diagonal + Y + Z (third direction variant)
     # - python src/opt/run_optimization.py --params recomb_alpha,recomb_beta_90 --tracks diagonal_100MeV:1,1,1:100+y100:0,1,0:100+z100:0,0,1:100 --loss sobolev_loss_geomean_log1p --lr 0.001 --lr-schedule constant --max-steps 500 --tol 1e-5 --N 10 --range 0.8 1.2 --results-base $RESULTS_DIR/opt/2D_recomb --no-wandb
+
+#post_gpu_jobs:
+#  - python src/plots/plot_2d_recomb_by_tracks.py --results-dir $RESULTS_DIR/opt/2D_recomb --output-dir $PLOTS_DIR/opt/2D_recomb

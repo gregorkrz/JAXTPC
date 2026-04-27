@@ -60,3 +60,4 @@ post_gpu_jobs:
   # diagonal_100MeV + X@1000 + Z@1000  (GPU 3 of opt plan)
   - python src/analysis/combine_landscapes.py $RESULTS_DIR/2d_landscape/landscape_sobolev_loss_geomean_log1p_diagonal_100MeV_T100MeV_30x30.pkl $RESULTS_DIR/2d_landscape/landscape_sobolev_loss_geomean_log1p_X_T1000MeV_30x30.pkl $RESULTS_DIR/2d_landscape/landscape_sobolev_loss_geomean_log1p_Z_T1000MeV_30x30.pkl --output-dir $RESULTS_DIR/2d_landscape/combined_landscapes
 
+  - python src/plots/plot_2d_landscape_by_tracks.py --opt-results-dir $RESULTS_DIR/opt/2D_recomb --landscape-dir $RESULTS_DIR/2d_landscape/combined_landscapes --output-dir $PLOTS_DIR/opt/2D_recomb_sorted_noise  
