@@ -13,7 +13,7 @@ LOGS_DIR = "/fs/ddn/sdf/group/atlas/d/gregork/logs"
 APPTAINER_CACHEDIR = "/sdf/scratch/atlas/gregork/apptainer_cache"
 APPTAINER_TMPDIR   = "/sdf/scratch/atlas/gregork/apptainer_tmp"
 
-APPTAINER_IMAGE = "docker://gkrz/jaxtpc:v1"
+APPTAINER_IMAGE = "docker://gkrz/jaxtpc:v2"
 BIND_MOUNTS = [
     "/sdf/home/g/gregork/jaxtpc",
     "/fs/ddn/sdf/group/atlas/d/gregork/jaxtpc",
