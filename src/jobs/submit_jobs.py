@@ -31,7 +31,9 @@ def make_opt_command(
     seed=None,
     noise_scale=0.0,
     results_base="$RESULTS_DIR/opt/all_params",
-    grad_clip=10.0
+    grad_clip=10.0,
+    lr_multipliers=None,
+    warmup_steps=100,
 ):
     """Return a run_optimization.py command string with the given settings."""
     parts = [
@@ -47,43 +49,54 @@ def make_opt_command(
         f"--N {N}",
         f"--range {range_lo} {range_hi}",
         f"--results-base {results_base}",
-        f"--clip-grad-norm {grad_clip}"
+        f"--clip-grad-norm {grad_clip}",
+        f"--warmup-steps {warmup_steps}",
     ]
+
     if seed is not None:
         parts.append(f"--seed {seed}")
     if noise_scale > 0.0:
         parts.append(f"--noise-scale {noise_scale}")
+    if lr_multipliers is not None:
+        parts.append(f"--lr-multipliers {lr_multipliers}")
     return " ".join(parts)
 
 
 if __name__ == "__main__":
-    # diagonal + X + Y + Z at both 1000 MeV and 100 MeV in one run
-    TRACKS_8 = (
+    # diagonal + X + Y + Z at 1000, 100, and 50 MeV in one run
+    TRACKS_12 = (
         "diagonal+X+Y+Z"
         "+diagonal_100MeV:1,1,1:100+x100:1,0,0:100+y100:0,1,0:100+z100:0,0,1:100"
+        "+diagonal_50MeV:1,1,1:50+x50:1,0,0:50+y50:0,1,0:50+z50:0,0,1:50"
     )
 
+    PARAM_LIST = [p.strip() for p in ALL_PARAMS.split(",") if p.strip()]
+
     SHARED = dict(
-        params=ALL_PARAMS,
         loss="sobolev_loss_geomean_log1p",
-        lr=0.001,
+        lr=0.0001,
         lr_schedule="constant",
-        max_steps=10000,
+        max_steps=40000,
         tol=1e-6,
-        patience=20,
+        patience=100,
         N=1,
         range_lo=0.9,
         range_hi=1.1,
-        results_base="$RESULTS_DIR/opt/all_params",
+        results_base="$RESULTS_DIR/opt/all_params_bugfix_20260428_1",
         grad_clip=10.0,
+        lr_multipliers="velocity_cm_us:0.005",
+        warmup_steps=1000,
     )
 
-    for noise_scale in [0.0, 1.0]:
-        command = make_opt_command(
-            tracks=TRACKS_8,
-            seed=42,
-            noise_scale=noise_scale,
-            **SHARED,
-        )
-        s3df_submit(command, time="05:00:00", submit=True)
+    for n_params in range(1, len(PARAM_LIST) + 1):
+        params = ",".join(PARAM_LIST[:n_params])
+        for seed in [42, 43, 44]:
+            command = make_opt_command(
+                params=params,
+                tracks=TRACKS_12,
+                seed=seed,
+                noise_scale=0.0,
+                **SHARED,
+            )
+            s3df_submit(command, time="10:00:00", submit=True)
    

@@ -48,7 +48,7 @@ Each pickle contains:
       loss_trajectory    list of length steps+1
       total_time_s, stopped_early, steps_run
 """
-import sys, os
+import sys, os, signal
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
 from dotenv import load_dotenv
@@ -189,8 +189,12 @@ def parse_args():
                    help='Linear LR warmup from 0 to --lr over this many steps '
                         '(default: 100, set to 0 to disable).')
     p.add_argument('--clip-grad-norm', type=float, default=10.0,
-                   help='Clip gradient global norm to this value before optimizer update '
-                        '(default: 10.0, set to 0 to disable).')
+                   help='Clip each gradient component independently to [-value, value] '
+                        'before optimizer update (default: 10.0, set to 0 to disable).')
+    p.add_argument('--lr-multipliers', default=None,
+                   help='Per-parameter LR multipliers as comma-separated name:factor pairs, '
+                        'e.g. "velocity_cm_us:0.01,lifetime_us:0.1". '
+                        'Unlisted parameters keep multiplier 1.0.')
     p.add_argument('--no-wandb', action='store_true',
                    help='Disable Weights & Biases logging (enabled by default).')
     p.add_argument('--wandb-project', default='jaxtpc-optimization',
@@ -347,11 +351,12 @@ def make_nparam_setter(param_names, gt_params, recomb_model):
 # ── Loss builder ───────────────────────────────────────────────────────────────
 
 def build_loss_fn(loss_name, fwd_fn, gt_arrays, weights):
-    """Return JIT-compiled (loss, grad) function of p_n_vec."""
+    """Return JIT-compiled (loss, grad) function for a single track."""
+    planes = tuple(range(len(gt_arrays)))
     if loss_name == 'sobolev_loss':
-        def fn(p_n_vec): return sobolev_loss(fwd_fn(p_n_vec), gt_arrays, weights)
+        def fn(p_n_vec): return sobolev_loss(fwd_fn(p_n_vec), gt_arrays, weights, planes)
     elif loss_name == 'sobolev_loss_geomean_log1p':
-        def fn(p_n_vec): return sobolev_loss_geomean_log1p(fwd_fn(p_n_vec), gt_arrays, weights)
+        def fn(p_n_vec): return sobolev_loss_geomean_log1p(fwd_fn(p_n_vec), gt_arrays, weights, planes)
     elif loss_name == 'mse_loss':
         def fn(p_n_vec): return mse_loss(fwd_fn(p_n_vec), gt_arrays)
     elif loss_name == 'l1_loss':
@@ -363,7 +368,38 @@ def build_loss_fn(loss_name, fwd_fn, gt_arrays, weights):
 
 # ── Optimizer factory ──────────────────────────────────────────────────────────
 
-def make_optax_optimizer(optimizer_name, lr, lr_schedule, max_steps, clip_grad_norm=0.0, warmup_steps=0):
+def parse_lr_multipliers(spec, param_names):
+    """Parse 'name:factor,...' string into a per-parameter scale vector (length = len(param_names)).
+
+    Unlisted parameters default to 1.0.
+    """
+    scales = [1.0] * len(param_names)
+    if not spec:
+        return scales
+    for item in spec.split(','):
+        item = item.strip()
+        if not item:
+            continue
+        name, factor = item.split(':')
+        name = name.strip()
+        if name not in param_names:
+            raise ValueError(f'--lr-multipliers: unknown param {name!r}. Known: {param_names}')
+        scales[param_names.index(name)] = float(factor)
+    return scales
+
+
+def _scale_by_vector(scales):
+    """Optax transform that element-wise multiplies gradients by a fixed scale vector."""
+    scales_arr = jnp.array(scales, dtype=jnp.float32)
+    def init_fn(params):
+        return ()
+    def update_fn(updates, state, params=None):
+        return updates * scales_arr, state
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+def make_optax_optimizer(optimizer_name, lr, lr_schedule, max_steps, clip_grad_norm=0.0,
+                         warmup_steps=0, lr_multipliers=None):
     if warmup_steps > 0:
         warmup = optax.linear_schedule(init_value=0.0, end_value=lr, transition_steps=warmup_steps)
         if lr_schedule == 'cosine':
@@ -379,10 +415,13 @@ def make_optax_optimizer(optimizer_name, lr, lr_schedule, max_steps, clip_grad_n
     elif optimizer_name == 'sgd':          base = optax.sgd(schedule)
     elif optimizer_name == 'momentum_sgd': base = optax.sgd(schedule, momentum=MOMENTUM)
     else: raise ValueError(f'Unknown optimizer {optimizer_name!r}')
+    transforms = []
+    if lr_multipliers is not None and any(s != 1.0 for s in lr_multipliers):
+        transforms.append(_scale_by_vector(lr_multipliers))
     if clip_grad_norm > 0.0:
-        tx = optax.chain(optax.clip_by_global_norm(clip_grad_norm), base)
-    else:
-        tx = base
+        transforms.append(optax.clip(clip_grad_norm))
+    transforms.append(base)
+    tx = optax.chain(*transforms)
     # Wrap schedule in a callable so callers can query lr at any step
     schedule_fn = schedule if callable(schedule) else (lambda _s, _lr=schedule: _lr)
     return tx, schedule_fn
@@ -390,9 +429,15 @@ def make_optax_optimizer(optimizer_name, lr, lr_schedule, max_steps, clip_grad_n
 
 # ── Trial runner ───────────────────────────────────────────────────────────────
 
+def _serialize_opt_state(opt_state):
+    """Convert JAX arrays in optax state to numpy arrays for pickling."""
+    return jax.tree_util.tree_map(np.asarray, opt_state)
+
+
 def run_trial(p0, val_and_grad_fn, optimizer, max_steps, tol=1e-5, patience=20,
               log_interval=50, param_names=None, scales=None, p_n_gts=None,
-              use_wandb=False, trial_idx=0, schedule_fn=None):
+              use_wandb=False, trial_idx=0, schedule_fn=None,
+              checkpoint_callback=None):
     """Run one optimization trial from starting p_n vector p0 (any length).
 
     Records param, loss, and gradient at every step.
@@ -438,11 +483,14 @@ def run_trial(p0, val_and_grad_fn, optimizer, max_steps, tol=1e-5, patience=20,
         loss_traj.append(float(lv_new))
         grad_traj.append(gv_new.tolist())
 
-        if use_wandb and _WANDB_AVAILABLE and (step + 1) % log_interval == 0:
-            _wandb_log_step(step + 1, float(lv_new), gv_new, p,
-                            param_names, scales, p_n_gts,
-                            step_time_s=step_time, trial_idx=trial_idx,
-                            schedule_fn=schedule_fn)
+        if (step + 1) % log_interval == 0:
+            if use_wandb and _WANDB_AVAILABLE:
+                _wandb_log_step(step + 1, float(lv_new), gv_new, p,
+                                param_names, scales, p_n_gts,
+                                step_time_s=step_time, trial_idx=trial_idx,
+                                schedule_fn=schedule_fn)
+            if checkpoint_callback is not None:
+                checkpoint_callback(step + 1, p, opt_state)
 
         if step >= patience:
             p_now  = np.array(param_traj[-1])
@@ -459,6 +507,7 @@ def run_trial(p0, val_and_grad_fn, optimizer, max_steps, tol=1e-5, patience=20,
         total_time_s     = time.time() - t_start,
         stopped_early    = stopped_early,
         steps_run        = len(param_traj) - 1,
+        final_opt_state  = _serialize_opt_state(opt_state),
     )
 
 
@@ -596,6 +645,7 @@ def main():
                 clip_grad_norm = args.clip_grad_norm,
                 seed          = effective_seed,
                 log_interval  = args.log_interval,
+                output_path   = output_path,
             ),
         )
 
@@ -646,47 +696,62 @@ def main():
         velocity_cm_us = jnp.array(GT_VELOCITY_CM_US),
     )
 
-    # ── GT arrays & Sobolev weights ───────────────────────────────────────────
-    print('Computing GT forward passes...')
-    t0 = time.time()
-    gt_arrays = []
-    for deposits in all_deposits:
-        arrs = simulator.forward(gt_params, deposits)
-        jax.block_until_ready(arrs)
-        gt_arrays.extend(arrs)
-    gt_arrays = tuple(gt_arrays)
-    print(f'Done ({time.time() - t0:.1f} s)  —  {len(gt_arrays)} plane arrays total')
-
-    # ── Optional noise on GT ──────────────────────────────────────────────────
-    signal_rms = float(np.mean([float(jnp.std(a)) for a in gt_arrays]))
-    if args.noise_scale > 0.0:
-        noisy_gt_arrays = apply_noise_to_gt(gt_arrays, simulator, args.noise_scale, noise_seed)
-        noise_rms = float(np.mean([float(jnp.std(n - c))
-                                   for n, c in zip(noisy_gt_arrays, gt_arrays)]))
-        gt_arrays = noisy_gt_arrays
-        print(f'  Signal RMS : {signal_rms:.4g}  (mean over planes)')
-        print(f'  Noise  RMS : {noise_rms:.4g}  (mean over planes,  SNR ≈ {signal_rms / max(noise_rms, 1e-30):.2f})')
-    else:
-        print(f'  Signal RMS : {signal_rms:.4g}  (mean over planes, use --noise-scale to add noise)')
-
-    weights = tuple(
-        make_sobolev_weight(arr.shape[0], arr.shape[1], max_pad=SOBOLEV_MAX_PAD)
-        for arr in gt_arrays
-    )
-
-    # ── Setter & forward ──────────────────────────────────────────────────────
+    # ── Setter ────────────────────────────────────────────────────────────────
     setter, gt_vals, scales, p_n_gts = make_nparam_setter(
         param_names, gt_params, simulator.recomb_model)
 
     for name, gt_val, scale, p_n_gt in zip(param_names, gt_vals, scales, p_n_gts):
         print(f'  {name}: GT={gt_val:.6g}  scale={scale:.6g}  log(GT/scale)={p_n_gt:.6g}')
 
-    def _multi_fwd(p_n_vec, _deps=all_deposits, _setter=setter):
-        arrays = []
-        for dep in _deps:
-            arrays.extend(simulator.forward(_setter(p_n_vec), dep))
-        return tuple(arrays)
-    fwd_fn = jax.jit(_multi_fwd)
+    # ── GT arrays, weights, and per-track loss fns (one track at a time) ─────
+    print('Computing GT forward passes and building per-track loss functions...')
+    t0 = time.time()
+    per_track_val_and_grad = []
+    signal_rms_acc = []
+    noise_rms_acc  = []
+    for deposits in all_deposits:
+        gt = tuple(simulator.forward(gt_params, deposits))
+        jax.block_until_ready(gt)
+
+        if args.noise_scale > 0.0:
+            gt_noisy = apply_noise_to_gt(gt, simulator, args.noise_scale, noise_seed)
+            signal_rms_acc.append(float(np.mean([float(jnp.std(a)) for a in gt])))
+            noise_rms_acc.append(float(np.mean([float(jnp.std(n - c)) for n, c in zip(gt_noisy, gt)])))
+            gt = gt_noisy
+        else:
+            signal_rms_acc.append(float(np.mean([float(jnp.std(a)) for a in gt])))
+
+        wts = tuple(
+            make_sobolev_weight(a.shape[0], a.shape[1], max_pad=SOBOLEV_MAX_PAD)
+            for a in gt
+        )
+
+        def _fwd(p, _dep=deposits, _setter=setter):
+            return tuple(simulator.forward(_setter(p), _dep))
+
+        per_track_val_and_grad.append(build_loss_fn(args.loss, jax.jit(_fwd), gt, wts))
+
+    n_planes_per_track = len(gt)
+    print(f'Done ({time.time() - t0:.1f} s)  —  '
+          f'{n_planes_per_track} planes per track, {len(all_deposits)} tracks')
+
+    signal_rms = float(np.mean(signal_rms_acc))
+    if args.noise_scale > 0.0:
+        noise_rms = float(np.mean(noise_rms_acc))
+        print(f'  Signal RMS : {signal_rms:.4g}  (mean over planes)')
+        print(f'  Noise  RMS : {noise_rms:.4g}  (mean over planes,  SNR ≈ {signal_rms / max(noise_rms, 1e-30):.2f})')
+    else:
+        print(f'  Signal RMS : {signal_rms:.4g}  (mean over planes, use --noise-scale to add noise)')
+
+    def val_and_grad_fn(p_n_vec):
+        total_loss = 0.0
+        total_grad = jnp.zeros(len(param_names), dtype=jnp.float32)
+        for fn in per_track_val_and_grad:
+            lv, gv = fn(p_n_vec)
+            jax.block_until_ready((lv, gv))
+            total_loss = total_loss + float(lv)
+            total_grad = total_grad + gv
+        return jnp.array(total_loss, dtype=jnp.float32), total_grad
 
     # ── Random starting points ────────────────────────────────────────────────
     rng = start_rng
@@ -695,19 +760,25 @@ def main():
     factor_grid   = factors.tolist()
     p_n_starts    = (np.log(factors) + np.array(p_n_gts)).tolist()
 
-    # ── Compile ───────────────────────────────────────────────────────────────
-    val_and_grad_fn = build_loss_fn(args.loss, fwd_fn, gt_arrays, weights)
-    print('\nCompiling value_and_grad...')
+    # ── Compile (warm up each per-track JIT fn) ───────────────────────────────
+    print('\nCompiling per-track value_and_grad functions...')
     t0 = time.time()
     _p0 = jnp.array(p_n_starts[0], dtype=jnp.float32)
-    _ = val_and_grad_fn(_p0); jax.block_until_ready(_)
-    _ = val_and_grad_fn(_p0); jax.block_until_ready(_)
+    for fn in per_track_val_and_grad:
+        _ = fn(_p0); jax.block_until_ready(_)
+        _ = fn(_p0); jax.block_until_ready(_)
     print(f'Done ({time.time() - t0:.1f} s)')
+
+    lr_multipliers = parse_lr_multipliers(args.lr_multipliers, param_names)
+    if any(s != 1.0 for s in lr_multipliers):
+        pairs = ', '.join(f'{n}×{s}' for n, s in zip(param_names, lr_multipliers) if s != 1.0)
+        print(f'LR multipliers : {pairs}')
 
     optimizer, schedule_fn = make_optax_optimizer(args.optimizer, args.lr, args.lr_schedule,
                                                   args.max_steps,
                                                   clip_grad_norm=args.clip_grad_norm,
-                                                  warmup_steps=args.warmup_steps)
+                                                  warmup_steps=args.warmup_steps,
+                                                  lr_multipliers=lr_multipliers)
 
     # ── Trials ────────────────────────────────────────────────────────────────
     all_trials = []
@@ -734,6 +805,28 @@ def main():
         trials              = all_trials,
     )
 
+    # ── Intra-trial checkpoint ────────────────────────────────────────────────
+    def _intra_trial_checkpoint(trial_idx, step, p, opt_state):
+        result['live_checkpoint'] = dict(
+            trial_idx = trial_idx,
+            step      = step,
+            p         = p.tolist(),
+            opt_state = _serialize_opt_state(opt_state),
+        )
+        with open(output_path, 'wb') as f:
+            pickle.dump(result, f)
+
+    # ── Preemption handler ────────────────────────────────────────────────────
+    def _sigterm_handler(_sig, _frame):
+        print('\nSIGTERM received — saving checkpoint before exit...', flush=True)
+        with open(output_path, 'wb') as f:
+            pickle.dump(result, f)
+        print(f'Saved: {output_path}', flush=True)
+        if use_wandb and _WANDB_AVAILABLE:
+            _wandb.finish()
+        sys.exit(0)
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
     cumulative_steps   = 0
     last_save_at_step  = 0
 
@@ -749,8 +842,10 @@ def main():
             log_interval=args.log_interval,
             param_names=param_names, scales=scales, p_n_gts=p_n_gts,
             use_wandb=use_wandb, trial_idx=gi, schedule_fn=schedule_fn,
+            checkpoint_callback=lambda step, p, opt_state: _intra_trial_checkpoint(gi, step, p, opt_state),
         )
         all_trials.append(trial)
+        result.pop('live_checkpoint', None)
 
         final_pn  = trial['param_trajectory'][-1]
         early_tag = f'  [early@{trial["steps_run"]}]' if trial['stopped_early'] else ''
