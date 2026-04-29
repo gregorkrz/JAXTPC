@@ -70,6 +70,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
+from tools.config import pad_deposit_data
 from tools.geometry import generate_detector
 from tools.loader import build_deposit_data
 from tools.losses import (
@@ -94,7 +95,7 @@ MAX_ACTIVE_BUCKETS = 1000
 #DETECTOR_BOUNDS_MM = ((-300, 300), (-300, 300), (-300, 300))
 
 _JAX_CACHE_DIR = os.environ.get('JAX_COMPILATION_CACHE_DIR',
-                                os.path.expanduser('~/.cache/jax_compilation_cache'))
+                                os.path.expanduser('/tmp/jax_cache'))
 jax.config.update('jax_compilation_cache_dir', _JAX_CACHE_DIR)
 jax.config.update('jax_persistent_cache_min_compile_time_secs', 1.0)
 _RESULTS_DIR = os.environ.get('RESULTS_DIR', 'results')
@@ -195,6 +196,33 @@ def parse_args():
                    help='Per-parameter LR multipliers as comma-separated name:factor pairs, '
                         'e.g. "velocity_cm_us:0.01,lifetime_us:0.1". '
                         'Unlisted parameters keep multiplier 1.0.')
+    p.add_argument('--batch-size', type=int, default=1,
+                   help='Number of tracks processed together on GPU per grad call (default: 1). '
+                        'Larger values use vmap to parallelize tracks; try 2–4.')
+    p.add_argument('--step-size', type=float, default=0.1,
+                   help='Muon track step size in mm (default: 0.1). '
+                        'Larger values reduce deposit count and memory use.')
+    p.add_argument('--max-num-deposits', type=int, default=50_000,
+                   help='Static deposit buffer size passed to the differentiable simulator '
+                        'as n_segments (default: 50000). Must be >= actual deposits per track.')
+    p.add_argument('--num-buckets', type=int, default=1000,
+                   help='Max active buckets for non-differentiable bucketed accumulation '
+                        '(default: 1000). Increase if you see bucket overflow warnings.')
+    p.add_argument('--schedule-steps', default=None,
+                   help='Comma-separated step thresholds that divide optimization into phases '
+                        '(e.g. "1000" → 2 phases; "1000,5000" → 3 phases).')
+    p.add_argument('--schedule-step-sizes', default=None,
+                   help='Comma-separated step sizes in mm, one per phase (e.g. "1.0,0.1").')
+    p.add_argument('--schedule-deposits', default=None,
+                   help='Comma-separated max-num-deposits, one per phase (e.g. "5000,50000").')
+    p.add_argument('--schedule-batch-sizes', default=None,
+                   help='Comma-separated batch sizes, one per phase (e.g. "5,1").')
+    p.add_argument('--gt-step-size', type=float, default=0.1,
+                   help='Step size in mm used to generate GT signals (default: 0.1). '
+                        'Independent of the forward simulation schedule.')
+    p.add_argument('--gt-max-deposits', type=int, default=50_000,
+                   help='Static deposit buffer for the GT simulator (default: 50000). '
+                        'Must be >= actual deposits per track at --gt-step-size.')
     p.add_argument('--no-wandb', action='store_true',
                    help='Disable Weights & Biases logging (enabled by default).')
     p.add_argument('--wandb-project', default='jaxtpc-optimization',
@@ -265,14 +293,19 @@ def parse_tracks(tracks_str):
 # ── Folder name ────────────────────────────────────────────────────────────────
 
 def make_folder_name(param_names, track_specs, loss_name, optimizer, lr,
-                     lr_schedule, max_steps, N, range_lo, range_hi, noise_scale=0.0):
+                     lr_schedule, max_steps, N, range_lo, range_hi,
+                     noise_scale=0.0, step_size=0.1, max_num_deposits=50_000, n_phases=1):
     params_tag    = '+'.join(param_names)
     tracks_tag    = '+'.join(t['name'] for t in track_specs)
     sched_tag     = '_cosine' if lr_schedule == 'cosine' else ''
     range_tag     = f'r{range_lo:.3g}_{range_hi:.3g}'.replace('.', 'p')
     noise_tag     = f'_noise{noise_scale:.3g}'.replace('.', 'p') if noise_scale > 0.0 else ''
+    ss_tag        = f'_ss{step_size:.3g}'.replace('.', 'p') if step_size != 0.1 else ''
+    dep_tag       = f'_dep{max_num_deposits // 1000}k' if max_num_deposits != 50_000 else ''
+    phase_tag     = f'_sched{n_phases}' if n_phases > 1 else ''
     return (f'{params_tag}__{tracks_tag}__{loss_name}__'
-            f'{optimizer}_lr{lr}{sched_tag}_s{max_steps}_N{N}_{range_tag}{noise_tag}')
+            f'{optimizer}_lr{lr}{sched_tag}_s{max_steps}_N{N}_{range_tag}'
+            f'{noise_tag}{ss_tag}{dep_tag}{phase_tag}')
 
 
 def next_result_path(folder, seed=None):
@@ -366,6 +399,77 @@ def build_loss_fn(loss_name, fwd_fn, gt_arrays, weights):
     return jax.jit(jax.value_and_grad(fn))
 
 
+def build_phase_fns(loss_name, simulator, setter, batches):
+    """Return one callable fn(p_n_vec) -> (loss, grad) per batch in a phase.
+
+    All batches with the same size share a single compiled XLA kernel — only
+    the deposit/gt/wt arrays differ between calls, so JAX compiles once per
+    unique batch size rather than once per batch.
+
+    batches: list of (batch_deposits, batch_gts, batch_wts)
+    """
+    cfg = simulator.config
+    n_volumes = cfg.n_volumes
+    n_planes_per_vol = cfg.volumes[0].n_planes
+    n_planes = n_volumes * n_planes_per_vol
+    planes = tuple(range(n_planes))
+    _batched_diff = jax.vmap(simulator._forward_diff, in_axes=(None, 0))
+
+    # Pre-pad and stack all batch data into JAX arrays up front
+    processed = []
+    for batch_deposits, batch_gts, batch_wts in batches:
+        bs = len(batch_deposits)
+        stacked_list = []
+        for dep in batch_deposits:
+            dep_padded = pad_deposit_data(dep, cfg.total_pad)
+            s = jax.tree.map(lambda *xs: jnp.stack(xs), *dep_padded.volumes)
+            stacked_list.append(s)
+        batch_deps = jax.tree.map(lambda *xs: jnp.stack(xs), *stacked_list)
+        # Stack per plane: shape (bs, n_wires, n_times) for each plane index
+        batch_gts_s = tuple(jnp.stack([batch_gts[b][p] for b in range(bs)]) for p in range(n_planes))
+        batch_wts_s = tuple(jnp.stack([batch_wts[b][p] for b in range(bs)]) for p in range(n_planes))
+        processed.append((bs, batch_deps, batch_gts_s, batch_wts_s))
+
+    # One compiled function per unique batch size (last batch may be smaller)
+    compiled_cache = {}
+
+    def _get_compiled(bs):
+        if bs in compiled_cache:
+            return compiled_cache[bs]
+
+        def fn(p_n_vec, batch_deps, batch_gts_s, batch_wts_s):
+            all_signals = _batched_diff(setter(p_n_vec), batch_deps)
+            total = 0.0
+            for b in range(bs):
+                pred = tuple(
+                    all_signals[b, v, pl]
+                    for v in range(n_volumes)
+                    for pl in range(n_planes_per_vol)
+                )
+                gt_b  = tuple(batch_gts_s[p][b] for p in range(n_planes))
+                wts_b = tuple(batch_wts_s[p][b] for p in range(n_planes))
+                if loss_name == 'sobolev_loss':
+                    total = total + sobolev_loss(pred, gt_b, wts_b, planes)
+                elif loss_name == 'sobolev_loss_geomean_log1p':
+                    total = total + sobolev_loss_geomean_log1p(pred, gt_b, wts_b, planes)
+                elif loss_name == 'mse_loss':
+                    total = total + mse_loss(pred, gt_b)
+                elif loss_name == 'l1_loss':
+                    total = total + l1_loss(pred, gt_b)
+                else:
+                    raise ValueError(f'Unknown loss {loss_name!r}')
+            return total
+
+        compiled = jax.jit(jax.value_and_grad(fn, argnums=0))
+        compiled_cache[bs] = compiled
+        return compiled
+
+    def _make_fn(compiled, deps, gts, wts):
+        return lambda p: compiled(p, deps, gts, wts)
+
+    return [_make_fn(_get_compiled(bs), d, g, w) for bs, d, g, w in processed]
+
+
 # ── Optimizer factory ──────────────────────────────────────────────────────────
 
 def parse_lr_multipliers(spec, param_names):
@@ -386,6 +490,39 @@ def parse_lr_multipliers(spec, param_names):
             raise ValueError(f'--lr-multipliers: unknown param {name!r}. Known: {param_names}')
         scales[param_names.index(name)] = float(factor)
     return scales
+
+
+def parse_schedule(args):
+    """Return a list of phase dicts: {step_size, max_num_deposits, batch_size, until_step}.
+
+    Single-phase (no --schedule-steps) returns a one-element list using the
+    top-level --step-size / --max-num-deposits / --batch-size values.
+    """
+    if args.schedule_steps is None:
+        return [dict(step_size=args.step_size,
+                     max_num_deposits=args.max_num_deposits,
+                     batch_size=args.batch_size,
+                     until_step=args.max_steps)]
+
+    thresholds = [int(x.strip()) for x in args.schedule_steps.split(',')]
+    n_phases   = len(thresholds) + 1
+
+    def _csv(s, typ, default):
+        if s is None:
+            return [typ(default)] * n_phases
+        vals = [typ(x.strip()) for x in s.split(',')]
+        if len(vals) != n_phases:
+            raise ValueError(
+                f'Expected {n_phases} comma-separated values (got {len(vals)}): {s!r}')
+        return vals
+
+    step_sizes  = _csv(args.schedule_step_sizes,  float, args.step_size)
+    deposits    = _csv(args.schedule_deposits,     int,   args.max_num_deposits)
+    batch_sizes = _csv(args.schedule_batch_sizes,  int,   args.batch_size)
+
+    until_steps = thresholds + [args.max_steps]
+    return [dict(step_size=ss, max_num_deposits=dep, batch_size=bs, until_step=us)
+            for ss, dep, bs, us in zip(step_sizes, deposits, batch_sizes, until_steps)]
 
 
 def _scale_by_vector(scales):
@@ -434,48 +571,68 @@ def _serialize_opt_state(opt_state):
     return jax.tree_util.tree_map(np.asarray, opt_state)
 
 
-def run_trial(p0, val_and_grad_fn, optimizer, max_steps, tol=1e-5, patience=20,
+def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
               log_interval=50, param_names=None, scales=None, p_n_gts=None,
               use_wandb=False, trial_idx=0, schedule_fn=None,
-              checkpoint_callback=None):
+              checkpoint_callback=None, lr_multipliers=None,
+              initial_opt_state=None, start_step=0):
     """Run one optimization trial from starting p_n vector p0 (any length).
 
-    Records param, loss, and gradient at every step.
+    phase_schedule: list of (until_step, batch_fns) sorted by until_step.
+    Each step uses the batch_fns of the first phase whose until_step > step.
 
     Returns dict with:
       param_trajectory   list[list]  length steps+1
-      grad_trajectory    list[list]  length steps+1  (grad at each recorded position)
+      grad_trajectory    list[list]  length steps+1
       loss_trajectory    list[float] length steps+1
       total_time_s, stopped_early, steps_run
     """
     p = jnp.array(p0, dtype=jnp.float32)
-    opt_state = optimizer.init(p)
+    opt_state = (jax.tree_util.tree_map(jnp.array, initial_opt_state)
+                 if initial_opt_state is not None else optimizer.init(p))
 
     param_traj = []
     loss_traj  = []
     grad_traj  = []
 
     t_start    = time.time()
-    step_start = time.time()
+    multi_phase = len(phase_schedule) > 1
 
-    lv, gv = val_and_grad_fn(p)
-    jax.block_until_ready((lv, gv))
+    def _phase_at(step):
+        for ph_idx, (until_step, bfns) in enumerate(phase_schedule):
+            if step < until_step:
+                return ph_idx, bfns
+        return len(phase_schedule) - 1, phase_schedule[-1][1]
+
+    # Step 0: aggregate phase-0 batches for a representative initial loss/grad.
+    _, batch_fns_0 = phase_schedule[0]
+    lv_init = 0.0
+    gv_init = jnp.zeros_like(p)
+    for fn in batch_fns_0:
+        lv, gv = fn(p)
+        jax.block_until_ready((lv, gv))
+        lv_init += float(lv)
+        gv_init  = gv_init + gv
     param_traj.append(p.tolist())
-    loss_traj.append(float(lv))
-    grad_traj.append(gv.tolist())
+    loss_traj.append(lv_init)
+    grad_traj.append(gv_init.tolist())
 
     if use_wandb and _WANDB_AVAILABLE:
-        _wandb_log_step(0, float(lv), gv, p, param_names, scales, p_n_gts,
-                        step_time_s=0.0, trial_idx=trial_idx, schedule_fn=schedule_fn)
+        _wandb_log_step(start_step, lv_init, gv_init, p, param_names, scales, p_n_gts,
+                        step_time_s=0.0, trial_idx=trial_idx, schedule_fn=schedule_fn,
+                        lr_multipliers=lr_multipliers,
+                        phase=0 if multi_phase else None)
 
     stopped_early = False
-    for step in range(max_steps):
+    for step in range(start_step, max_steps):
         step_start = time.time()
-        lv, gv = val_and_grad_fn(p)
+        ph_idx, batch_fns = _phase_at(step)
+        fn = batch_fns[step % len(batch_fns)]
+        lv, gv = fn(p)
         jax.block_until_ready((lv, gv))
         updates, opt_state = optimizer.update(gv, opt_state)
         p = optax.apply_updates(p, updates)
-        lv_new, gv_new = val_and_grad_fn(p)
+        lv_new, gv_new = fn(p)
         jax.block_until_ready((lv_new, gv_new))
         step_time = time.time() - step_start
 
@@ -488,11 +645,13 @@ def run_trial(p0, val_and_grad_fn, optimizer, max_steps, tol=1e-5, patience=20,
                 _wandb_log_step(step + 1, float(lv_new), gv_new, p,
                                 param_names, scales, p_n_gts,
                                 step_time_s=step_time, trial_idx=trial_idx,
-                                schedule_fn=schedule_fn)
+                                schedule_fn=schedule_fn,
+                                lr_multipliers=lr_multipliers,
+                                phase=ph_idx if multi_phase else None)
             if checkpoint_callback is not None:
                 checkpoint_callback(step + 1, p, opt_state)
 
-        if step >= patience:
+        if len(param_traj) > patience:
             p_now  = np.array(param_traj[-1])
             p_prev = np.array(param_traj[-1 - patience])
             rel = np.linalg.norm(p_now - p_prev) / (np.linalg.norm(p_prev) + 1e-30)
@@ -512,7 +671,8 @@ def run_trial(p0, val_and_grad_fn, optimizer, max_steps, tol=1e-5, patience=20,
 
 
 def _wandb_log_step(step, loss, gv, p, param_names, scales, p_n_gts,
-                    step_time_s, trial_idx, schedule_fn=None):
+                    step_time_s, trial_idx, schedule_fn=None, lr_multipliers=None,
+                    phase=None):
     """Log one step to W&B."""
     p_np  = np.array(p)
     gv_np = np.array(gv)
@@ -524,6 +684,8 @@ def _wandb_log_step(step, loss, gv, p, param_names, scales, p_n_gts,
         'param_norm':     float(np.linalg.norm(p_np)),
         'step_time_s':    step_time_s,
     }
+    if phase is not None:
+        log['phase'] = phase
     if schedule_fn is not None:
         log['lr'] = float(schedule_fn(step))
 
@@ -537,7 +699,8 @@ def _wandb_log_step(step, loss, gv, p, param_names, scales, p_n_gts,
                 rel_err = abs(float(np.exp(p_np[i] - p_n_gts[i])) - 1.0)
                 log[f'params/{name}_rel_err'] = rel_err
             if gv_np is not None:
-                log[f'grads/{name}'] = float(gv_np[i])
+                scale = lr_multipliers[i] if lr_multipliers is not None else 1.0
+                log[f'grads/{name}'] = float(gv_np[i] * scale)
 
     _wandb.log(log, step=step)
 
@@ -575,6 +738,7 @@ def main():
     param_names = parse_params(args.params)
     track_specs = parse_tracks(args.tracks)
     range_lo, range_hi = getattr(args, 'range')
+    schedule    = parse_schedule(args)
 
     # ── Seeding ───────────────────────────────────────────────────────────────
     # SeedSequence(None) draws entropy from the OS; spawn gives independent
@@ -589,13 +753,25 @@ def main():
         param_names, track_specs, args.loss, args.optimizer,
         args.lr, args.lr_schedule, args.max_steps, args.N, range_lo, range_hi,
         noise_scale=args.noise_scale,
+        step_size=schedule[-1]['step_size'],
+        max_num_deposits=schedule[-1]['max_num_deposits'],
+        n_phases=len(schedule),
     )
     output_dir  = os.path.join(args.results_base, folder_name)
     output_path = next_result_path(output_dir, seed=effective_seed)
 
+    with open(os.path.join(output_dir, f'command_{effective_seed}.txt'), 'w') as _f:
+        _f.write(' '.join(sys.argv))
+
+    existing_result = None
     if args.seed is not None and os.path.exists(output_path):
-        print(f'Skipping: {output_path} already exists.')
-        return
+        with open(output_path, 'rb') as f:
+            existing_result = pickle.load(f)
+        n_done = len(existing_result.get('trials', []))
+        if n_done >= args.N:
+            print(f'Skipping: {output_path} already complete ({n_done}/{args.N} trials).')
+            return
+        print(f'Resuming: {output_path} ({n_done}/{args.N} trials done).')
 
     use_wandb = (not args.no_wandb) and _WANDB_AVAILABLE
     if not args.no_wandb and not _WANDB_AVAILABLE:
@@ -614,6 +790,15 @@ def main():
     print(f'N            : {args.N}')
     print(f'Seed         : {effective_seed}')
     print(f'Noise scale  : {args.noise_scale}')
+    print(f'Num buckets  : {args.num_buckets:,}')
+    print(f'GT step size : {args.gt_step_size} mm  max deposits={args.gt_max_deposits:,}')
+    if len(schedule) == 1:
+        print(f'Fwd step size: {schedule[0]["step_size"]} mm')
+        print(f'Fwd deposits : {schedule[0]["max_num_deposits"]:,}')
+        print(f'Batch size   : {schedule[0]["batch_size"]}')
+    else:
+        print(f'Fwd schedule : {len(schedule)} phases  '
+              + '  →  '.join(f'{ph["step_size"]}mm/{ph["max_num_deposits"]//1000}k/bs{ph["batch_size"]}@{ph["until_step"]}' for ph in schedule))
     print(f'W&B          : {"enabled  project=" + args.wandb_project if use_wandb else "disabled"}')
     print(f'Log interval : {args.log_interval} steps')
     print(f'Output       : {output_path}')
@@ -646,112 +831,154 @@ def main():
                 seed          = effective_seed,
                 log_interval  = args.log_interval,
                 output_path   = output_path,
+                jax_compilation_cache_dir = jax.config.jax_compilation_cache_dir,
             ),
         )
 
-    # ── Simulator ─────────────────────────────────────────────────────────────
-    print('\nBuilding differentiable simulator...')
+
+    # ── Schedule ──────────────────────────────────────────────────────────────
+    if len(schedule) > 1:
+        print(f'\nSchedule: {len(schedule)} phases')
+        for i, ph in enumerate(schedule):
+            print(f'  Phase {i}: steps 0–{ph["until_step"]}  '
+                  f'step_size={ph["step_size"]}mm  '
+                  f'deposits={ph["max_num_deposits"]:,}  '
+                  f'batch_size={ph["batch_size"]}')
+
+    # ── Simulators (cached by n_segments) ─────────────────────────────────────
     detector_config = generate_detector(CONFIG_PATH)
-    simulator = DetectorSimulator(
-        detector_config,
-        differentiable=True,
-        n_segments=N_SEGMENTS,
-        use_bucketed=True,
-        max_active_buckets=MAX_ACTIVE_BUCKETS,
-        include_noise=False,
-        include_electronics=False,
-        include_track_hits=False,
-        include_digitize=False,
-    )
+    _sim_cache: dict = {}
 
-    # ── Tracks & deposits ─────────────────────────────────────────────────────
-    all_deposits = []
-    for ts in track_specs:
-        print(f'Generating track  name={ts["name"]}  '
-              f'direction={ts["direction"]}  T={ts["momentum_mev"]} MeV...')
-        track = generate_muon_track(
-            start_position_mm=(0.0, 0.0, 0.0),
-            direction=ts['direction'],
-            kinetic_energy_mev=ts['momentum_mev'],
-            step_size_mm=0.1,
-            track_id=1,
-            #detector_bounds_mm=DETECTOR_BOUNDS_MM,
-        )
-        deposits = build_deposit_data(
-            track['position'], track['de'], track['dx'], simulator.config,
-            theta=track['theta'], phi=track['phi'],
-            track_ids=track['track_id'],
-        )
-        n_total = sum(v.n_actual for v in deposits.volumes)
-        print(f'  {n_total:,} deposits')
-        all_deposits.append(deposits)
+    def _get_sim(n_seg):
+        if n_seg not in _sim_cache:
+            print(f'\nBuilding differentiable simulator (n_segments={n_seg:,})...')
+            sim = DetectorSimulator(
+                detector_config,
+                differentiable=True,
+                n_segments=n_seg,
+                use_bucketed=True,
+                max_active_buckets=args.num_buckets,
+                include_noise=False,
+                include_electronics=False,
+                include_track_hits=False,
+                include_digitize=False,
+            )
+            print('Warming up JIT...')
+            t0 = time.time()
+            sim.warm_up()
+            print(f'Done ({time.time() - t0:.1f} s)')
+            _sim_cache[n_seg] = sim
+        return _sim_cache[n_seg]
 
-    print('Warming up JIT...')
-    t0 = time.time()
-    simulator.warm_up()
-    print(f'Done ({time.time() - t0:.1f} s)')
-
-    gt_params = simulator.default_sim_params._replace(
+    gt_sim = _get_sim(args.gt_max_deposits)
+    gt_params = gt_sim.default_sim_params._replace(
         lifetime_us    = jnp.array(GT_LIFETIME_US),
         velocity_cm_us = jnp.array(GT_VELOCITY_CM_US),
     )
 
     # ── Setter ────────────────────────────────────────────────────────────────
     setter, gt_vals, scales, p_n_gts = make_nparam_setter(
-        param_names, gt_params, simulator.recomb_model)
+        param_names, gt_params, gt_sim.recomb_model)
 
     for name, gt_val, scale, p_n_gt in zip(param_names, gt_vals, scales, p_n_gts):
         print(f'  {name}: GT={gt_val:.6g}  scale={scale:.6g}  log(GT/scale)={p_n_gt:.6g}')
 
-    # ── GT arrays, weights, and per-track loss fns (one track at a time) ─────
-    print('Computing GT forward passes and building per-track loss functions...')
+    # ── GT signals (computed once at fixed fine resolution) ────────────────────
+    print(f'\nComputing GT signals '
+          f'(step_size={args.gt_step_size}mm  max_deposits={args.gt_max_deposits:,})...')
     t0 = time.time()
-    per_track_val_and_grad = []
-    signal_rms_acc = []
-    noise_rms_acc  = []
-    for deposits in all_deposits:
-        gt = tuple(simulator.forward(gt_params, deposits))
+    gt_signals_per_track = []
+    gt_weights_per_track = []
+    sig_rms_acc = []
+    noi_rms_acc = []
+
+    for ts in track_specs:
+        print(f'  track {ts["name"]}  dir={ts["direction"]}  T={ts["momentum_mev"]} MeV')
+        track_gt = generate_muon_track(
+            start_position_mm=(0.0, 0.0, 0.0),
+            direction=ts['direction'],
+            kinetic_energy_mev=ts['momentum_mev'],
+            step_size_mm=args.gt_step_size,
+            track_id=1,
+        )
+        deposits_gt = build_deposit_data(
+            track_gt['position'], track_gt['de'], track_gt['dx'], gt_sim.config,
+            theta=track_gt['theta'], phi=track_gt['phi'],
+            track_ids=track_gt['track_id'],
+        )
+        n_total = sum(v.n_actual for v in deposits_gt.volumes)
+        print(f'    {n_total:,} deposits')
+
+        gt = tuple(gt_sim.forward(gt_params, deposits_gt))
         jax.block_until_ready(gt)
 
         if args.noise_scale > 0.0:
-            gt_noisy = apply_noise_to_gt(gt, simulator, args.noise_scale, noise_seed)
-            signal_rms_acc.append(float(np.mean([float(jnp.std(a)) for a in gt])))
-            noise_rms_acc.append(float(np.mean([float(jnp.std(n - c)) for n, c in zip(gt_noisy, gt)])))
+            gt_noisy = apply_noise_to_gt(gt, gt_sim, args.noise_scale, noise_seed)
+            sig_rms_acc.append(float(np.mean([float(jnp.std(a)) for a in gt])))
+            noi_rms_acc.append(float(np.mean([float(jnp.std(n - c))
+                                               for n, c in zip(gt_noisy, gt)])))
             gt = gt_noisy
         else:
-            signal_rms_acc.append(float(np.mean([float(jnp.std(a)) for a in gt])))
+            sig_rms_acc.append(float(np.mean([float(jnp.std(a)) for a in gt])))
 
-        wts = tuple(
-            make_sobolev_weight(a.shape[0], a.shape[1], max_pad=SOBOLEV_MAX_PAD)
-            for a in gt
-        )
+        wts = tuple(make_sobolev_weight(a.shape[0], a.shape[1], max_pad=SOBOLEV_MAX_PAD)
+                    for a in gt)
+        gt_signals_per_track.append(gt)
+        gt_weights_per_track.append(wts)
 
-        def _fwd(p, _dep=deposits, _setter=setter):
-            return tuple(simulator.forward(_setter(p), _dep))
-
-        per_track_val_and_grad.append(build_loss_fn(args.loss, jax.jit(_fwd), gt, wts))
-
-    n_planes_per_track = len(gt)
-    print(f'Done ({time.time() - t0:.1f} s)  —  '
-          f'{n_planes_per_track} planes per track, {len(all_deposits)} tracks')
-
-    signal_rms = float(np.mean(signal_rms_acc))
+    signal_rms = float(np.mean(sig_rms_acc))
     if args.noise_scale > 0.0:
-        noise_rms = float(np.mean(noise_rms_acc))
-        print(f'  Signal RMS : {signal_rms:.4g}  (mean over planes)')
-        print(f'  Noise  RMS : {noise_rms:.4g}  (mean over planes,  SNR ≈ {signal_rms / max(noise_rms, 1e-30):.2f})')
+        noise_rms = float(np.mean(noi_rms_acc))
+        print(f'Done ({time.time() - t0:.1f} s) — '
+              f'Signal RMS: {signal_rms:.4g}  Noise RMS: {noise_rms:.4g}  '
+              f'SNR ≈ {signal_rms / max(noise_rms, 1e-30):.2f}')
     else:
-        print(f'  Signal RMS : {signal_rms:.4g}  (mean over planes, use --noise-scale to add noise)')
+        print(f'Done ({time.time() - t0:.1f} s) — Signal RMS: {signal_rms:.4g}')
 
-    def val_and_grad_fn(p_n_vec):
-        total_loss = 0.0
-        total_grad = jnp.zeros(len(param_names), dtype=jnp.float32)
-        for fn in per_track_val_and_grad:
-            lv, gv = fn(p_n_vec)
-            jax.block_until_ready((lv, gv))
-            total_loss = total_loss + float(lv)
-            total_grad = total_grad + gv
-        return jnp.array(total_loss, dtype=jnp.float32), total_grad
+    # ── Per-phase forward loss functions ───────────────────────────────────────
+    phase_schedule = []   # [(until_step, batch_fns), ...]
+
+    for ph_idx, phase in enumerate(schedule):
+        sim_ph = _get_sim(phase['max_num_deposits'])
+        prefix = f'Phase {ph_idx}' if len(schedule) > 1 else 'Building loss fn'
+        print(f'\n{prefix} (fwd step_size={phase["step_size"]}mm  '
+              f'deposits={phase["max_num_deposits"]:,}  '
+              f'batch_size={phase["batch_size"]})...')
+        t0 = time.time()
+
+        _batches = []
+        _deps, _gts, _wts = [], [], []
+
+        for ti, ts in enumerate(track_specs):
+            track_ph = generate_muon_track(
+                start_position_mm=(0.0, 0.0, 0.0),
+                direction=ts['direction'],
+                kinetic_energy_mev=ts['momentum_mev'],
+                step_size_mm=phase['step_size'],
+                track_id=1,
+            )
+            deposits_ph = build_deposit_data(
+                track_ph['position'], track_ph['de'], track_ph['dx'], sim_ph.config,
+                theta=track_ph['theta'], phi=track_ph['phi'],
+                track_ids=track_ph['track_id'],
+            )
+            n_total = sum(v.n_actual for v in deposits_ph.volumes)
+            print(f'  track {ts["name"]}  {n_total:,} fwd deposits')
+
+            _deps.append(deposits_ph)
+            _gts.append(gt_signals_per_track[ti])
+            _wts.append(gt_weights_per_track[ti])
+
+            if len(_deps) == phase['batch_size']:
+                _batches.append((list(_deps), list(_gts), list(_wts)))
+                _deps.clear(); _gts.clear(); _wts.clear()
+
+        if _deps:
+            _batches.append((list(_deps), list(_gts), list(_wts)))
+
+        batch_fns_ph = build_phase_fns(args.loss, sim_ph, setter, _batches)
+        print(f'Done ({time.time() - t0:.1f} s) — {len(batch_fns_ph)} batches')
+        phase_schedule.append((phase['until_step'], batch_fns_ph))
 
     # ── Random starting points ────────────────────────────────────────────────
     rng = start_rng
@@ -760,13 +987,14 @@ def main():
     factor_grid   = factors.tolist()
     p_n_starts    = (np.log(factors) + np.array(p_n_gts)).tolist()
 
-    # ── Compile (warm up each per-track JIT fn) ───────────────────────────────
-    print('\nCompiling per-track value_and_grad functions...')
+    # ── Compile all phase value_and_grad functions ───────────────────────────
+    print('\nCompiling value_and_grad functions...')
     t0 = time.time()
     _p0 = jnp.array(p_n_starts[0], dtype=jnp.float32)
-    for fn in per_track_val_and_grad:
-        _ = fn(_p0); jax.block_until_ready(_)
-        _ = fn(_p0); jax.block_until_ready(_)
+    for _, batch_fns_ph in phase_schedule:
+        for fn in batch_fns_ph:
+            _ = fn(_p0); jax.block_until_ready(_)
+            _ = fn(_p0); jax.block_until_ready(_)
     print(f'Done ({time.time() - t0:.1f} s)')
 
     lr_multipliers = parse_lr_multipliers(args.lr_multipliers, param_names)
@@ -802,6 +1030,7 @@ def main():
         noise_scale         = args.noise_scale,
         factor_grid         = factor_grid,
         starting_p_n_values = p_n_starts,
+        command             = ' '.join(sys.argv),
         trials              = all_trials,
     )
 
@@ -827,22 +1056,42 @@ def main():
         sys.exit(0)
     signal.signal(signal.SIGTERM, _sigterm_handler)
 
+    # Pre-populate completed trials from a prior (preempted) run.
+    if existing_result:
+        all_trials.extend(existing_result['trials'])
+    live_ckpt = (existing_result or {}).get('live_checkpoint')
+
     cumulative_steps   = 0
     last_save_at_step  = 0
 
     for gi, (factors_i, pn_start) in enumerate(zip(factor_grid, p_n_starts)):
+        if gi < len(all_trials):
+            continue  # already completed in a previous run
+
         factors_str = ', '.join(f'{f:.4f}' for f in factors_i)
         pn_str      = ', '.join(f'{v:.4f}' for v in pn_start)
         print(f'\nTrial [{gi+1}/{args.N}]  factors=({factors_str})  p_n=({pn_str})',
               end='', flush=True)
 
+        pn0            = pn_start
+        init_opt_state = None
+        start_step     = 0
+        if live_ckpt and live_ckpt.get('trial_idx') == gi:
+            pn0            = live_ckpt['p']
+            init_opt_state = live_ckpt['opt_state']
+            start_step     = live_ckpt['step']
+            print(f'  [resuming from step {start_step}]', end='', flush=True)
+
         trial = run_trial(
-            pn_start, val_and_grad_fn, optimizer,
+            pn0, phase_schedule, optimizer,
             args.max_steps, tol=args.tol, patience=args.patience,
             log_interval=args.log_interval,
             param_names=param_names, scales=scales, p_n_gts=p_n_gts,
             use_wandb=use_wandb, trial_idx=gi, schedule_fn=schedule_fn,
             checkpoint_callback=lambda step, p, opt_state: _intra_trial_checkpoint(gi, step, p, opt_state),
+            lr_multipliers=lr_multipliers,
+            initial_opt_state=init_opt_state,
+            start_step=start_step,
         )
         all_trials.append(trial)
         result.pop('live_checkpoint', None)

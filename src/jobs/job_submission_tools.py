@@ -12,11 +12,13 @@ LOGS_DIR = "/fs/ddn/sdf/group/atlas/d/gregork/logs"
 
 APPTAINER_CACHEDIR = "/sdf/scratch/atlas/gregork/apptainer_cache"
 APPTAINER_TMPDIR   = "/sdf/scratch/atlas/gregork/apptainer_tmp"
+JAX_CACHE_DIR      = "/sdf/scratch/atlas/gregork/jax_cache"
 
 APPTAINER_IMAGE = "docker://gkrz/jaxtpc:v2"
 BIND_MOUNTS = [
     "/sdf/home/g/gregork/jaxtpc",
     "/fs/ddn/sdf/group/atlas/d/gregork/jaxtpc",
+    JAX_CACHE_DIR,
 ]
 
 
@@ -47,10 +49,14 @@ def s3df_submit(command: str, *, time: str = "02:00:00", gpus: int = 1,
         "",
         "set -euo pipefail",
         f"mkdir -p {LOGS_DIR}",
+        f"mkdir -p {JAX_CACHE_DIR}",
         f"export APPTAINER_CACHEDIR={APPTAINER_CACHEDIR}",
         f"export APPTAINER_TMPDIR={APPTAINER_TMPDIR}",
         f"cd {REMOTE_DIR}",
         "source .env",
+        f"export JAX_COMPILATION_CACHE_DIR={JAX_CACHE_DIR}",
+        "export XLA_PYTHON_CLIENT_PREALLOCATE=false",
+        "export WANDB_DISABLE_SERVICE=true",
         "",
         "nvidia-smi",
         "",

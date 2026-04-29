@@ -1,0 +1,24 @@
+time_limit: "00:30:00"   # interactive QOS max; job will checkpoint and can be resumed
+command_timeout: 230      # per-command timeout in minutes
+
+gpus:
+  0:
+    - >-
+      python src/opt/run_optimization.py
+      --params velocity_cm_us,lifetime_us,diffusion_trans_cm2_us,diffusion_long_cm2_us,recomb_alpha,recomb_beta_90,recomb_R
+      --tracks diagonal+X+Y+Z+diagonal_100MeV:1,1,1:100+x100:1,0,0:100+y100:0,1,0:100+z100:0,0,1:100+diagonal_50MeV:1,1,1:50+x50:1,0,0:50+y50:0,1,0:50+z50:0,0,1:50
+      --loss sobolev_loss_geomean_log1p
+      --lr 0.0001
+      --lr-schedule constant
+      --max-steps 40000
+      --tol 1e-6
+      --patience 100
+      --N 1
+      --range 0.9 1.1
+      --results-base $RESULTS_DIR/opt/all_params_bugfix_20260428_BS2
+      --clip-grad-norm 10.0
+      --lr-multipliers velocity_cm_us:0.005
+      --warmup-steps 1000
+      --batch-size 2
+      --seed 42
+
