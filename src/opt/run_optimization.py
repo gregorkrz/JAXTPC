@@ -415,7 +415,8 @@ def build_phase_fns(loss_name, simulator, setter, batches):
     planes = tuple(range(n_planes))
     _batched_diff = jax.vmap(simulator._forward_diff, in_axes=(None, 0))
 
-    # Pre-pad and stack all batch data into JAX arrays up front
+    # Pre-pad and stack deposits per batch.
+    # gts/wts are kept as-is (lists of tuples) — no duplicate allocation.
     processed = []
     for batch_deposits, batch_gts, batch_wts in batches:
         bs = len(batch_deposits)
@@ -425,19 +426,19 @@ def build_phase_fns(loss_name, simulator, setter, batches):
             s = jax.tree.map(lambda *xs: jnp.stack(xs), *dep_padded.volumes)
             stacked_list.append(s)
         batch_deps = jax.tree.map(lambda *xs: jnp.stack(xs), *stacked_list)
-        # Stack per plane: shape (bs, n_wires, n_times) for each plane index
-        batch_gts_s = tuple(jnp.stack([batch_gts[b][p] for b in range(bs)]) for p in range(n_planes))
-        batch_wts_s = tuple(jnp.stack([batch_wts[b][p] for b in range(bs)]) for p in range(n_planes))
-        processed.append((bs, batch_deps, batch_gts_s, batch_wts_s))
+        processed.append((bs, batch_deps, batch_gts, batch_wts))
 
-    # One compiled function per unique batch size (last batch may be smaller)
+    # One compiled function per unique batch size (last batch may be smaller).
+    # batch_deps/gts/wts are explicit arguments so all batches share one kernel,
+    # and stop_gradient prevents JAX from storing deposit residuals in the backward pass.
     compiled_cache = {}
 
     def _get_compiled(bs):
         if bs in compiled_cache:
             return compiled_cache[bs]
 
-        def fn(p_n_vec, batch_deps, batch_gts_s, batch_wts_s):
+        def fn(p_n_vec, batch_deps, batch_gts, batch_wts):
+            batch_deps = jax.lax.stop_gradient(batch_deps)
             all_signals = _batched_diff(setter(p_n_vec), batch_deps)
             total = 0.0
             for b in range(bs):
@@ -446,8 +447,8 @@ def build_phase_fns(loss_name, simulator, setter, batches):
                     for v in range(n_volumes)
                     for pl in range(n_planes_per_vol)
                 )
-                gt_b  = tuple(batch_gts_s[p][b] for p in range(n_planes))
-                wts_b = tuple(batch_wts_s[p][b] for p in range(n_planes))
+                gt_b  = tuple(jax.lax.stop_gradient(batch_gts[b][p]) for p in range(n_planes))
+                wts_b = tuple(jax.lax.stop_gradient(batch_wts[b][p]) for p in range(n_planes))
                 if loss_name == 'sobolev_loss':
                     total = total + sobolev_loss(pred, gt_b, wts_b, planes)
                 elif loss_name == 'sobolev_loss_geomean_log1p':
