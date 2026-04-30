@@ -48,6 +48,7 @@ Each pickle contains:
       loss_trajectory    list of length steps+1
       total_time_s, stopped_early, steps_run
 """
+import gc
 import sys, os, signal
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 
@@ -295,8 +296,11 @@ def parse_tracks(tracks_str):
 def make_folder_name(param_names, track_specs, loss_name, optimizer, lr,
                      lr_schedule, max_steps, N, range_lo, range_hi,
                      noise_scale=0.0, step_size=0.1, max_num_deposits=50_000, n_phases=1):
-    params_tag    = '+'.join(param_names)
-    tracks_tag    = '+'.join(t['name'] for t in track_specs)
+    _is_all = (_BASE_PARAMS <= frozenset(param_names) and
+               bool(frozenset(param_names) & _BETA_VARIANTS))
+    params_tag = 'all_params' if _is_all else '+'.join(param_names)
+    tracks_tag = (f'{len(track_specs)}tracks' if len(track_specs) >= 6
+                  else '+'.join(t['name'] for t in track_specs))
     sched_tag     = '_cosine' if lr_schedule == 'cosine' else ''
     range_tag     = f'r{range_lo:.3g}_{range_hi:.3g}'.replace('.', 'p')
     noise_tag     = f'_noise{noise_scale:.3g}'.replace('.', 'p') if noise_scale > 0.0 else ''
@@ -579,7 +583,8 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
               initial_opt_state=None, start_step=0):
     """Run one optimization trial from starting p_n vector p0 (any length).
 
-    phase_schedule: list of (until_step, batch_fns) sorted by until_step.
+    phase_schedule: list of (until_step, build_fn) sorted by until_step.
+    build_fn(p) -> list[batch_fn] compiles and warms up on first call (cached).
     Each step uses the batch_fns of the first phase whose until_step > step.
 
     Returns dict with:
@@ -599,17 +604,31 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
     t_start    = time.time()
     multi_phase = len(phase_schedule) > 1
 
-    def _phase_at(step):
-        for ph_idx, (until_step, bfns) in enumerate(phase_schedule):
+    # Local cache of built fns per phase index; build_fn itself is the persistent cache.
+    _cur_ph_idx  = [-1]
+    _cur_fns     = [None]
+
+    def _get_fns(ph_idx, p):
+        if ph_idx != _cur_ph_idx[0]:
+            # Release the previous phase's fns before building the new one so
+            # that the builder can free its store entry without a dangling ref here.
+            _cur_fns[0]    = None
+            _cur_ph_idx[0] = ph_idx
+            _, build_fn = phase_schedule[ph_idx]
+            _cur_fns[0] = build_fn(p)
+        return _cur_fns[0]
+
+    def _phase_at(step, p):
+        for ph_idx, (until_step, _) in enumerate(phase_schedule):
             if step < until_step:
-                return ph_idx, bfns
-        return len(phase_schedule) - 1, phase_schedule[-1][1]
+                return ph_idx, _get_fns(ph_idx, p)
+        last = len(phase_schedule) - 1
+        return last, _get_fns(last, p)
 
     # Step 0: aggregate phase-0 batches for a representative initial loss/grad.
-    _, batch_fns_0 = phase_schedule[0]
     lv_init = 0.0
     gv_init = jnp.zeros_like(p)
-    for fn in batch_fns_0:
+    for fn in _get_fns(0, p):
         lv, gv = fn(p)
         jax.block_until_ready((lv, gv))
         lv_init += float(lv)
@@ -625,9 +644,11 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
                         phase=0 if multi_phase else None)
 
     stopped_early = False
+    fn = batch_fns = None  # initial state; cleared each iteration for phase-transition GC
     for step in range(start_step, max_steps):
         step_start = time.time()
-        ph_idx, batch_fns = _phase_at(step)
+        fn = None; batch_fns = None  # drop previous refs so phase transition can free old fns
+        ph_idx, batch_fns = _phase_at(step, p)
         fn = batch_fns[step % len(batch_fns)]
         lv, gv = fn(p)
         jax.block_until_ready((lv, gv))
@@ -671,6 +692,38 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
     )
 
 
+def _collect_gpu_metrics():
+    """Collect GPU utilization and memory from nvidia-smi and JAX device memory stats."""
+    metrics = {}
+    devs = jax.local_devices()
+    for i, dev in enumerate(devs):
+        try:
+            mem = dev.memory_stats()
+            if mem:
+                pfx = f'gpu{i}' if len(devs) > 1 else 'gpu'
+                metrics[f'sys/{pfx}/jax_mem_gb']  = mem.get('bytes_in_use', 0) / 2**30
+                metrics[f'sys/{pfx}/jax_peak_gb'] = mem.get('peak_bytes_in_use', 0) / 2**30
+        except Exception:
+            pass
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ['nvidia-smi',
+             '--query-gpu=index,utilization.gpu,memory.used,memory.total',
+             '--format=csv,noheader,nounits'],
+            timeout=5, stderr=subprocess.DEVNULL,
+        ).decode()
+        for line in out.strip().splitlines():
+            idx_s, util_s, used_s, total_s = [s.strip() for s in line.split(',')]
+            pfx = f'sys/gpu{idx_s}'
+            metrics[f'{pfx}/util_pct']     = float(util_s)
+            metrics[f'{pfx}/mem_used_gb']  = float(used_s) / 1024.0
+            metrics[f'{pfx}/mem_total_gb'] = float(total_s) / 1024.0
+    except Exception:
+        pass
+    return metrics
+
+
 def _wandb_log_step(step, loss, gv, p, param_names, scales, p_n_gts,
                     step_time_s, trial_idx, schedule_fn=None, lr_multipliers=None,
                     phase=None):
@@ -703,6 +756,7 @@ def _wandb_log_step(step, loss, gv, p, param_names, scales, p_n_gts,
                 scale = lr_multipliers[i] if lr_multipliers is not None else 1.0
                 log[f'grads/{name}'] = float(gv_np[i] * scale)
 
+    log.update(_collect_gpu_metrics())
     _wandb.log(log, step=step)
 
 
@@ -936,12 +990,17 @@ def main():
     else:
         print(f'Done ({time.time() - t0:.1f} s) — Signal RMS: {signal_rms:.4g}')
 
-    # ── Per-phase forward loss functions ───────────────────────────────────────
-    phase_schedule = []   # [(until_step, batch_fns), ...]
+    # ── Per-phase forward: build deposits upfront, compile lazily ─────────────
+    # Deposit generation is cheap; compilation is deferred to first entry of each
+    # phase so that only the active phase's arrays and XLA buffers are live at once.
+    # Shared store for built phase fns; allows the previous phase to be freed
+    # before the next one is compiled, keeping peak memory to one phase at a time.
+    _phase_fns_store: dict = {}
+    phase_schedule = []   # [(until_step, build_fn), ...]
 
     for ph_idx, phase in enumerate(schedule):
         sim_ph = _get_sim(phase['max_num_deposits'])
-        prefix = f'Phase {ph_idx}' if len(schedule) > 1 else 'Building loss fn'
+        prefix = f'Phase {ph_idx}' if len(schedule) > 1 else 'Building deposits'
         print(f'\n{prefix} (fwd step_size={phase["step_size"]}mm  '
               f'deposits={phase["max_num_deposits"]:,}  '
               f'batch_size={phase["batch_size"]})...')
@@ -977,9 +1036,36 @@ def main():
         if _deps:
             _batches.append((list(_deps), list(_gts), list(_wts)))
 
-        batch_fns_ph = build_phase_fns(args.loss, sim_ph, setter, _batches)
-        print(f'Done ({time.time() - t0:.1f} s) — {len(batch_fns_ph)} batches')
-        phase_schedule.append((phase['until_step'], batch_fns_ph))
+        print(f'Done ({time.time() - t0:.1f} s) — {len(_batches)} batches, compiling on first use')
+
+        def _make_build_fn(ph_idx, phase, sim_ph, batches):
+            def _build(p):
+                if ph_idx not in _phase_fns_store:
+                    # Free previous phase's compiled fns and GPU buffers before
+                    # allocating this phase's (potentially larger) data.
+                    prev = ph_idx - 1
+                    if prev in _phase_fns_store:
+                        del _phase_fns_store[prev]
+                        gc.collect()          # flush Python GC so JAX array __del__ runs
+                        jax.clear_caches()    # release XLA compiled executables + device memory
+                    cp = f'Phase {ph_idx}' if len(schedule) > 1 else 'Compiling loss fn'
+                    print(f'\n{cp} (step_size={phase["step_size"]}mm  '
+                          f'deposits={phase["max_num_deposits"]:,}  '
+                          f'batch_size={phase["batch_size"]})  compiling...',
+                          flush=True)
+                    t0 = time.time()
+                    fns = build_phase_fns(args.loss, sim_ph, setter, batches)
+                    for fn in fns:
+                        _ = fn(p); jax.block_until_ready(_)
+                        _ = fn(p); jax.block_until_ready(_)
+                    print(f'  done ({time.time() - t0:.1f} s) — {len(fns)} batches',
+                          flush=True)
+                    _phase_fns_store[ph_idx] = fns
+                return _phase_fns_store[ph_idx]
+            return _build
+
+        phase_schedule.append((phase['until_step'],
+                               _make_build_fn(ph_idx, phase, sim_ph, _batches)))
 
     # ── Random starting points ────────────────────────────────────────────────
     rng = start_rng
@@ -987,16 +1073,6 @@ def main():
     factors = rng.uniform(range_lo, range_hi, size=(args.N, n_params))   # (N, n_params)
     factor_grid   = factors.tolist()
     p_n_starts    = (np.log(factors) + np.array(p_n_gts)).tolist()
-
-    # ── Compile all phase value_and_grad functions ───────────────────────────
-    print('\nCompiling value_and_grad functions...')
-    t0 = time.time()
-    _p0 = jnp.array(p_n_starts[0], dtype=jnp.float32)
-    for _, batch_fns_ph in phase_schedule:
-        for fn in batch_fns_ph:
-            _ = fn(_p0); jax.block_until_ready(_)
-            _ = fn(_p0); jax.block_until_ready(_)
-    print(f'Done ({time.time() - t0:.1f} s)')
 
     lr_multipliers = parse_lr_multipliers(args.lr_multipliers, param_names)
     if any(s != 1.0 for s in lr_multipliers):

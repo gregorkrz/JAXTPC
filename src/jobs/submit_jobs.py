@@ -212,19 +212,20 @@ if __name__ == "__main__":
         N=1,
         range_lo=0.9,
         range_hi=1.1,
-        results_base="$RESULTS_DIR/opt/debugging_memory_2904",
+        results_base="$RESULTS_DIR/opt/sched2_longer_schedule",
         grad_clip=10.0,
         lr_multipliers="velocity_cm_us:0.005",
         warmup_steps=1000,
         num_buckets=1000,
-        schedule_step_sizes="0.1",
-        schedule_deposits="50000",
-        schedule_batch_sizes="1"
+        schedule_steps="2000",
+        schedule_step_sizes="1.0,0.1",
+        schedule_deposits="5000,50000",
+        schedule_batch_sizes="5,1"
     )
 
     #for n_params in range(1, len(PARAM_LIST) + 1):
     params = ",".join(PARAM_LIST)
-    for seed in [42]:
+    for seed in [44, 45, 46, 47]:
         command = make_opt_command(
             params=params,
             tracks=TRACKS_12,
@@ -233,4 +234,4 @@ if __name__ == "__main__":
             **SCHED_SHARED,
         )
         print(command)
-        s3df_submit(command, time="04:00:00", submit=False)
+        s3df_submit(command, time="04:00:00", submit=True, mem_gb=64)
