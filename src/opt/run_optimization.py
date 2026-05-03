@@ -38,6 +38,7 @@ Output
 Each pickle contains:
   param_names, param_gts, scales, p_n_gts,
   optimizer, lr, lr_schedule, max_steps, tol, patience, N,
+  tol_per_param, patience_per_param  optional; present when coordinate freezing is enabled
   loss_name, tracks,
   range_lo, range_hi,
   factor_grid,           list of [f1, ...] per trial
@@ -47,7 +48,13 @@ Each pickle contains:
       grad_trajectory    list of length steps+1, each entry [g1, ...]
       loss_trajectory    list of length steps+1
       total_time_s, stopped_early, steps_run
+      frozen_mask_final, tol_per_param, patience_per_param  optional; coordinate-freeze mode
+  run_complete          bool; True after successful final save (informational; resume logic uses trials+N)
+  live_checkpoint       optional mid-trial resume payload (must be absent when complete);
+                        may include frozen_mask when using --tol-per-param
+  wandb_run_id          optional; persisted so resumed jobs continue the same W&B run
 """
+
 import gc
 import sys, os, signal
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -56,8 +63,11 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import argparse
+import hashlib
 import os
 import pickle
+import shlex
+import tempfile
 import time
 
 try:
@@ -86,6 +96,9 @@ from tools.particle_generator import generate_muon_track
 from tools.simulation import DetectorSimulator
 
 # ── Constants ──────────────────────────────────────────────────────────────────
+
+# Log per-track loss curves to W&B only below this track count (avoids huge metric cardinality).
+WANDB_PER_TRACK_LOSS_MAX_TRACKS = 50
 GT_LIFETIME_US    = 10_000.0
 GT_VELOCITY_CM_US = 0.160
 SOBOLEV_MAX_PAD   = 128
@@ -174,6 +187,16 @@ def parse_args():
                    help='Early-stop relative tolerance on p_n norm (default: 1e-5)')
     p.add_argument('--patience', type=int, default=20,
                    help='Steps over which relative change is checked (default: 20)')
+    p.add_argument('--tol-per-param', type=float, default=None,
+                   metavar='TOL',
+                   help='With --patience-per-param: freeze when relative change from t-W to '
+                        'now and every step-to-step change in the window are all < TOL '
+                        '(default: disabled).')
+    p.add_argument('--patience-per-param', type=int, default=None,
+                   metavar='STEPS',
+                   help='Window length W for --tol-per-param: compare to t-W and check each '
+                        'of the W consecutive updates (default: disabled). '
+                        'Set both flags together to enable per-parameter freezing.')
     p.add_argument('--N', type=int, default=25,
                    help='Number of random trials (default: 25)')
     p.add_argument('--results-base', default=_RESULTS_DIR,
@@ -228,6 +251,8 @@ def parse_args():
                    help='Disable Weights & Biases logging (enabled by default).')
     p.add_argument('--wandb-project', default='jaxtpc-optimization',
                    help='W&B project name (default: jaxtpc-optimization).')
+    p.add_argument('--wandb-tags', default=None,
+                   help='Comma-separated W&B run tags (e.g. "sched_v2,fine_stage").')
     p.add_argument('--log-interval', type=int, default=50,
                    help='Log to W&B every this many steps (default: 50).')
     return p.parse_args()
@@ -388,7 +413,7 @@ def make_nparam_setter(param_names, gt_params, recomb_model):
 # ── Loss builder ───────────────────────────────────────────────────────────────
 
 def build_loss_fn(loss_name, fwd_fn, gt_arrays, weights):
-    """Return JIT-compiled (loss, grad) function for a single track."""
+    """Return sJIT-compiled (loss, grad) function for a single track."""
     planes = tuple(range(len(gt_arrays)))
     if loss_name == 'sobolev_loss':
         def fn(p_n_vec): return sobolev_loss(fwd_fn(p_n_vec), gt_arrays, weights, planes)
@@ -403,8 +428,12 @@ def build_loss_fn(loss_name, fwd_fn, gt_arrays, weights):
     return jax.jit(jax.value_and_grad(fn))
 
 
-def build_phase_fns(loss_name, simulator, setter, batches):
-    """Return one callable fn(p_n_vec) -> (loss, grad) per batch in a phase.
+def build_phase_fns(loss_name, simulator, setter, batches, *, return_per_track_loss=False):
+    """Return one callable per batch in a phase.
+
+    Default ``fn(p) -> (loss, grad)``. When ``return_per_track_loss=True``,
+    ``fn(p) -> (loss, grad, per_track_losses)`` where ``per_track_losses`` has
+    shape ``(batch_size,)`` and sums to ``loss``.
 
     All batches with the same size share a single compiled XLA kernel — only
     the deposit/gt/wt arrays differ between calls, so JAX compiles once per
@@ -438,38 +467,74 @@ def build_phase_fns(loss_name, simulator, setter, batches):
     compiled_cache = {}
 
     def _get_compiled(bs):
-        if bs in compiled_cache:
-            return compiled_cache[bs]
+        key = (bs, return_per_track_loss)
+        if key in compiled_cache:
+            return compiled_cache[key]
 
-        def fn(p_n_vec, batch_deps, batch_gts, batch_wts):
-            batch_deps = jax.lax.stop_gradient(batch_deps)
-            all_signals = _batched_diff(setter(p_n_vec), batch_deps)
-            total = 0.0
-            for b in range(bs):
-                pred = tuple(
-                    all_signals[b, v, pl]
-                    for v in range(n_volumes)
-                    for pl in range(n_planes_per_vol)
-                )
-                gt_b  = tuple(jax.lax.stop_gradient(batch_gts[b][p]) for p in range(n_planes))
-                wts_b = tuple(jax.lax.stop_gradient(batch_wts[b][p]) for p in range(n_planes))
-                if loss_name == 'sobolev_loss':
-                    total = total + sobolev_loss(pred, gt_b, wts_b, planes)
-                elif loss_name == 'sobolev_loss_geomean_log1p':
-                    total = total + sobolev_loss_geomean_log1p(pred, gt_b, wts_b, planes)
-                elif loss_name == 'mse_loss':
-                    total = total + mse_loss(pred, gt_b)
-                elif loss_name == 'l1_loss':
-                    total = total + l1_loss(pred, gt_b)
-                else:
-                    raise ValueError(f'Unknown loss {loss_name!r}')
-            return total
+        if return_per_track_loss:
+            def fn(p_n_vec, batch_deps, batch_gts, batch_wts):
+                batch_deps = jax.lax.stop_gradient(batch_deps)
+                all_signals = _batched_diff(setter(p_n_vec), batch_deps)
+                loss_terms = []
+                for b in range(bs):
+                    pred = tuple(
+                        all_signals[b, v, pl]
+                        for v in range(n_volumes)
+                        for pl in range(n_planes_per_vol)
+                    )
+                    gt_b  = tuple(jax.lax.stop_gradient(batch_gts[b][p]) for p in range(n_planes))
+                    wts_b = tuple(jax.lax.stop_gradient(batch_wts[b][p]) for p in range(n_planes))
+                    if loss_name == 'sobolev_loss':
+                        lb = sobolev_loss(pred, gt_b, wts_b, planes)
+                    elif loss_name == 'sobolev_loss_geomean_log1p':
+                        lb = sobolev_loss_geomean_log1p(pred, gt_b, wts_b, planes)
+                    elif loss_name == 'mse_loss':
+                        lb = mse_loss(pred, gt_b)
+                    elif loss_name == 'l1_loss':
+                        lb = l1_loss(pred, gt_b)
+                    else:
+                        raise ValueError(f'Unknown loss {loss_name!r}')
+                    loss_terms.append(lb)
+                losses_arr = jnp.stack(loss_terms)
+                return jnp.sum(losses_arr), losses_arr
 
-        compiled = jax.jit(jax.value_and_grad(fn, argnums=0))
-        compiled_cache[bs] = compiled
+            compiled = jax.jit(jax.value_and_grad(fn, argnums=0, has_aux=True))
+        else:
+            def fn(p_n_vec, batch_deps, batch_gts, batch_wts):
+                batch_deps = jax.lax.stop_gradient(batch_deps)
+                all_signals = _batched_diff(setter(p_n_vec), batch_deps)
+                total = 0.0
+                for b in range(bs):
+                    pred = tuple(
+                        all_signals[b, v, pl]
+                        for v in range(n_volumes)
+                        for pl in range(n_planes_per_vol)
+                    )
+                    gt_b  = tuple(jax.lax.stop_gradient(batch_gts[b][p]) for p in range(n_planes))
+                    wts_b = tuple(jax.lax.stop_gradient(batch_wts[b][p]) for p in range(n_planes))
+                    if loss_name == 'sobolev_loss':
+                        total = total + sobolev_loss(pred, gt_b, wts_b, planes)
+                    elif loss_name == 'sobolev_loss_geomean_log1p':
+                        total = total + sobolev_loss_geomean_log1p(pred, gt_b, wts_b, planes)
+                    elif loss_name == 'mse_loss':
+                        total = total + mse_loss(pred, gt_b)
+                    elif loss_name == 'l1_loss':
+                        total = total + l1_loss(pred, gt_b)
+                    else:
+                        raise ValueError(f'Unknown loss {loss_name!r}')
+                return total
+
+            compiled = jax.jit(jax.value_and_grad(fn, argnums=0))
+
+        compiled_cache[key] = compiled
         return compiled
 
     def _make_fn(compiled, deps, gts, wts):
+        if return_per_track_loss:
+            def call(p):
+                (lv, pt), gv = compiled(p, deps, gts, wts)
+                return lv, gv, pt
+            return call
         return lambda p: compiled(p, deps, gts, wts)
 
     return [_make_fn(_get_compiled(bs), d, g, w) for bs, d, g, w in processed]
@@ -576,16 +641,143 @@ def _serialize_opt_state(opt_state):
     return jax.tree_util.tree_map(np.asarray, opt_state)
 
 
+def _safe_pickle_dump(path, obj):
+    """Write pickle atomically so interrupted writes do not leave truncated pkls."""
+    path = os.path.abspath(path)
+    out_dir = os.path.dirname(path)
+    os.makedirs(out_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".result_", suffix=".tmp", dir=out_dir)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _wandb_track_metric_suffix(track_name):
+    """Fragment safe for use inside W&B metric keys."""
+    return str(track_name).replace('/', '_').replace(' ', '_')
+
+
+def _wandb_json_safe(value):
+    """Convert values for wandb.init(config=...) / JSON-ish summaries."""
+    if isinstance(value, tuple):
+        return [_wandb_json_safe(v) for v in value]
+    if isinstance(value, list):
+        return [_wandb_json_safe(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _wandb_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (bool, int, float, str)) or value is None:
+        return value
+    return str(value)
+
+
+def wandb_config_dict(args, *, param_names, track_specs, schedule, effective_seed,
+                      output_path, wandb_tag_list, argv_cmd):
+    """Full CLI snapshot plus derived fields for W&B run config."""
+    cfg = {k: _wandb_json_safe(v) for k, v in vars(args).items()}
+    cfg.update(
+        effective_seed=effective_seed,
+        command=argv_cmd,
+        param_names=param_names,
+        track_names=[t['name'] for t in track_specs],
+        schedule_phases=[_wandb_json_safe(ph) for ph in schedule],
+        output_path=output_path,
+        jax_compilation_cache_dir=jax.config.jax_compilation_cache_dir,
+        wandb_tags=wandb_tag_list or None,
+    )
+    return cfg
+
+
+def _wandb_sidecar_path(output_dir, seed):
+    return os.path.join(output_dir, f'.wandb_run_id_{seed}')
+
+
+def _read_stored_wandb_run_id(output_dir, seed, existing_result):
+    if existing_result:
+        rid = existing_result.get('wandb_run_id')
+        if isinstance(rid, str) and rid.strip():
+            return rid.strip()
+    path = _wandb_sidecar_path(output_dir, seed)
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding='utf-8') as f:
+                s = f.read().strip()
+                return s or None
+        except OSError:
+            return None
+    return None
+
+
+def _stable_wandb_run_id(project, folder_name, seed):
+    """Deterministic W&B run id when none was persisted (legacy checkpoints)."""
+    digest = hashlib.sha256(f'{project}:{folder_name}:{seed}'.encode()).hexdigest()
+    return digest[:12]
+
+
+def _write_wandb_sidecar(output_dir, seed, run_id):
+    if not run_id:
+        return
+    os.makedirs(output_dir, exist_ok=True)
+    path = _wandb_sidecar_path(output_dir, seed)
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(run_id)
+
+
+def optimization_run_complete(data):
+    """Return True when all N trials are present (nothing left to optimize).
+
+    ``run_complete`` is only written on clean shutdown and is **not** required here:
+    treating ``run_complete=False`` after SIGTERM even though ``trials`` is full
+    used to queue redundant Slurm jobs (duplicate W&B runs).
+    """
+    trials = data.get("trials")
+    if trials is None:
+        return False
+    n_expected = data.get("N")
+    if not isinstance(n_expected, int) or n_expected < 0:
+        return False
+    if len(trials) < n_expected:
+        return False
+    if data.get("live_checkpoint"):
+        return False
+    return True
+
+
 def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
               log_interval=50, param_names=None, scales=None, p_n_gts=None,
               use_wandb=False, trial_idx=0, schedule_fn=None,
               checkpoint_callback=None, lr_multipliers=None,
-              initial_opt_state=None, start_step=0):
+              initial_opt_state=None, start_step=0,
+              wandb_track_batch_groups=None,
+              tol_per_param=None, patience_per_param=None,
+              initial_frozen_mask=None):
     """Run one optimization trial from starting p_n vector p0 (any length).
 
     phase_schedule: list of (until_step, build_fn) sorted by until_step.
     build_fn(p) -> list[batch_fn] compiles and warms up on first call (cached).
     Each step uses the batch_fns of the first phase whose until_step > step.
+    With start_step > 0 (resume), only that step's phase is compiled for the
+    entry loss/grad row — earlier phases are not rebuilt first.
+
+    wandb_track_batch_groups: optional ``[phase][batch] -> [(global_track_idx, name), ...]``
+    built when logging per-track losses (few tracks + W&B enabled).
+
+    tol_per_param / patience_per_param: when both set, each coordinate stops receiving
+    updates when, over the last ``patience_per_param`` optimizer steps, (i) its relative
+    change from the value ``patience_per_param`` steps ago is below ``tol_per_param``,
+    and (ii) every consecutive step in that window has relative step change below
+    ``tol_per_param``. Resumed trials restore ``initial_frozen_mask``.
+
+    checkpoint_callback: ``callback(step, p, opt_state, frozen_mask=None)`` —
+    ``frozen_mask`` is a numpy bool vector when per-parameter freezing is enabled.
 
     Returns dict with:
       param_trajectory   list[list]  length steps+1
@@ -597,12 +789,44 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
     opt_state = (jax.tree_util.tree_map(jnp.array, initial_opt_state)
                  if initial_opt_state is not None else optimizer.init(p))
 
+    freeze_enabled = tol_per_param is not None and patience_per_param is not None
+    n_dim = int(p.shape[0])
+    frozen_np = np.zeros(n_dim, dtype=bool)
+    if freeze_enabled and initial_frozen_mask is not None:
+        fm = np.asarray(initial_frozen_mask, dtype=bool).reshape(-1)
+        if fm.shape[0] != n_dim:
+            raise ValueError(
+                f'initial_frozen_mask length {fm.shape[0]} != n_params {n_dim}')
+        frozen_np = fm.copy()
+
     param_traj = []
     loss_traj  = []
     grad_traj  = []
 
+    _freeze_eps = 1e-30
+
+    def _per_param_freeze_ok(traj, coord_i, W, tol):
+        """Relative move t-W→t and every intermediate step are below ``tol`` for coord ``coord_i``."""
+        L = len(traj) - 1
+        a0 = float(traj[L - W][coord_i])
+        a1 = float(traj[L][coord_i])
+        if abs(a1 - a0) / (abs(a0) + _freeze_eps) >= tol:
+            return False
+        for k in range(L - W, L):
+            p0 = float(traj[k][coord_i])
+            p1 = float(traj[k + 1][coord_i])
+            if abs(p1 - p0) / (abs(p0) + _freeze_eps) >= tol:
+                return False
+        return True
+
     t_start    = time.time()
     multi_phase = len(phase_schedule) > 1
+
+    def _unpack_batch_fn_ret(ret):
+        if len(ret) == 3:
+            return ret[0], ret[1], ret[2]
+        lv, gv = ret
+        return lv, gv, None
 
     # Local cache of built fns per phase index; build_fn itself is the persistent cache.
     _cur_ph_idx  = [-1]
@@ -618,30 +842,53 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
             _cur_fns[0] = build_fn(p)
         return _cur_fns[0]
 
-    def _phase_at(step, p):
+    def _phase_index_at(step):
+        """Which schedule phase is active at optimization loop index ``step``."""
         for ph_idx, (until_step, _) in enumerate(phase_schedule):
             if step < until_step:
-                return ph_idx, _get_fns(ph_idx, p)
-        last = len(phase_schedule) - 1
-        return last, _get_fns(last, p)
+                return ph_idx
+        return len(phase_schedule) - 1
 
-    # Step 0: aggregate phase-0 batches for a representative initial loss/grad.
+    def _phase_at(step, p):
+        ph_idx = _phase_index_at(step)
+        return ph_idx, _get_fns(ph_idx, p)
+
+    # Representative loss/grad at loop entry: phase 0 on a fresh trial; on resume,
+    # only the active phase is compiled (avoids loading phase 0 before a phase-1 resume).
+    ph_idx_init = _phase_index_at(start_step)
     lv_init = 0.0
     gv_init = jnp.zeros_like(p)
-    for fn in _get_fns(0, p):
-        lv, gv = fn(p)
+    wandb_track_extra_init = {}
+    if wandb_track_batch_groups is not None:
+        ph_init_groups = wandb_track_batch_groups[ph_idx_init]
+    else:
+        ph_init_groups = None
+    for batch_idx, fn in enumerate(_get_fns(ph_idx_init, p)):
+        lv, gv, pt = _unpack_batch_fn_ret(fn(p))
         jax.block_until_ready((lv, gv))
         lv_init += float(lv)
         gv_init  = gv_init + gv
+        if pt is not None and ph_init_groups is not None:
+            groups = ph_init_groups[batch_idx]
+            pt_np = np.asarray(pt)
+            for loc_i, (gi, nm) in enumerate(groups):
+                sk = _wandb_track_metric_suffix(nm)
+                wandb_track_extra_init[f'loss/track/{gi}_{sk}'] = float(pt_np[loc_i])
     param_traj.append(p.tolist())
     loss_traj.append(lv_init)
     grad_traj.append(gv_init.tolist())
 
-    if use_wandb and _WANDB_AVAILABLE:
+    # Skip initial W&B row when resuming — that step was already logged before checkpoint.
+    if use_wandb and _WANDB_AVAILABLE and start_step == 0:
+        extra0 = dict(wandb_track_extra_init or {})
+        if freeze_enabled and param_names is not None:
+            for i in range(n_dim):
+                extra0[f'freeze/{param_names[i]}'] = (1.0 if frozen_np[i] else 0.0)
         _wandb_log_step(start_step, lv_init, gv_init, p, param_names, scales, p_n_gts,
                         step_time_s=0.0, trial_idx=trial_idx, schedule_fn=schedule_fn,
                         lr_multipliers=lr_multipliers,
-                        phase=0 if multi_phase else None)
+                        phase=ph_idx_init if multi_phase else None,
+                        extra_metrics=extra0 if extra0 else None)
 
     stopped_early = False
     fn = batch_fns = None  # initial state; cleared each iteration for phase-transition GC
@@ -649,12 +896,16 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
         step_start = time.time()
         fn = None; batch_fns = None  # drop previous refs so phase transition can free old fns
         ph_idx, batch_fns = _phase_at(step, p)
-        fn = batch_fns[step % len(batch_fns)]
-        lv, gv = fn(p)
+        batch_idx = step % len(batch_fns)
+        fn = batch_fns[batch_idx]
+        lv, gv, _ = _unpack_batch_fn_ret(fn(p))
         jax.block_until_ready((lv, gv))
+        if freeze_enabled:
+            active = jnp.asarray(~frozen_np, dtype=jnp.float32)
+            gv = gv * active
         updates, opt_state = optimizer.update(gv, opt_state)
         p = optax.apply_updates(p, updates)
-        lv_new, gv_new = fn(p)
+        lv_new, gv_new, pt_new = _unpack_batch_fn_ret(fn(p))
         jax.block_until_ready((lv_new, gv_new))
         step_time = time.time() - step_start
 
@@ -662,16 +913,31 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
         loss_traj.append(float(lv_new))
         grad_traj.append(gv_new.tolist())
 
-        if (step + 1) % log_interval == 0:
-            if use_wandb and _WANDB_AVAILABLE:
-                _wandb_log_step(step + 1, float(lv_new), gv_new, p,
-                                param_names, scales, p_n_gts,
-                                step_time_s=step_time, trial_idx=trial_idx,
-                                schedule_fn=schedule_fn,
-                                lr_multipliers=lr_multipliers,
-                                phase=ph_idx if multi_phase else None)
-            if checkpoint_callback is not None:
-                checkpoint_callback(step + 1, p, opt_state)
+        if use_wandb and _WANDB_AVAILABLE and wandb_track_batch_groups is not None and pt_new is not None:
+            groups = wandb_track_batch_groups[ph_idx][batch_idx]
+            pt_np = np.asarray(pt_new)
+            thin = {'trial': trial_idx}
+            for loc_i, (gi, nm) in enumerate(groups):
+                sk = _wandb_track_metric_suffix(nm)
+                thin[f'loss/track/{gi}_{sk}'] = float(pt_np[loc_i])
+            _wandb.log(thin, step=step + 1)
+
+        if freeze_enabled and len(param_traj) > patience_per_param:
+            W = patience_per_param
+            frozen_names = []
+            for i in range(n_dim):
+                if frozen_np[i]:
+                    continue
+                if _per_param_freeze_ok(param_traj, i, W, tol_per_param):
+                    frozen_np[i] = True
+                    if param_names is not None:
+                        frozen_names.append(param_names[i])
+            if frozen_names:
+                print(f'\n    [freeze @{step + 1}] {", ".join(frozen_names)}', flush=True)
+
+        if freeze_enabled and frozen_np.all():
+            stopped_early = True
+            break
 
         if len(param_traj) > patience:
             p_now  = np.array(param_traj[-1])
@@ -681,7 +947,26 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
                 stopped_early = True
                 break
 
-    return dict(
+        if (step + 1) % log_interval == 0:
+            if use_wandb and _WANDB_AVAILABLE:
+                freeze_metrics = None
+                if freeze_enabled and param_names is not None:
+                    freeze_metrics = {
+                        f'freeze/{param_names[i]}': (1.0 if frozen_np[i] else 0.0)
+                        for i in range(n_dim)}
+                _wandb_log_step(step + 1, float(lv_new), gv_new, p,
+                                param_names, scales, p_n_gts,
+                                step_time_s=step_time, trial_idx=trial_idx,
+                                schedule_fn=schedule_fn,
+                                lr_multipliers=lr_multipliers,
+                                phase=ph_idx if multi_phase else None,
+                                extra_metrics=freeze_metrics)
+            if checkpoint_callback is not None:
+                checkpoint_callback(
+                    step + 1, p, opt_state,
+                    frozen_np if freeze_enabled else None)
+
+    out = dict(
         param_trajectory = param_traj,
         grad_trajectory  = grad_traj,
         loss_trajectory  = loss_traj,
@@ -690,6 +975,11 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
         steps_run        = len(param_traj) - 1,
         final_opt_state  = _serialize_opt_state(opt_state),
     )
+    if freeze_enabled:
+        out['frozen_mask_final'] = frozen_np.tolist()
+        out['tol_per_param'] = tol_per_param
+        out['patience_per_param'] = patience_per_param
+    return out
 
 
 def _collect_gpu_metrics():
@@ -726,7 +1016,7 @@ def _collect_gpu_metrics():
 
 def _wandb_log_step(step, loss, gv, p, param_names, scales, p_n_gts,
                     step_time_s, trial_idx, schedule_fn=None, lr_multipliers=None,
-                    phase=None):
+                    phase=None, extra_metrics=None):
     """Log one step to W&B."""
     p_np  = np.array(p)
     gv_np = np.array(gv)
@@ -755,6 +1045,9 @@ def _wandb_log_step(step, loss, gv, p, param_names, scales, p_n_gts,
             if gv_np is not None:
                 scale = lr_multipliers[i] if lr_multipliers is not None else 1.0
                 log[f'grads/{name}'] = float(gv_np[i] * scale)
+
+    if extra_metrics:
+        log.update(extra_metrics)
 
     log.update(_collect_gpu_metrics())
     _wandb.log(log, step=step)
@@ -790,6 +1083,16 @@ def apply_noise_to_gt(gt_arrays, simulator, noise_scale, noise_seed):
 def main():
     args = parse_args()
 
+    if (args.tol_per_param is None) ^ (args.patience_per_param is None):
+        print('error: use both --tol-per-param and --patience-per-param, or neither.',
+              file=sys.stderr)
+        raise SystemExit(2)
+    freeze_params_enabled = (
+        args.tol_per_param is not None and args.patience_per_param is not None)
+    if freeze_params_enabled and args.patience_per_param < 1:
+        print('error: --patience-per-param must be >= 1.', file=sys.stderr)
+        raise SystemExit(2)
+
     param_names = parse_params(args.params)
     track_specs = parse_tracks(args.tracks)
     range_lo, range_hi = getattr(args, 'range')
@@ -815,17 +1118,50 @@ def main():
     output_dir  = os.path.join(args.results_base, folder_name)
     output_path = next_result_path(output_dir, seed=effective_seed)
 
+    # Include interpreter — sys.argv[0] is only the script path (restores incorrectly omit ``python``).
+    _argv_cmd = shlex.join([sys.executable] + sys.argv)
     with open(os.path.join(output_dir, f'command_{effective_seed}.txt'), 'w') as _f:
-        _f.write(' '.join(sys.argv))
+        _f.write(_argv_cmd)
+
+    # SIGTERM as soon as paths exist — covers long GT/build phases before ``result`` exists.
+    preemption_state = {'output_path': output_path, 'result': None, 'wandb_active': False}
+
+    def _sigterm_handler(_sig, _frame):
+        print('\nSIGTERM received — saving checkpoint before exit...', flush=True)
+        path = preemption_state['output_path']
+        r = preemption_state['result']
+        try:
+            if r is not None:
+                r['run_complete'] = False
+                _safe_pickle_dump(path, r)
+                print(f'Saved: {path}', flush=True)
+            else:
+                print('No result checkpoint yet (still in setup phase).', flush=True)
+            if preemption_state['wandb_active'] and _WANDB_AVAILABLE:
+                try:
+                    _wandb.finish()
+                except Exception:
+                    pass
+        except Exception as exc:
+            print(f'SIGTERM checkpoint failed: {exc}', flush=True)
+        raise SystemExit(143)
+
+    signal.signal(signal.SIGTERM, _sigterm_handler)
 
     existing_result = None
     if args.seed is not None and os.path.exists(output_path):
-        with open(output_path, 'rb') as f:
-            existing_result = pickle.load(f)
-        n_done = len(existing_result.get('trials', []))
-        if n_done >= args.N:
+        try:
+            with open(output_path, 'rb') as f:
+                existing_result = pickle.load(f)
+        except Exception as exc:
+            print(f'Cannot read checkpoint {output_path}: {exc}\n'
+                  f'Rename or delete this file to start fresh.')
+            raise SystemExit(1) from exc
+        if optimization_run_complete(existing_result):
+            n_done = len(existing_result.get('trials', []))
             print(f'Skipping: {output_path} already complete ({n_done}/{args.N} trials).')
             return
+        n_done = len(existing_result.get('trials', []))
         print(f'Resuming: {output_path} ({n_done}/{args.N} trials done).')
 
     use_wandb = (not args.no_wandb) and _WANDB_AVAILABLE
@@ -842,6 +1178,9 @@ def main():
     print(f'Optimizer    : {args.optimizer}  lr={args.lr}  schedule={args.lr_schedule}  '
           f'warmup={warmup_tag}  clip_grad_norm={clip_tag}')
     print(f'Max steps    : {args.max_steps}  tol={args.tol}  patience={args.patience}')
+    if freeze_params_enabled:
+        print(f'Freeze coords: tol_per_param={args.tol_per_param}  '
+              f'patience_per_param={args.patience_per_param}')
     print(f'N            : {args.N}')
     print(f'Seed         : {effective_seed}')
     print(f'Noise scale  : {args.noise_scale}')
@@ -854,7 +1193,12 @@ def main():
     else:
         print(f'Fwd schedule : {len(schedule)} phases  '
               + '  →  '.join(f'{ph["step_size"]}mm/{ph["max_num_deposits"]//1000}k/bs{ph["batch_size"]}@{ph["until_step"]}' for ph in schedule))
-    print(f'W&B          : {"enabled  project=" + args.wandb_project if use_wandb else "disabled"}')
+    _wb_tag_list = []
+    if args.wandb_tags:
+        _wb_tag_list = [t.strip() for t in args.wandb_tags.split(',') if t.strip()]
+    _wb_summary = ("enabled  project=" + args.wandb_project +
+                   ("  tags=" + ",".join(_wb_tag_list) if _wb_tag_list else ""))
+    print(f'W&B          : {_wb_summary if use_wandb else "disabled"}')
     print(f'Log interval : {args.log_interval} steps')
     print(f'Output       : {output_path}')
 
@@ -863,32 +1207,43 @@ def main():
                       bool(frozenset(param_names) & _BETA_VARIANTS))
     wandb_name = ('all_params__' + folder_name.split('__', 1)[1]) if _is_all_params else folder_name
 
+    wb_run_id_for_result = None
     if use_wandb:
-        _wandb.init(
+        resume_training = (
+            existing_result is not None
+            and not optimization_run_complete(existing_result)
+        )
+        stored_wb_id = _read_stored_wandb_run_id(output_dir, effective_seed, existing_result)
+
+        _wandb_kw = dict(
             project=args.wandb_project,
             name=wandb_name,
-            config=dict(
-                param_names   = param_names,
-                tracks        = [t['name'] for t in track_specs],
-                loss          = args.loss,
-                optimizer     = args.optimizer,
-                lr            = args.lr,
-                lr_schedule   = args.lr_schedule,
-                max_steps     = args.max_steps,
-                tol           = args.tol,
-                patience      = args.patience,
-                N             = args.N,
-                range_lo      = range_lo,
-                range_hi      = range_hi,
-                noise_scale   = args.noise_scale,
-                warmup_steps  = args.warmup_steps,
-                clip_grad_norm = args.clip_grad_norm,
-                seed          = effective_seed,
-                log_interval  = args.log_interval,
-                output_path   = output_path,
-                jax_compilation_cache_dir = jax.config.jax_compilation_cache_dir,
+            config=wandb_config_dict(
+                args,
+                param_names=param_names,
+                track_specs=track_specs,
+                schedule=schedule,
+                effective_seed=effective_seed,
+                output_path=output_path,
+                wandb_tag_list=_wb_tag_list,
+                argv_cmd=_argv_cmd,
             ),
         )
+        if _wb_tag_list:
+            _wandb_kw['tags'] = _wb_tag_list
+
+        if resume_training:
+            run_id = stored_wb_id or _stable_wandb_run_id(
+                args.wandb_project, folder_name, effective_seed)
+            _wandb_kw['id'] = run_id
+            _wandb_kw['resume'] = 'allow'
+            note = 'stored id' if stored_wb_id else 'synthetic id (legacy ckpt)'
+            print(f'W&B resume   : {note} → {run_id}')
+
+        _wandb.init(**_wandb_kw)
+        wb_run_id_for_result = _wandb.run.id
+        _write_wandb_sidecar(output_dir, effective_seed, wb_run_id_for_result)
+        preemption_state['wandb_active'] = True
 
 
     # ── Schedule ──────────────────────────────────────────────────────────────
@@ -997,6 +1352,10 @@ def main():
     # before the next one is compiled, keeping peak memory to one phase at a time.
     _phase_fns_store: dict = {}
     phase_schedule = []   # [(until_step, build_fn), ...]
+    wandb_track_batch_groups = []   # [phase][batch] -> [(global_track_idx, name), ...]
+
+    log_track_losses_wandb = (
+        use_wandb and len(track_specs) < WANDB_PER_TRACK_LOSS_MAX_TRACKS)
 
     for ph_idx, phase in enumerate(schedule):
         sim_ph = _get_sim(phase['max_num_deposits'])
@@ -1036,6 +1395,15 @@ def main():
         if _deps:
             _batches.append((list(_deps), list(_gts), list(_wts)))
 
+        ti_cursor = 0
+        phase_track_groups = []
+        for batch_deps, _, _ in _batches:
+            bs = len(batch_deps)
+            phase_track_groups.append(
+                [(ti_cursor + j, track_specs[ti_cursor + j]['name']) for j in range(bs)])
+            ti_cursor += bs
+        wandb_track_batch_groups.append(phase_track_groups)
+
         print(f'Done ({time.time() - t0:.1f} s) — {len(_batches)} batches, compiling on first use')
 
         def _make_build_fn(ph_idx, phase, sim_ph, batches):
@@ -1054,10 +1422,14 @@ def main():
                           f'batch_size={phase["batch_size"]})  compiling...',
                           flush=True)
                     t0 = time.time()
-                    fns = build_phase_fns(args.loss, sim_ph, setter, batches)
+                    fns = build_phase_fns(
+                        args.loss, sim_ph, setter, batches,
+                        return_per_track_loss=log_track_losses_wandb)
                     for fn in fns:
-                        _ = fn(p); jax.block_until_ready(_)
-                        _ = fn(p); jax.block_until_ready(_)
+                        out = fn(p)
+                        jax.block_until_ready(out)
+                        out = fn(p)
+                        jax.block_until_ready(out)
                     print(f'  done ({time.time() - t0:.1f} s) — {len(fns)} batches',
                           flush=True)
                     _phase_fns_store[ph_idx] = fns
@@ -1098,6 +1470,8 @@ def main():
         max_steps           = args.max_steps,
         tol                 = args.tol,
         patience            = args.patience,
+        tol_per_param       = args.tol_per_param,
+        patience_per_param  = args.patience_per_param,
         N                   = args.N,
         loss_name           = args.loss,
         tracks              = track_specs,
@@ -1107,31 +1481,25 @@ def main():
         noise_scale         = args.noise_scale,
         factor_grid         = factor_grid,
         starting_p_n_values = p_n_starts,
-        command             = ' '.join(sys.argv),
+        command             = _argv_cmd,
         trials              = all_trials,
+        run_complete        = False,
+        wandb_run_id        = wb_run_id_for_result,
     )
+    preemption_state['result'] = result
 
     # ── Intra-trial checkpoint ────────────────────────────────────────────────
-    def _intra_trial_checkpoint(trial_idx, step, p, opt_state):
-        result['live_checkpoint'] = dict(
+    def _intra_trial_checkpoint(trial_idx, step, p, opt_state, frozen_mask=None):
+        ckpt = dict(
             trial_idx = trial_idx,
             step      = step,
             p         = p.tolist(),
             opt_state = _serialize_opt_state(opt_state),
         )
-        with open(output_path, 'wb') as f:
-            pickle.dump(result, f)
-
-    # ── Preemption handler ────────────────────────────────────────────────────
-    def _sigterm_handler(_sig, _frame):
-        print('\nSIGTERM received — saving checkpoint before exit...', flush=True)
-        with open(output_path, 'wb') as f:
-            pickle.dump(result, f)
-        print(f'Saved: {output_path}', flush=True)
-        if use_wandb and _WANDB_AVAILABLE:
-            _wandb.finish()
-        sys.exit(0)
-    signal.signal(signal.SIGTERM, _sigterm_handler)
+        if frozen_mask is not None:
+            ckpt['frozen_mask'] = np.asarray(frozen_mask, dtype=bool).tolist()
+        result['live_checkpoint'] = ckpt
+        _safe_pickle_dump(output_path, result)
 
     # Pre-populate completed trials from a prior (preempted) run.
     if existing_result:
@@ -1153,10 +1521,12 @@ def main():
         pn0            = pn_start
         init_opt_state = None
         start_step     = 0
+        init_frozen_mask = None
         if live_ckpt and live_ckpt.get('trial_idx') == gi:
             pn0            = live_ckpt['p']
             init_opt_state = live_ckpt['opt_state']
             start_step     = live_ckpt['step']
+            init_frozen_mask = live_ckpt.get('frozen_mask')
             print(f'  [resuming from step {start_step}]', end='', flush=True)
 
         trial = run_trial(
@@ -1165,10 +1535,17 @@ def main():
             log_interval=args.log_interval,
             param_names=param_names, scales=scales, p_n_gts=p_n_gts,
             use_wandb=use_wandb, trial_idx=gi, schedule_fn=schedule_fn,
-            checkpoint_callback=lambda step, p, opt_state: _intra_trial_checkpoint(gi, step, p, opt_state),
+            checkpoint_callback=(
+                lambda step, p, opt_state, fm=None: _intra_trial_checkpoint(
+                    gi, step, p, opt_state, frozen_mask=fm)),
             lr_multipliers=lr_multipliers,
             initial_opt_state=init_opt_state,
             start_step=start_step,
+            wandb_track_batch_groups=(wandb_track_batch_groups if log_track_losses_wandb else None),
+            tol_per_param=(args.tol_per_param if freeze_params_enabled else None),
+            patience_per_param=(
+                args.patience_per_param if freeze_params_enabled else None),
+            initial_frozen_mask=init_frozen_mask,
         )
         all_trials.append(trial)
         result.pop('live_checkpoint', None)
@@ -1184,13 +1561,12 @@ def main():
         cumulative_steps += trial['steps_run']
         if cumulative_steps - last_save_at_step >= 100:
             last_save_at_step = cumulative_steps
-            with open(output_path, 'wb') as f:
-                pickle.dump(result, f)
+            _safe_pickle_dump(output_path, result)
             print(f'  [checkpoint @ {cumulative_steps} steps → {output_path}]')
 
     # ── Save ──────────────────────────────────────────────────────────────────
-    with open(output_path, 'wb') as f:
-        pickle.dump(result, f)
+    result['run_complete'] = True
+    _safe_pickle_dump(output_path, result)
     print(f'\nSaved: {output_path}')
 
     if use_wandb:

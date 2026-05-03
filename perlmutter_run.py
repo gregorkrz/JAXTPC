@@ -60,6 +60,8 @@ def _gpu_script(gpu_id, commands, command_timeout_min, container_dir):
         "set -euo pipefail",
         f"cd {container_dir}",
         "source .env",
+        "export XLA_PYTHON_CLIENT_PREALLOCATE=false",
+        "export TF_GPU_ALLOCATOR=cuda_malloc_async",
         f"export CUDA_VISIBLE_DEVICES={gpu_id}",
     ]
     for cmd in commands:
