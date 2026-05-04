@@ -29,6 +29,9 @@ Available profiles
   2_part_schedule                  1.0 mm phase (5k steps) then 0.1 mm (15k steps), constant LR, 20k steps
   2_part_schedule_cosine_30k       Same 2-phase fwd schedule; cosine LR over 30k steps (5k + 25k)
   fine_nosched_bs1                  Single-phase 0.1 mm run, seeds 44–47
+  fine_nosched_bs1_mixed_xyz        Same as fine_nosched_bs1; Xm/Ym/Zm tracks (all direction components nonzero)
+  tracks50_mixed_cos30k_nosched     12 mixed-XYZ tracks + 38 random dirs, T~U(50,1000) MeV; single-phase 0.1 mm; warmup 1k; cosine LR / 30k steps
+  tracks50_mixed_cos30k_2phase      Same 50 tracks; 1 mm / 5k steps then 0.1 mm; same LR settings as 2_part_schedule_cosine_30k
   fine_nosched_bs1_tol1e4_p300      Same as fine_nosched_bs1; per-param freeze tol=1e-4, window=300
   longitudinal_diffusion_only       Same tracks/seeds as fine_nosched_bs1; optimize diffusion_long_cm2_us only
   longitudinal_transverse_diffusion Same setup; optimize diffusion_long_cm2_us and diffusion_trans_cm2_us together
@@ -43,8 +46,10 @@ Profile runs pass --wandb-tags <profile> to run_optimization.py (optional extras
 """
 import argparse
 import glob
+import math
 import os
 import pickle
+import random
 import sys
 
 from job_submission_tools import s3df_submit
@@ -67,8 +72,43 @@ TRACKS_12 = (
     "+diagonal_50MeV:1,1,1:50+x50:1,0,0:50+y50:0,1,0:50+z50:0,0,1:50"
 )
 
+# Same 12-track layout; axis-aligned tracks replaced by Xm/Ym/Zm so (dx,dy,dz) are all nonzero.
+TRACKS_12_MIXED_XYZ = (
+    "diagonal"
+    "+xm1000:1,0.1,0.2:1000+ym1000:0.15,1,0.25:1000+zm1000:0.2,0.05,1:1000"
+    "+diagonal_100MeV:1,1,1:100+xm100:1,0.1,0.2:100+ym100:0.15,1,0.25:100+zm100:0.2,0.05,1:100"
+    "+diagonal_50MeV:1,1,1:50+xm50:1,0.1,0.2:50+ym50:0.15,1,0.25:50+zm50:0.2,0.05,1:50"
+)
+
 # Single track (same physics tag as diagonal_50MeV in TRACKS_12)
 TRACK_DIAG_50MEV = "diagonal_50MeV:1,1,1:50"
+
+
+def _tracks_mixed_xyz_plus_random(
+    *,
+    n_random: int = 38,
+    rng_seed: int = 170_452_067,
+) -> str:
+    """``TRACKS_12_MIXED_XYZ`` plus ``n_random`` extra tracks.
+
+    Directions are uniform on S² (normalized i.i.d. Gaussians). Kinetic energy T is
+    ``random.uniform(50, 1000)`` MeV per extra track. Reproducible for fixed
+    ``rng_seed``.
+    """
+    rng = random.Random(rng_seed)
+    extras = []
+    for i in range(n_random):
+        x, y, z = rng.gauss(0.0, 1.0), rng.gauss(0.0, 1.0), rng.gauss(0.0, 1.0)
+        nrm = math.sqrt(x * x + y * y + z * z)
+        x, y, z = x / nrm, y / nrm, z / nrm
+        T = rng.uniform(50.0, 1000.0)
+        extras.append(f"rnd{i + 1:03d}:{x:.12g},{y:.12g},{z:.12g}:{T:.12g}")
+    return TRACKS_12_MIXED_XYZ + "+" + "+".join(extras)
+
+
+# 12-track mixed layout + 38 random (50 total). See ``WANDB_PER_TRACK_LOSS_MAX_TRACKS`` in run_optimization:
+# per-track W&B loss is disabled when track count reaches 50.
+TRACKS_50_MIXED_RANDOM = _tracks_mixed_xyz_plus_random()
 
 PARAM_LIST = [p.strip() for p in ALL_PARAMS.split(",") if p.strip()]
 
@@ -461,6 +501,294 @@ def profile_fine_nosched_bs1(*, submit=True, print_sbatch_only=False, wandb_tags
         )
 
 
+def profile_fine_nosched_bs1_mixed_xyz(*, submit=True, print_sbatch_only=False, wandb_tags=None):
+    """No phase schedule; 0.1 mm, 50k deposits, bs=1 — same hyperparams as fine_nosched_bs1.
+
+    Track list matches the 12-track layout but replaces axis-aligned X/Y/Z with mixed
+    directions Xm (1,0.1,0.2), Ym (0.15,1,0.25), Zm (0.2,0.05,1) at 1000 / 100 / 50 MeV.
+    """
+    shared = dict(
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.0001,
+        lr_schedule="constant",
+        max_steps=50000,
+        tol=1e-6,
+        patience=100,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base="$RESULTS_DIR/opt/sched2_longer_schedule_20260430/no_sched_fine_mixed_xyz",
+        grad_clip=10.0,
+        lr_multipliers="velocity_cm_us:0.005",
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=0.1,
+        max_num_deposits=50000,
+        batch_size=1,
+    )
+    params = ",".join(PARAM_LIST)
+    for seed in [44, 45, 46, 47]:
+        command = make_opt_command(
+            params=params,
+            tracks=TRACKS_12_MIXED_XYZ,
+            seed=seed,
+            noise_scale=0.0,
+            wandb_tags=wandb_tags,
+            **shared,
+        )
+        if not print_sbatch_only:
+            print(command)
+        s3df_submit(
+            command,
+            time="04:00:00",
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+        )
+
+
+def profile_tracks50_mixed_cos30k_nosched(*, submit=True, print_sbatch_only=False, wandb_tags=None):
+    """50 tracks (12 mixed XYZ + 38 random directions, T ~ U(50,1000) MeV).
+
+    Single forward phase: 0.1 mm, 50k deposits, batch 1. Warmup 1k steps; cosine LR decay
+    over 30k optimizer steps (no coarse/fine step-size schedule).
+    """
+    shared = dict(
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.0001,
+        lr_schedule="cosine",
+        max_steps=30000,
+        tol=1e-6,
+        patience=100,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base="$RESULTS_DIR/opt/tracks50_mixed_cos30k/nosched",
+        grad_clip=10.0,
+        lr_multipliers="velocity_cm_us:0.005",
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=0.1,
+        max_num_deposits=50000,
+        batch_size=1,
+    )
+    params = ",".join(PARAM_LIST)
+    for seed in [44, 45, 46, 47]:
+        command = make_opt_command(
+            params=params,
+            tracks=TRACKS_50_MIXED_RANDOM,
+            seed=seed,
+            noise_scale=0.0,
+            wandb_tags=wandb_tags,
+            **shared,
+        )
+        if not print_sbatch_only:
+            print(command)
+        s3df_submit(
+            command,
+            time="06:00:00",
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+        )
+
+
+def profile_tracks50_mixed_cos30k_2phase(*, submit=True, print_sbatch_only=False, wandb_tags=None):
+    """Same 50 tracks as ``profile_tracks50_mixed_cos30k_nosched``.
+
+    Two-phase forward schedule like ``profile_2_part_schedule_cosine_30k``: 1.0 mm for
+    steps 0–5000 (5k-deposit pad, batch 5), then 0.1 mm to step 30k (50k pads, batch 1).
+    Warmup 1k steps; cosine LR over 30k steps.
+    """
+    shared = dict(
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.0001,
+        lr_schedule="cosine",
+        max_steps=30000,
+        tol=1e-6,
+        patience=100,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base="$RESULTS_DIR/opt/tracks50_mixed_cos30k/2phase",
+        grad_clip=10.0,
+        lr_multipliers="velocity_cm_us:0.005",
+        warmup_steps=1000,
+        num_buckets=1000,
+        schedule_steps="5000",
+        schedule_step_sizes="1.0,0.1",
+        schedule_deposits="5000,50000",
+        schedule_batch_sizes="5,1",
+    )
+    params = ",".join(PARAM_LIST)
+    for seed in [44, 45, 46, 47]:
+        command = make_opt_command(
+            params=params,
+            tracks=TRACKS_50_MIXED_RANDOM,
+            seed=seed,
+            noise_scale=0.0,
+            wandb_tags=wandb_tags,
+            **shared,
+        )
+        if not print_sbatch_only:
+            print(command)
+        s3df_submit(
+            command,
+            time="06:00:00",
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+        )
+
+
+def profile_tracks12_mixed_cos30k_nosched(*, submit=True, print_sbatch_only=False, wandb_tags=None):
+    """12-track core of ``TRACKS_50_MIXED_RANDOM`` (``TRACKS_12_MIXED_XYZ``).
+
+    Same optimizer/forward setup as ``profile_tracks50_mixed_cos30k_nosched`` but on the
+    12 mixed-XYZ tracks only: single forward phase 0.1 mm, 50k deposits, batch 1; warmup
+    1k steps; cosine LR decay over 30k optimizer steps (no coarse/fine schedule).
+    """
+    shared = dict(
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.0001,
+        lr_schedule="cosine",
+        max_steps=30000,
+        tol=1e-6,
+        patience=100,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base="$RESULTS_DIR/opt/tracks12_mixed_cos30k/nosched",
+        grad_clip=10.0,
+        lr_multipliers="velocity_cm_us:0.005",
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=0.1,
+        max_num_deposits=50000,
+        batch_size=1,
+    )
+    params = ",".join(PARAM_LIST)
+    for seed in [44, 45, 46, 47]:
+        command = make_opt_command(
+            params=params,
+            tracks=TRACKS_12_MIXED_XYZ,
+            seed=seed,
+            noise_scale=0.0,
+            wandb_tags=wandb_tags,
+            **shared,
+        )
+        if not print_sbatch_only:
+            print(command)
+        s3df_submit(
+            command,
+            time="04:00:00",
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+        )
+
+
+def profile_tracks12_mixed_cos30k_2phase(*, submit=True, print_sbatch_only=False, wandb_tags=None):
+    """Same 12 tracks as ``profile_tracks12_mixed_cos30k_nosched``.
+
+    Two-phase forward schedule like ``profile_tracks50_mixed_cos30k_2phase``: 1.0 mm for
+    steps 0–5000 (5k-deposit pad, batch 5), then 0.1 mm to step 30k (50k pads, batch 1).
+    Warmup 1k steps; cosine LR over 30k steps.
+    """
+    shared = dict(
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.0001,
+        lr_schedule="cosine",
+        max_steps=30000,
+        tol=1e-6,
+        patience=100,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base="$RESULTS_DIR/opt/tracks12_mixed_cos30k/2phase",
+        grad_clip=10.0,
+        lr_multipliers="velocity_cm_us:0.005",
+        warmup_steps=1000,
+        num_buckets=1000,
+        schedule_steps="5000",
+        schedule_step_sizes="1.0,0.1",
+        schedule_deposits="5000,50000",
+        schedule_batch_sizes="5,1",
+    )
+    params = ",".join(PARAM_LIST)
+    for seed in [44, 45, 46, 47]:
+        command = make_opt_command(
+            params=params,
+            tracks=TRACKS_12_MIXED_XYZ,
+            seed=seed,
+            noise_scale=0.0,
+            wandb_tags=wandb_tags,
+            **shared,
+        )
+        if not print_sbatch_only:
+            print(command)
+        s3df_submit(
+            command,
+            time="04:00:00",
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+        )
+
+
+def profile_tracks12_mixed_cos30k_nosched_tol1e4_p2000(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """tracks12_mixed_cos30k_nosched with per-parameter freezing enabled.
+
+    Uses ``--tol-per-param 1e-4`` and ``--patience-per-param 2000`` while keeping the same
+    optimizer and forward settings as ``profile_tracks12_mixed_cos30k_nosched``.
+    """
+    shared = dict(
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.0001,
+        lr_schedule="cosine",
+        max_steps=30000,
+        tol=1e-6,
+        patience=2000,
+        tol_per_param=1e-4,
+        patience_per_param=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base="$RESULTS_DIR/opt/tracks12_mixed_cos30k/nosched_tol1e4_p2000_per_param",
+        grad_clip=10.0,
+        lr_multipliers="velocity_cm_us:0.005",
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=0.1,
+        max_num_deposits=50000,
+        batch_size=1,
+    )
+    params = ",".join(PARAM_LIST)
+    for seed in [44, 45, 46, 47]:
+        command = make_opt_command(
+            params=params,
+            tracks=TRACKS_12_MIXED_XYZ,
+            seed=seed,
+            noise_scale=0.0,
+            wandb_tags=wandb_tags,
+            **shared,
+        )
+        if not print_sbatch_only:
+            print(command)
+        s3df_submit(
+            command,
+            time="04:00:00",
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+        )
+
+
 def profile_fine_nosched_bs1_tol1e4_2k(*, submit=True, print_sbatch_only=False, wandb_tags=None):
     """Same as fine_nosched_bs1 plus coordinate freezing: --tol-per-param / --patience-per-param.
 
@@ -832,6 +1160,12 @@ PROFILES = {
     "2_part_schedule": profile_2_part_schedule,
     "2_part_schedule_cosine_30k": profile_2_part_schedule_cosine_30k,
     "fine_nosched_bs1": profile_fine_nosched_bs1,
+    "fine_nosched_bs1_mixed_xyz": profile_fine_nosched_bs1_mixed_xyz,
+    "tracks50_mixed_cos30k_nosched": profile_tracks50_mixed_cos30k_nosched,
+    "tracks50_mixed_cos30k_2phase": profile_tracks50_mixed_cos30k_2phase,
+    "tracks12_mixed_cos30k_nosched": profile_tracks12_mixed_cos30k_nosched,
+    "tracks12_mixed_cos30k_2phase": profile_tracks12_mixed_cos30k_2phase,
+    "tracks12_mixed_cos30k_nosched_tol1e4_p2000": profile_tracks12_mixed_cos30k_nosched_tol1e4_p2000,
     "fine_nosched_bs1_tol1e4_p2000": profile_fine_nosched_bs1_tol1e4_2k,
     "no_schedule_less_params": profile_no_schedule_less_params,
     "longitudinal_diffusion_only": profile_longitudinal_diffusion_only,

@@ -15,6 +15,8 @@ srun \
         export APPTAINER_CACHEDIR=/sdf/scratch/atlas/gregork/apptainer_cache
         export APPTAINER_TMPDIR=/sdf/scratch/atlas/gregork/apptainer_tmp
         export JAX_COMPILATION_CACHE_DIR=/sdf/scratch/atlas/gregork/jax_cache
+        export XLA_PYTHON_CLIENT_PREALLOCATE=false
+        export TF_GPU_ALLOCATOR=cuda_malloc_async
         cd /sdf/home/g/gregork/jaxtpc
         source .env
         apptainer shell --nv \
