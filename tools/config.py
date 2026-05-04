@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 Configuration classes for JAXTPC detector simulation.
 

@@ -11,66 +11,71 @@ Main entry points:
 - load_particle_step_data: Load HDF5 particle step data
 - generate_noise / add_noise: Standalone noise generation (accepts SimConfig)
 """
-from importlib import import_module
 
-__all__ = []
-
-
-def _optional_export(module_path, names):
-    """Import names when available, skipping optional/heavy dependencies."""
-    try:
-        module = import_module(module_path)
-    except Exception:
-        return
-
-    for name in names:
-        if hasattr(module, name):
-            globals()[name] = getattr(module, name)
-            __all__.append(name)
-
-
-_optional_export(
-    "tools.config",
-    [
-        # Core types
-        "DepositData",
-        "VolumeDeposits",
-        "SimParams",
-        "SimConfig",
-        "ModifiedBoxParams",
-        "EMBParams",
-        "SCEOutputs",
-        "VolumeGeometry",
-        "VolumeIntermediates",
-        "PlaneIntermediates",
-        "DiffusionConfig",
-        "TrackHitsConfig",
-        "DigitizationConfig",
-        "ResponseKernel",
-        # Helpers
-        "get_volume_deposits",
-        # Factories
-        "create_sim_params",
-        "create_sim_config",
-        "create_deposit_data",
-        "pad_deposit_data",
-        "create_track_hits_config",
-        "create_digitization_config",
-    ],
+from tools.config import (
+    # Core types
+    DepositData,
+    VolumeDeposits,
+    SimParams,
+    SimConfig,
+    ModifiedBoxParams,
+    EMBParams,
+    SCEOutputs,
+    VolumeGeometry,
+    VolumeIntermediates,
+    PlaneIntermediates,
+    DiffusionConfig,
+    TrackHitsConfig,
+    DigitizationConfig,
+    ResponseKernel,
+    # Helpers
+    get_volume_deposits,
+    # Factories
+    create_sim_params,
+    create_sim_config,
+    create_deposit_data,
+    pad_deposit_data,
+    create_track_hits_config,
+    create_digitization_config,
 )
 
-_optional_export("tools.geometry", ["generate_detector"])
-_optional_export("tools.loader", ["load_particle_step_data", "build_deposit_data", "load_event"])
-_optional_export("tools.simulation", ["DetectorSimulator"])
-_optional_export("tools.recombination", ["RECOMB_MODELS", "compute_quanta", "XI_FN"])
-_optional_export(
-    "tools.particle_generator",
-    [
-        "generate_muon_segments",
-        "generate_muon_segments_trig",
-        "load_dedx_table_jax",
-        "mask_outside_volume",
-    ],
+from tools.geometry import generate_detector
+from tools.loader import load_particle_step_data, build_deposit_data, load_event
+from tools.simulation import DetectorSimulator
+from tools.recombination import RECOMB_MODELS, compute_quanta, XI_FN
+from tools.particle_generator import (
+    generate_muon_segments, generate_muon_segments_trig,
+    load_dedx_table_jax, mask_outside_volume,
 )
-_optional_export("tools.wires", ["sparse_buckets_to_dense"])
-_optional_export("tools.noise", ["add_noise", "generate_noise", "generate_noise_bucketed"])
+
+from tools.wires import sparse_buckets_to_dense
+
+from tools.noise import (
+    add_noise,
+    generate_noise,
+    generate_noise_bucketed,
+)
+
+__all__ = [
+    # Core types
+    'DepositData', 'VolumeDeposits', 'SimParams', 'SimConfig',
+    'ModifiedBoxParams', 'EMBParams',
+    'SCEOutputs', 'VolumeGeometry', 'VolumeIntermediates', 'PlaneIntermediates',
+    'DiffusionConfig', 'TrackHitsConfig', 'DigitizationConfig', 'ResponseKernel',
+    # Recombination
+    'RECOMB_MODELS', 'compute_quanta', 'XI_FN',
+    # Entry points
+    'generate_detector', 'load_particle_step_data', 'build_deposit_data',
+    'load_event', 'get_volume_deposits', 'DetectorSimulator',
+    # Factories
+    'create_sim_params', 'create_sim_config', 'create_deposit_data',
+    'pad_deposit_data',
+    'create_track_hits_config', 'create_digitization_config',
+    # Particle generation (differentiable)
+    'generate_muon_segments', 'generate_muon_segments_trig',
+    'load_dedx_table_jax', 'mask_outside_volume',
+    # Sparse utilities
+    'sparse_buckets_to_dense',
+    # Noise post-processing
+    'add_noise', 'generate_noise', 'generate_noise_bucketed',
+]

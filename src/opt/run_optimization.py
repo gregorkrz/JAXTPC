@@ -540,85 +540,30 @@ def _scale_by_vector(scales):
     return optax.GradientTransformation(init_fn, update_fn)
 
 
-class _ManualPreconditionedOptimizer:
-    """Fallback optimizer wrapper when optax.chain/clip are unavailable.
-
-    Applies per-parameter LR multipliers and component-wise clipping before
-    delegating to the wrapped optimizer.
-    """
-    def __init__(self, base_optimizer, lr_multipliers=None, clip_grad_norm=0.0):
-        self._base = base_optimizer
-        self._lr_multipliers = lr_multipliers
-        self._clip_grad_norm = clip_grad_norm
-
-    def init(self, params):
-        return self._base.init(params)
-
-    def update(self, grads, state):
-        updates = grads
-        if self._lr_multipliers is not None and any(s != 1.0 for s in self._lr_multipliers):
-            updates = updates * jnp.array(self._lr_multipliers, dtype=jnp.float32)
-        if self._clip_grad_norm > 0.0:
-            updates = jnp.clip(updates, -self._clip_grad_norm, self._clip_grad_norm)
-        return self._base.update(updates, state)
-
-
 def make_optax_optimizer(optimizer_name, lr, lr_schedule, max_steps, clip_grad_norm=0.0,
                          warmup_steps=0, lr_multipliers=None):
-    if warmup_steps > 0 and all(
-        hasattr(optax, name) for name in ("linear_schedule", "constant_schedule", "join_schedules")
-    ):
+    if warmup_steps > 0:
         warmup = optax.linear_schedule(init_value=0.0, end_value=lr, transition_steps=warmup_steps)
         if lr_schedule == 'cosine':
             post = optax.cosine_decay_schedule(init_value=lr, decay_steps=max_steps - warmup_steps)
         else:
             post = optax.constant_schedule(lr)
         schedule = optax.join_schedules([warmup, post], boundaries=[warmup_steps])
-    elif warmup_steps > 0:
-        # Compatibility fallback for lightweight optax stubs used in import tests.
-        if lr_schedule == "cosine":
-            post = optax.cosine_decay_schedule(init_value=lr, decay_steps=max(max_steps - warmup_steps, 1))
-        else:
-            post = lambda _step, _lr=lr: _lr
-
-        def schedule(step):
-            if step < warmup_steps:
-                return lr * float(step) / float(max(warmup_steps, 1))
-            return post(step - warmup_steps)
     elif lr_schedule == 'cosine':
         schedule = optax.cosine_decay_schedule(init_value=lr, decay_steps=max_steps)
     else:
         schedule = lr
-
-    if optimizer_name == 'adam':
-        try:
-            base = optax.adam(schedule, b1=ADAM_BETA1, b2=ADAM_BETA2, eps=ADAM_EPS)
-        except TypeError:
-            base = optax.adam(schedule)
-    elif optimizer_name == 'sgd':
-        base = optax.sgd(schedule)
-    elif optimizer_name == 'momentum_sgd':
-        base = optax.sgd(schedule, momentum=MOMENTUM)
+    if optimizer_name == 'adam':         base = optax.adam(schedule, b1=ADAM_BETA1, b2=ADAM_BETA2, eps=ADAM_EPS)
+    elif optimizer_name == 'sgd':          base = optax.sgd(schedule)
+    elif optimizer_name == 'momentum_sgd': base = optax.sgd(schedule, momentum=MOMENTUM)
     else: raise ValueError(f'Unknown optimizer {optimizer_name!r}')
-
-    use_multipliers = lr_multipliers is not None and any(s != 1.0 for s in lr_multipliers)
-    use_clipping = clip_grad_norm > 0.0
-    if hasattr(optax, "chain") and (not use_clipping or hasattr(optax, "clip")):
-        transforms = []
-        if use_multipliers:
-            transforms.append(_scale_by_vector(lr_multipliers))
-        if use_clipping:
-            transforms.append(optax.clip(clip_grad_norm))
-        transforms.append(base)
-        tx = optax.chain(*transforms)
-    elif use_multipliers or use_clipping:
-        tx = _ManualPreconditionedOptimizer(
-            base_optimizer=base,
-            lr_multipliers=lr_multipliers,
-            clip_grad_norm=clip_grad_norm,
-        )
-    else:
-        tx = base
+    transforms = []
+    if lr_multipliers is not None and any(s != 1.0 for s in lr_multipliers):
+        transforms.append(_scale_by_vector(lr_multipliers))
+    if clip_grad_norm > 0.0:
+        transforms.append(optax.clip(clip_grad_norm))
+    transforms.append(base)
+    tx = optax.chain(*transforms)
     # Wrap schedule in a callable so callers can query lr at any step
     schedule_fn = schedule if callable(schedule) else (lambda _s, _lr=schedule: _lr)
     return tx, schedule_fn
@@ -628,30 +573,14 @@ def make_optax_optimizer(optimizer_name, lr, lr_schedule, max_steps, clip_grad_n
 
 def _serialize_opt_state(opt_state):
     """Convert JAX arrays in optax state to numpy arrays for pickling."""
-    tree_util = getattr(jax, "tree_util", None)
-    if tree_util is not None and hasattr(tree_util, "tree_map"):
-        return tree_util.tree_map(np.asarray, opt_state)
-
-    def _to_numpy(value):
-        if isinstance(value, dict):
-            return {k: _to_numpy(v) for k, v in value.items()}
-        if isinstance(value, tuple):
-            return tuple(_to_numpy(v) for v in value)
-        if isinstance(value, list):
-            return [_to_numpy(v) for v in value]
-        try:
-            return np.asarray(value)
-        except Exception:
-            return value
-
-    return _to_numpy(opt_state)
+    return jax.tree_util.tree_map(np.asarray, opt_state)
 
 
-def run_trial(p0, phase_schedule=None, optimizer=None, max_steps=0, tol=1e-5, patience=20,
+def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
               log_interval=50, param_names=None, scales=None, p_n_gts=None,
               use_wandb=False, trial_idx=0, schedule_fn=None,
               checkpoint_callback=None, lr_multipliers=None,
-              initial_opt_state=None, start_step=0, val_and_grad_fn=None):
+              initial_opt_state=None, start_step=0):
     """Run one optimization trial from starting p_n vector p0 (any length).
 
     phase_schedule: list of (until_step, build_fn) sorted by until_step.
@@ -664,71 +593,15 @@ def run_trial(p0, phase_schedule=None, optimizer=None, max_steps=0, tol=1e-5, pa
       loss_trajectory    list[float] length steps+1
       total_time_s, stopped_early, steps_run
     """
-    if optimizer is None:
-        raise ValueError("optimizer must be provided")
-
-    if isinstance(optimizer, tuple):
-        # Backward compatibility with older call sites/tests that pass
-        # make_optax_optimizer() output directly.
-        optimizer, schedule_from_tuple = optimizer
-        if schedule_fn is None:
-            schedule_fn = schedule_from_tuple
-
     p = jnp.array(p0, dtype=jnp.float32)
-    if initial_opt_state is not None:
-        tree_util = getattr(jax, "tree_util", None)
-        if tree_util is not None and hasattr(tree_util, "tree_map"):
-            opt_state = tree_util.tree_map(jnp.array, initial_opt_state)
-        else:
-            opt_state = initial_opt_state
-    else:
-        opt_state = optimizer.init(p)
+    opt_state = (jax.tree_util.tree_map(jnp.array, initial_opt_state)
+                 if initial_opt_state is not None else optimizer.init(p))
 
     param_traj = []
     loss_traj  = []
     grad_traj  = []
 
-    t_start = time.time()
-
-    # Legacy/simple optimization path used by lightweight unit tests.
-    if val_and_grad_fn is not None and phase_schedule is None:
-        lv_init, gv_init = val_and_grad_fn(p)
-        param_traj.append(p.tolist())
-        loss_traj.append(float(lv_init))
-        grad_traj.append(np.asarray(gv_init).tolist())
-
-        stopped_early = False
-        for step in range(start_step, max_steps):
-            lv, gv = val_and_grad_fn(p)
-            updates, opt_state = optimizer.update(gv, opt_state)
-            p = optax.apply_updates(p, updates)
-            lv_new, gv_new = val_and_grad_fn(p)
-
-            param_traj.append(p.tolist())
-            loss_traj.append(float(lv_new))
-            grad_traj.append(np.asarray(gv_new).tolist())
-
-            if len(param_traj) > patience:
-                p_now = np.array(param_traj[-1])
-                p_prev = np.array(param_traj[-1 - patience])
-                rel = np.linalg.norm(p_now - p_prev) / (np.linalg.norm(p_prev) + 1e-30)
-                if rel < tol:
-                    stopped_early = True
-                    break
-
-        return dict(
-            param_trajectory=param_traj,
-            grad_trajectory=grad_traj,
-            loss_trajectory=loss_traj,
-            total_time_s=time.time() - t_start,
-            stopped_early=stopped_early,
-            steps_run=len(param_traj) - 1,
-            final_opt_state=_serialize_opt_state(opt_state),
-        )
-
-    if phase_schedule is None:
-        raise ValueError("phase_schedule must be provided when val_and_grad_fn is not set")
-
+    t_start    = time.time()
     multi_phase = len(phase_schedule) > 1
 
     # Local cache of built fns per phase index; build_fn itself is the persistent cache.
