@@ -26,9 +26,6 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from dotenv import load_dotenv
-load_dotenv()
-
 import argparse
 import math
 import re
@@ -36,10 +33,17 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
 import numpy as np
-import wandb
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
+if load_dotenv is not None:
+    load_dotenv()
+
+plt = None
+Line2D = None
 
 
 _PLOTS_DIR = os.environ.get("PLOTS_DIR", "plots")
@@ -161,7 +165,7 @@ def _extract_run_series(
 
 
 def _resolve_entity_project(
-    api: wandb.Api,
+    api,
     entity: Optional[str],
     project: Optional[str],
 ) -> Tuple[str, str]:
@@ -174,7 +178,7 @@ def _resolve_entity_project(
     return final_entity, final_project
 
 
-def _configure_log_axis(ax: plt.Axes, all_values: np.ndarray, ylabel_base: str) -> None:
+def _configure_log_axis(ax, all_values: np.ndarray, ylabel_base: str) -> None:
     finite_vals = all_values[np.isfinite(all_values)]
     if finite_vals.size == 0:
         ax.set_ylabel(f"{ylabel_base} (log)")
@@ -307,7 +311,26 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    global plt, Line2D
     args = parse_args()
+
+    try:
+        import matplotlib.pyplot as _plt
+        from matplotlib.lines import Line2D as _Line2D
+    except ImportError as exc:
+        raise ModuleNotFoundError(
+            "matplotlib is required for this script. Install it with `pip install matplotlib`."
+        ) from exc
+    plt = _plt
+    Line2D = _Line2D
+
+    try:
+        import wandb
+    except ImportError as exc:
+        raise ModuleNotFoundError(
+            "wandb is required for this script. Install it with `pip install wandb`."
+        ) from exc
+
     tags = _split_csv(args.tags)
     if not tags:
         raise ValueError("--tags must not be empty")
