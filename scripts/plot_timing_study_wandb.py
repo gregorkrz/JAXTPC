@@ -10,6 +10,11 @@ Examples::
         --entity fcc_ml --project jaxtpc-optimization \\
         --output plots/timing_study.png
 
+    .venv/bin/python scripts/plot_timing_study_wandb.py \\
+        --study-tags timing_study_diag50mev,timing_study_cont \\
+        --study-tag-labels "Diag 50 MeV,Continuous scan" \\
+        --output plots/timing_study.png
+
 Reference **finished** run ``x29don9r`` (``dep_5000``): summary includes ``_runtime``,
 ``sys/gpu/jax_peak_gb``, ``sys/gpu/jax_mem_gb``, sparse ``step_time_s`` when
 ``--log-interval 1000``.
@@ -27,7 +32,10 @@ import json
 import math
 import os
 import re
+from collections import Counter
 from typing import Any, Iterable
+
+DEFAULT_PNG_DPI = 300
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -95,12 +103,14 @@ def collect_runs(
     study_tags: list[str],
     *,
     limit: int,
+    verbose: bool = False,
 ) -> list[dict[str, Any]]:
     """Fetch runs whose tags intersect ``study_tags``; newest run wins per deposit."""
     path = f"{entity}/{project}"
     tagged: dict[int, dict[str, Any]] = {}
 
     seen_ids: set[str] = set()
+    per_tag_counts: list[tuple[str, int]] = []
     for tag in study_tags:
         try:
             iterator = api.runs(path, filters={"tags": {"$in": [tag]}}, order="-created_at")
@@ -204,12 +214,39 @@ def collect_runs(
             if replace:
                 tagged[dep] = row
 
+        per_tag_counts.append((tag, n_tag))
+
+    if verbose:
+        print(f"W&B path: {path}", flush=True)
+        print(f"Study tags ({len(study_tags)}): {study_tags}", flush=True)
+        print(f"Fetch limit per tag: {limit}", flush=True)
+        for t, n in per_tag_counts:
+            print(f"  runs seen for tag {t!r}: {n}", flush=True)
+
     return sorted(tagged.values(), key=lambda r: r["deposits"])
 
 
-def plot_rows(rows: list[dict[str, Any]], title: str, output_path: str) -> None:
+def plot_rows(
+    rows: list[dict[str, Any]],
+    title: str,
+    output_path: str,
+    *,
+    study_tag_labels: list[str] | None = None,
+    study_tags: list[str] | None = None,
+    verbose: bool = False,
+    dpi: int = DEFAULT_PNG_DPI,
+) -> None:
     if not rows:
         raise SystemExit("No matching runs — check entity/project/tags and wandb login.")
+
+    if verbose:
+        states = Counter(str(r["state"]) for r in rows)
+        with_jax = sum(1 for r in rows if r.get("jax_metrics_logged"))
+        print(
+            f"Plotting {len(rows)} rows (one per deposit): "
+            f"states {dict(states)}, with JAX metrics: {with_jax}",
+            flush=True,
+        )
 
     deps = np.array([r["deposits"] for r in rows], dtype=float)
     finished = np.array([r["state"] == "finished" for r in rows])
@@ -242,7 +279,13 @@ def plot_rows(rows: list[dict[str, Any]], title: str, output_path: str) -> None:
         if show_legend:
             ax.legend(loc="best", fontsize=8)
 
-    axes[0].set_title(title)
+    if study_tag_labels and study_tags and len(study_tag_labels) == len(study_tags):
+        label_line = " · ".join(
+            f"{lab} ({tag})" for lab, tag in zip(study_tag_labels, study_tags, strict=True)
+        )
+        axes[0].set_title(f"{title}\n{label_line}", fontsize=10)
+    else:
+        axes[0].set_title(title)
     _plot_xy(
         axes[0],
         est_loop,
@@ -286,12 +329,29 @@ def plot_rows(rows: list[dict[str, Any]], title: str, output_path: str) -> None:
         axes[0].legend(h0, l0, loc="upper right", fontsize=7)
 
     # Reference ymax for placing compile-OOM markers (failed before any JAX metric).
-    peak_ref = np.nanmax(peak[finished & np.isfinite(peak)])
+    peak_fin = peak[finished & np.isfinite(peak)]
+    peak_ref = _nanmax(peak_fin)
     if not math.isfinite(peak_ref) or peak_ref <= 0:
+        if verbose:
+            print(
+                "  peak_ref: no finished finite jax_peak_gb — using fallback 1.0 GB",
+                flush=True,
+            )
         peak_ref = 1.0
-    mem_ref = np.nanmax(mem_avg[finished & np.isfinite(mem_avg)])
+    elif verbose:
+        print(f"  peak_ref from finished runs: {peak_ref:.6g} GB", flush=True)
+
+    mem_fin = mem_avg[finished & np.isfinite(mem_avg)]
+    mem_ref = _nanmax(mem_fin)
     if not math.isfinite(mem_ref) or mem_ref <= 0:
+        if verbose:
+            print(
+                "  mem_ref: no finished finite jax_mem_avg_gb — using fallback 0.5 GB",
+                flush=True,
+            )
         mem_ref = 0.5
+    elif verbose:
+        print(f"  mem_ref from finished runs: {mem_ref:.6g} GB", flush=True)
 
     fail_no_jax = (~finished) & ~np.isfinite(peak) & ~np.isfinite(mem_avg)
 
@@ -335,9 +395,17 @@ def plot_rows(rows: list[dict[str, Any]], title: str, output_path: str) -> None:
     if h2:
         axes[2].legend(h2, l2, loc="best", fontsize=8)
 
-    step_ref = np.nanmax(step_mean[finished & np.isfinite(step_mean)])
+    step_fin = step_mean[finished & np.isfinite(step_mean)]
+    step_ref = _nanmax(step_fin)
     if not math.isfinite(step_ref) or step_ref <= 0:
+        if verbose:
+            print(
+                "  step_ref: no finished finite mean_step_time — using fallback 0.2 s",
+                flush=True,
+            )
         step_ref = 0.2
+    elif verbose:
+        print(f"  step_ref from finished runs: {step_ref:.6g} s", flush=True)
 
     no_step = ~np.isfinite(step_mean)
     _plot_xy(
@@ -363,7 +431,7 @@ def plot_rows(rows: list[dict[str, Any]], title: str, output_path: str) -> None:
     axes[-1].set_xlabel("max_num_deposits (pad)")
     plt.tight_layout()
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, dpi=dpi)
     plt.close()
     print(f"Saved plot: {output_path}")
 
@@ -413,6 +481,28 @@ def main() -> None:
         help="Comma-separated run tags (union); runs matching any tag are considered.",
     )
     p.add_argument(
+        "--study-tag-labels",
+        default=None,
+        metavar="LABELS",
+        help=(
+            "Optional comma-separated human-readable names in the same order as "
+            "--study-tags (shown under the plot title with each tag). "
+            "Must provide exactly one label per tag. "
+            "Cannot use together with repeated --study-tag-label."
+        ),
+    )
+    p.add_argument(
+        "--study-tag-label",
+        action="append",
+        default=None,
+        dest="study_tag_label_each",
+        metavar="LABEL",
+        help=(
+            "Human-readable name for the next --study-tags slot (repeat once per tag). "
+            "Use this when a label contains commas. Mutually exclusive with --study-tag-labels."
+        ),
+    )
+    p.add_argument(
         "--output",
         default=os.path.join(os.environ.get("PLOTS_DIR", "plots"), "timing_study_wandb.png"),
         help="PNG output path (CSV stem matched).",
@@ -423,16 +513,82 @@ def main() -> None:
         default=500,
         help="Approx max runs fetched per study tag (safety bound).",
     )
+    p.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Print W&B fetch counts, row summary, and reference scale choices.",
+    )
+    p.add_argument(
+        "--dpi",
+        type=int,
+        default=DEFAULT_PNG_DPI,
+        metavar="N",
+        help=f"PNG resolution (default: {DEFAULT_PNG_DPI}).",
+    )
     args = p.parse_args()
 
     study_tags = [t.strip() for t in args.study_tags.split(",") if t.strip()]
+    study_tag_labels: list[str] | None = None
+    str_labels = args.study_tag_labels is not None and str(args.study_tag_labels).strip()
+    each_labels = args.study_tag_label_each
+    if str_labels and each_labels:
+        raise SystemExit("Use either --study-tag-labels or repeated --study-tag-label, not both.")
+    if each_labels:
+        study_tag_labels = list(each_labels)
+        if len(study_tag_labels) != len(study_tags):
+            raise SystemExit(
+                f"Provide exactly one --study-tag-label per --study-tags entry "
+                f"({len(study_tags)} tags), got {len(study_tag_labels)} label(s)."
+            )
+    elif str_labels:
+        study_tag_labels = [s.strip() for s in str(args.study_tag_labels).split(",")]
+        if len(study_tag_labels) != len(study_tags):
+            raise SystemExit(
+                f"--study-tag-labels must list exactly {len(study_tags)} name(s) "
+                f"(same count as --study-tags), got {len(study_tag_labels)}."
+            )
 
     import wandb
 
+    if args.verbose:
+        print(
+            f"Query: entity={args.entity!r} project={args.project!r} "
+            f"output={args.output!r}",
+            flush=True,
+        )
+
     api = wandb.Api(timeout=120)
-    rows = collect_runs(api, args.entity, args.project, study_tags, limit=args.limit)
-    title = f"{args.entity}/{args.project}  timing study ({', '.join(study_tags)})"
-    plot_rows(rows, title, args.output)
+    rows = collect_runs(
+        api,
+        args.entity,
+        args.project,
+        study_tags,
+        limit=args.limit,
+        verbose=args.verbose,
+    )
+    if args.verbose:
+        deps_sorted = [r["deposits"] for r in rows]
+        if deps_sorted:
+            print(
+                f"Unique deposits covered: {len(deps_sorted)} "
+                f"(min={min(deps_sorted)}, max={max(deps_sorted)})",
+                flush=True,
+            )
+
+    if study_tag_labels:
+        title = f"{args.entity}/{args.project}  timing study"
+    else:
+        title = f"{args.entity}/{args.project}  timing study ({', '.join(study_tags)})"
+    plot_rows(
+        rows,
+        title,
+        args.output,
+        study_tag_labels=study_tag_labels,
+        study_tags=study_tags if study_tag_labels else None,
+        verbose=args.verbose,
+        dpi=args.dpi,
+    )
 
 
 if __name__ == "__main__":

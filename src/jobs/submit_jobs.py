@@ -32,6 +32,13 @@ Available profiles
   fine_nosched_bs1_mixed_xyz        Same as fine_nosched_bs1; Xm/Ym/Zm tracks (all direction components nonzero)
   tracks50_mixed_cos30k_nosched     12 mixed-XYZ tracks + 38 random dirs, T~U(50,1000) MeV; single-phase 0.1 mm; warmup 1k; cosine LR / 30k steps
   tracks50_mixed_cos30k_2phase      Same 50 tracks; 1 mm / 5k steps then 0.1 mm; same LR settings as 2_part_schedule_cosine_30k
+  tracks24_mixed_cos30k_nosched_tol1e4_p2000  Like tracks12_mixed…tol1e4_p2000 but 24 tracks (12 mixed-XYZ + x-flipped copy each)
+  tracks12_mixed_cos30k_nosched_tol1e4_p2000_auto_clip1  Like tracks12_mixed…tol1e4_p2000; --lr-multipliers auto (100-step burn-in); global grad clip 1.0
+  tracks12_mixed_cos30k_nosched_tol1e4_p2000_auto_clip1_p500  Same as …_auto_clip1; --patience-per-param 500 (not 2000)
+  tracks12_mixed_cos30k_nosched_auto_clip1_noparamfreeze  Like …_auto_clip1_p500 but disables per-parameter freezing
+  tracks12_mixed_cos30k_nosched_auto_clip1_noparamfreeze_no_vel  Same as …_noparamfreeze but ``velocity_cm_us`` held at nominal (not in ``--params``)
+  tracks12_mixed_cos30k_nosched_tol1e4_p2000_auto_clip1_p500_ebs12  Same as …_p500 with --effective-batch-size 12
+  tracks12_mixed_cos30k_auto_clip1_p500_no_vel  Same as …_p500; all EMB params except velocity_cm_us
   fine_nosched_bs1_tol1e4_p300      Same as fine_nosched_bs1; per-param freeze tol=1e-4, window=300
   longitudinal_diffusion_only       Same tracks/seeds as fine_nosched_bs1; optimize diffusion_long_cm2_us only
   longitudinal_transverse_diffusion Same setup; optimize diffusion_long_cm2_us and diffusion_trans_cm2_us together
@@ -78,6 +85,16 @@ TRACKS_12_MIXED_XYZ = (
     "+xm1000:1,0.1,0.2:1000+ym1000:0.15,1,0.25:1000+zm1000:0.2,0.05,1:1000"
     "+diagonal_100MeV:1,1,1:100+xm100:1,0.1,0.2:100+ym100:0.15,1,0.25:100+zm100:0.2,0.05,1:100"
     "+diagonal_50MeV:1,1,1:50+xm50:1,0.1,0.2:50+ym50:0.15,1,0.25:50+zm50:0.2,0.05,1:50"
+)
+
+# ``TRACKS_12_MIXED_XYZ`` plus a second copy of each track with direction (dx,dy,dz) -> (-dx,dy,dz);
+# same kinetic energy per pair. Names suffixed ``_rnx`` for the x-flipped copy.
+TRACKS_24_MIXED_XYZ = (
+    TRACKS_12_MIXED_XYZ
+    + "+diagonal_rnx:-1,1,1:1000"
+    + "+xm1000_rnx:-1,0.1,0.2:1000+ym1000_rnx:-0.15,1,0.25:1000+zm1000_rnx:-0.2,0.05,1:1000"
+    + "+diagonal_100MeV_rnx:-1,1,1:100+xm100_rnx:-1,0.1,0.2:100+ym100_rnx:-0.15,1,0.25:100+zm100_rnx:-0.2,0.05,1:100"
+    + "+diagonal_50MeV_rnx:-1,1,1:50+xm50_rnx:-1,0.1,0.2:50+ym50_rnx:-0.15,1,0.25:50+zm50_rnx:-0.2,0.05,1:50"
 )
 
 # Single track (same physics tag as diagonal_50MeV in TRACKS_12)
@@ -226,6 +243,7 @@ def make_opt_command(
     max_num_deposits=None,
     num_buckets=None,
     batch_size=None,
+    effective_batch_size=None,
     schedule_steps=None,
     schedule_step_sizes=None,
     schedule_deposits=None,
@@ -236,6 +254,7 @@ def make_opt_command(
     tol_per_param=None,
     patience_per_param=None,
     log_interval=None,
+    lr_mult_auto_burn_in_steps=None,
 ):
     """Return a run_optimization.py command string with the given settings."""
     parts = [
@@ -261,8 +280,12 @@ def make_opt_command(
         parts.append(f"--noise-scale {noise_scale}")
     if lr_multipliers is not None:
         parts.append(f"--lr-multipliers {lr_multipliers}")
+    if lr_mult_auto_burn_in_steps is not None:
+        parts.append(f"--lr-mult-auto-burn-in-steps {int(lr_mult_auto_burn_in_steps)}")
     if batch_size is not None:
         parts.append(f"--batch-size {batch_size}")
+    if effective_batch_size is not None:
+        parts.append(f"--effective-batch-size {int(effective_batch_size)}")
     if step_size is not None:
         parts.append(f"--step-size {step_size}")
     if max_num_deposits is not None:
@@ -789,6 +812,376 @@ def profile_tracks12_mixed_cos30k_nosched_tol1e4_p2000(
         )
 
 
+def profile_tracks12_mixed_cos30k_nosched_tol1e4_p2000_auto_clip1(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """Same as ``profile_tracks12_mixed_cos30k_nosched_tol1e4_p2000`` except per-param LR
+    scales come from ``--lr-multipliers auto`` (default 100 burn-in steps in
+    ``run_optimization``) and gradients use global norm clip ``--clip-grad-norm 1.0``.
+    """
+    shared = dict(
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.0001,
+        lr_schedule="cosine",
+        max_steps=30000,
+        tol=1e-6,
+        patience=2000,
+        tol_per_param=1e-4,
+        patience_per_param=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base="$RESULTS_DIR/opt/tracks12_mixed_cos30k/nosched_tol1e4_p2000_auto_clip1",
+        grad_clip=1.0,
+        lr_multipliers="auto",
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=0.1,
+        max_num_deposits=50000,
+        batch_size=1,
+    )
+    params = ",".join(PARAM_LIST)
+    for seed in [44, 45, 46, 47]:
+        command = make_opt_command(
+            params=params,
+            tracks=TRACKS_12_MIXED_XYZ,
+            seed=seed,
+            noise_scale=0.0,
+            wandb_tags=wandb_tags,
+            **shared,
+        )
+        if not print_sbatch_only:
+            print(command)
+        s3df_submit(
+            command,
+            time="04:00:00",
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+        )
+
+
+def profile_tracks12_mixed_cos30k_nosched_tol1e4_p2000_auto_clip1_p500(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """Same as ``profile_tracks12_mixed_cos30k_nosched_tol1e4_p2000_auto_clip1`` but
+    ``--patience-per-param 500`` instead of 2000 (still ``--tol-per-param 1e-4``).
+    """
+    shared = dict(
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.0001,
+        lr_schedule="cosine",
+        max_steps=30000,
+        tol=1e-6,
+        patience=2000,
+        tol_per_param=1e-4,
+        patience_per_param=500,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base="$RESULTS_DIR/opt/tracks12_mixed_cos30k/nosched_tol1e4_p2000_auto_clip1_p500",
+        grad_clip=1.0,
+        lr_multipliers="auto",
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=0.1,
+        max_num_deposits=50000,
+        batch_size=1,
+    )
+    params = ",".join(PARAM_LIST)
+    for seed in [44, 45, 46, 47]:
+        command = make_opt_command(
+            params=params,
+            tracks=TRACKS_12_MIXED_XYZ,
+            seed=seed,
+            noise_scale=0.0,
+            wandb_tags=wandb_tags,
+            **shared,
+        )
+        if not print_sbatch_only:
+            print(command)
+        s3df_submit(
+            command,
+            time="04:00:00",
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+        )
+
+
+def profile_tracks12_mixed_cos30k_auto_clip1_p500_no_vel(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """Same as ``profile_tracks12_mixed_cos30k_nosched_tol1e4_p2000_auto_clip1_p500`` but
+    ``--params`` lists every EMB parameter except ``velocity_cm_us`` (held at nominal).
+    """
+    shared = dict(
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.0001,
+        lr_schedule="cosine",
+        max_steps=30000,
+        tol=1e-6,
+        patience=2000,
+        tol_per_param=1e-4,
+        patience_per_param=500,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base=(
+            "$RESULTS_DIR/opt/tracks12_mixed_cos30k/"
+            "nosched_tol1e4_p2000_auto_clip1_p500_no_vel"
+        ),
+        grad_clip=1.0,
+        lr_multipliers="auto",
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=0.1,
+        max_num_deposits=50000,
+        batch_size=1,
+    )
+    params = ",".join(p for p in PARAM_LIST if p != "velocity_cm_us")
+    for seed in [44, 45, 46, 47]:
+        command = make_opt_command(
+            params=params,
+            tracks=TRACKS_12_MIXED_XYZ,
+            seed=seed,
+            noise_scale=0.0,
+            wandb_tags=wandb_tags,
+            **shared,
+        )
+        if not print_sbatch_only:
+            print(command)
+        s3df_submit(
+            command,
+            time="04:00:00",
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+        )
+
+
+def profile_tracks12_mixed_cos30k_nosched_tol1e4_p2000_auto_clip1_p500_ebs12(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """Same as ``profile_tracks12_mixed_cos30k_nosched_tol1e4_p2000_auto_clip1_p500``
+    with ``--effective-batch-size 12`` and global grad clip 10.0.
+    """
+    shared = dict(
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.0001,
+        lr_schedule="cosine",
+        max_steps=30000,
+        tol=1e-6,
+        patience=2000,
+        tol_per_param=1e-4,
+        patience_per_param=500,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base=(
+            "$RESULTS_DIR/opt/tracks12_mixed_cos30k/"
+            "nosched_tol1e4_p2000_auto_clip1_p500_ebs12"
+        ),
+        grad_clip=10.0,
+        lr_multipliers="auto",
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=0.1,
+        max_num_deposits=50000,
+        batch_size=1,
+        effective_batch_size=12,
+    )
+    params = ",".join(PARAM_LIST)
+    for seed in [44, 45, 46, 47]:
+        command = make_opt_command(
+            params=params,
+            tracks=TRACKS_12_MIXED_XYZ,
+            seed=seed,
+            noise_scale=0.0,
+            wandb_tags=wandb_tags,
+            **shared,
+        )
+        if not print_sbatch_only:
+            print(command)
+        s3df_submit(
+            command,
+            time="04:00:00",
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+        )
+
+
+def profile_tracks12_mixed_cos30k_nosched_auto_clip1_noparamfreeze(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """Same core setup as ``..._auto_clip1_p500`` but without per-parameter freezing.
+
+    I.e. no ``--tol-per-param`` / ``--patience-per-param``.
+    """
+    shared = dict(
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.0001,
+        lr_schedule="cosine",
+        max_steps=30000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base=(
+            "$RESULTS_DIR/opt/tracks12_mixed_cos30k/"
+            "nosched_auto_clip1_noparamfreeze"
+        ),
+        grad_clip=1.0,
+        lr_multipliers="auto",
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=0.1,
+        max_num_deposits=50000,
+        batch_size=1,
+    )
+    params = ",".join(PARAM_LIST)
+    for seed in [44, 45, 46, 47]:
+        command = make_opt_command(
+            params=params,
+            tracks=TRACKS_12_MIXED_XYZ,
+            seed=seed,
+            noise_scale=0.0,
+            wandb_tags=wandb_tags,
+            **shared,
+        )
+        if not print_sbatch_only:
+            print(command)
+        s3df_submit(
+            command,
+            time="04:00:00",
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+        )
+
+
+def profile_tracks12_mixed_cos30k_nosched_auto_clip1_noparamfreeze_no_vel(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """Same as ``profile_tracks12_mixed_cos30k_nosched_auto_clip1_noparamfreeze`` but
+    ``--params`` omits ``velocity_cm_us`` (held at nominal).
+    """
+    shared = dict(
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.0001,
+        lr_schedule="cosine",
+        max_steps=30000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base=(
+            "$RESULTS_DIR/opt/tracks12_mixed_cos30k/"
+            "nosched_auto_clip1_noparamfreeze_no_vel"
+        ),
+        grad_clip=1.0,
+        lr_multipliers="auto",
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=0.1,
+        max_num_deposits=50000,
+        batch_size=1,
+    )
+    params = ",".join(p for p in PARAM_LIST if p != "velocity_cm_us")
+    for seed in [44, 45, 46, 47]:
+        command = make_opt_command(
+            params=params,
+            tracks=TRACKS_12_MIXED_XYZ,
+            seed=seed,
+            noise_scale=0.0,
+            wandb_tags=wandb_tags,
+            **shared,
+        )
+        if not print_sbatch_only:
+            print(command)
+        s3df_submit(
+            command,
+            time="04:00:00",
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+        )
+
+
+def profile_tracks24_mixed_cos30k_nosched_tol1e4_p2000(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """Same as ``profile_tracks12_mixed_cos30k_nosched_tol1e4_p2000`` but 24 mixed tracks.
+
+    Uses ``TRACKS_24_MIXED_XYZ``: the 12 mixed-XYZ layout plus an x-reflected copy
+    ``(-dx, dy, dz)`` at the same momentum for each explicit track (``*_rnx`` names).
+    """
+    shared = dict(
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.0001,
+        lr_schedule="cosine",
+        max_steps=30000,
+        tol=1e-6,
+        patience=2000,
+        tol_per_param=1e-4,
+        patience_per_param=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base="$RESULTS_DIR/opt/tracks24_mixed_cos30k/nosched_tol1e4_p2000_per_param",
+        grad_clip=10.0,
+        lr_multipliers="velocity_cm_us:0.005",
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=0.1,
+        max_num_deposits=50000,
+        batch_size=1,
+    )
+    params = ",".join(PARAM_LIST)
+    for seed in [44, 45, 46, 47]:
+        command = make_opt_command(
+            params=params,
+            tracks=TRACKS_24_MIXED_XYZ,
+            seed=seed,
+            noise_scale=0.0,
+            wandb_tags=wandb_tags,
+            **shared,
+        )
+        if not print_sbatch_only:
+            print(command)
+        s3df_submit(
+            command,
+            time="06:00:00",
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+        )
+
+
 def profile_fine_nosched_bs1_tol1e4_2k(*, submit=True, print_sbatch_only=False, wandb_tags=None):
     """Same as fine_nosched_bs1 plus coordinate freezing: --tol-per-param / --patience-per-param.
 
@@ -1166,6 +1559,25 @@ PROFILES = {
     "tracks12_mixed_cos30k_nosched": profile_tracks12_mixed_cos30k_nosched,
     "tracks12_mixed_cos30k_2phase": profile_tracks12_mixed_cos30k_2phase,
     "tracks12_mixed_cos30k_nosched_tol1e4_p2000": profile_tracks12_mixed_cos30k_nosched_tol1e4_p2000,
+    "tracks12_mixed_cos30k_nosched_tol1e4_p2000_auto_clip1": (
+        profile_tracks12_mixed_cos30k_nosched_tol1e4_p2000_auto_clip1
+    ),
+    "tracks12_mixed_cos30k_nosched_tol1e4_p2000_auto_clip1_p500": (
+        profile_tracks12_mixed_cos30k_nosched_tol1e4_p2000_auto_clip1_p500
+    ),
+    "tracks12_mixed_cos30k_nosched_auto_clip1_noparamfreeze": (
+        profile_tracks12_mixed_cos30k_nosched_auto_clip1_noparamfreeze
+    ),
+    "tracks12_mixed_cos30k_nosched_auto_clip1_noparamfreeze_no_vel": (
+        profile_tracks12_mixed_cos30k_nosched_auto_clip1_noparamfreeze_no_vel
+    ),
+    "tracks12_mixed_cos30k_nosched_tol1e4_p2000_auto_clip1_p500_ebs12": (
+        profile_tracks12_mixed_cos30k_nosched_tol1e4_p2000_auto_clip1_p500_ebs12
+    ),
+    "tracks12_mixed_cos30k_auto_clip1_p500_no_vel": (
+        profile_tracks12_mixed_cos30k_auto_clip1_p500_no_vel
+    ),
+    "tracks24_mixed_cos30k_nosched_tol1e4_p2000": profile_tracks24_mixed_cos30k_nosched_tol1e4_p2000,
     "fine_nosched_bs1_tol1e4_p2000": profile_fine_nosched_bs1_tol1e4_2k,
     "no_schedule_less_params": profile_no_schedule_less_params,
     "longitudinal_diffusion_only": profile_longitudinal_diffusion_only,

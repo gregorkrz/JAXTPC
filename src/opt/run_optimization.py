@@ -53,6 +53,9 @@ Each pickle contains:
   live_checkpoint       optional mid-trial resume payload (must be absent when complete);
                         may include frozen_mask when using --tol-per-param
   wandb_run_id          optional; persisted so resumed jobs continue the same W&B run
+  lr_multipliers        optional list[float]; resolved per-param grad scales (always stored)
+  lr_mult_auto_meta     optional dict when --lr-multipliers auto (median_abs_grad, abs_grad,
+                        burn_in_steps, burn_in_steps_used)
 """
 
 import gc
@@ -214,15 +217,28 @@ def parse_args():
                    help='Linear LR warmup from 0 to --lr over this many steps '
                         '(default: 100, set to 0 to disable).')
     p.add_argument('--clip-grad-norm', type=float, default=10.0,
-                   help='Clip each gradient component independently to [-value, value] '
-                        'before optimizer update (default: 10.0, set to 0 to disable).')
+                   help='If > 0, rescale the full gradient vector so its L2 norm is at most '
+                        'this value (global norm clip; default: 10.0). Set to 0 to disable.')
     p.add_argument('--lr-multipliers', default=None,
                    help='Per-parameter LR multipliers as comma-separated name:factor pairs, '
                         'e.g. "velocity_cm_us:0.01,lifetime_us:0.1". '
-                        'Unlisted parameters keep multiplier 1.0.')
+                        'Unlisted parameters keep multiplier 1.0. '
+                        'Use "auto" to set each multiplier once from |dL/dp| (median-scaled, '
+                        'clipped to [0.01, 10]); see --lr-mult-auto-burn-in-steps. '
+                        'Values are stored in the result pickle for resume.')
+    p.add_argument('--lr-mult-auto-burn-in-steps', type=int, default=100,
+                   help='With --lr-multipliers auto: run this many optimizer steps first '
+                        '(same LR/clip/warmup/schedule as trials, but no per-param grad scaling) '
+                        'and set each multiplier from the mean |dL/dp_i| over those steps, so '
+                        'multi-phase schedules are exercised by step index. '
+                        '0 = use a single summed grad at trial start (step 0). Default: 100.')
     p.add_argument('--batch-size', type=int, default=1,
                    help='Number of tracks processed together on GPU per grad call (default: 1). '
                         'Larger values use vmap to parallelize tracks; try 2–4.')
+    p.add_argument('--effective-batch-size', type=int, default=1,
+                   help='Number of consecutive micro-batches to accumulate before one optimizer '
+                        'update (default: 1). This increases effective batch size without '
+                        'holding all tracks in memory at once.')
     p.add_argument('--step-size', type=float, default=0.1,
                    help='Muon track step size in mm (default: 0.1). '
                         'Larger values reduce deposit count and memory use.')
@@ -542,6 +558,102 @@ def build_phase_fns(loss_name, simulator, setter, batches, *, return_per_track_l
 
 # ── Optimizer factory ──────────────────────────────────────────────────────────
 
+def _unpack_batch_fn_ret(ret):
+    if len(ret) == 3:
+        return ret[0], ret[1], ret[2]
+    lv, gv = ret
+    return lv, gv, None
+
+
+def _phase_index_at(step, phase_schedule):
+    for ph_idx, (until_step, _) in enumerate(phase_schedule):
+        if step < until_step:
+            return ph_idx
+    return len(phase_schedule) - 1
+
+
+def sum_grad_batches_at_step(p0, phase_schedule, start_step):
+    """Sum ∂L/∂p over all batches for the phase active at ``start_step`` (same convention as run_trial)."""
+    p = jnp.asarray(p0, dtype=jnp.float32)
+    ph_idx = _phase_index_at(start_step, phase_schedule)
+    _, build_fn = phase_schedule[ph_idx]
+    fns = build_fn(p)
+    gv_acc = jnp.zeros_like(p)
+    for fn in fns:
+        lv, gv, _ = _unpack_batch_fn_ret(fn(p))
+        jax.block_until_ready((lv, gv))
+        gv_acc = gv_acc + gv
+    return gv_acc
+
+
+def burn_in_mean_abs_grad(p0, phase_schedule, optimizer, burn_in_steps, effective_batch_size=1):
+    """Run ``burn_in_steps`` trial-like optimizer steps and return mean |∂L/∂p| per coordinate.
+
+    Uses the same phase-vs-step indexing as ``run_trial`` (so schedule boundaries apply).
+    ``optimizer`` should be built **without** per-param LR multipliers (uniform scaling).
+
+    Returns:
+        mean_abs: JAX vector, time-average of |grad| over the burn-in window
+        steps_used: int, number of steps actually run (``burn_in_steps``)
+    """
+    n_steps = int(burn_in_steps)
+    eff_bs = int(effective_batch_size)
+    if n_steps <= 0:
+        raise ValueError('burn_in_mean_abs_grad: burn_in_steps must be positive')
+    if eff_bs < 1:
+        raise ValueError('burn_in_mean_abs_grad: effective_batch_size must be >= 1')
+    p = jnp.asarray(p0, dtype=jnp.float32)
+    opt_state = optimizer.init(p)
+    _cur_ph_idx = [-1]
+    _cur_fns = [None]
+
+    def _get_fns(ph_idx, p_):
+        if ph_idx != _cur_ph_idx[0]:
+            _cur_fns[0] = None
+            _cur_ph_idx[0] = ph_idx
+            _, build_fn = phase_schedule[ph_idx]
+            _cur_fns[0] = build_fn(p_)
+        return _cur_fns[0]
+
+    def _phase_at(step, p_):
+        ph_idx = _phase_index_at(step, phase_schedule)
+        return ph_idx, _get_fns(ph_idx, p_)
+
+    sum_abs = jnp.zeros_like(p)
+    for step in range(n_steps):
+        _, batch_fns = _phase_at(step, p)
+        gv_acc = jnp.zeros_like(p)
+        for micro in range(eff_bs):
+            batch_idx = (step * eff_bs + micro) % len(batch_fns)
+            fn = batch_fns[batch_idx]
+            lv, gv, _ = _unpack_batch_fn_ret(fn(p))
+            jax.block_until_ready((lv, gv))
+            sum_abs = sum_abs + jnp.abs(gv)
+            gv_acc = gv_acc + gv
+        gv_eff = gv_acc / float(eff_bs)
+        updates, opt_state = optimizer.update(gv_eff, opt_state)
+        p = optax.apply_updates(p, updates)
+
+    mean_abs = sum_abs / float(n_steps * eff_bs)
+    return mean_abs, n_steps
+
+
+def auto_lr_multipliers_from_grad(gv):
+    """Per-parameter scales from per-coordinate sensitivity (non-negative).
+
+    sens_i = |v_i| (typically v = ∂L/∂p or a time-mean thereof), then
+    lr_mult_i = clip(median(sens) / (sens_i + 1e-8), 0.01, 10).
+
+    Returns (multipliers list, median(sens), list of sens_i per param).
+    """
+    sens = jnp.abs(gv)
+    med = jnp.median(sens)
+    mult = jnp.clip(med / (sens + 1e-8), 0.01, 10.0)
+    mult_list = [float(x) for x in mult]
+    sens_list = [float(x) for x in sens]
+    return mult_list, float(med), sens_list
+
+
 def parse_lr_multipliers(spec, param_names):
     """Parse 'name:factor,...' string into a per-parameter scale vector (length = len(param_names)).
 
@@ -550,6 +662,8 @@ def parse_lr_multipliers(spec, param_names):
     scales = [1.0] * len(param_names)
     if not spec:
         return scales
+    if spec.strip().lower() == 'auto':
+        raise ValueError('parse_lr_multipliers: use resolve path for "auto" (caller handles this)')
     for item in spec.split(','):
         item = item.strip()
         if not item:
@@ -626,7 +740,7 @@ def make_optax_optimizer(optimizer_name, lr, lr_schedule, max_steps, clip_grad_n
     if lr_multipliers is not None and any(s != 1.0 for s in lr_multipliers):
         transforms.append(_scale_by_vector(lr_multipliers))
     if clip_grad_norm > 0.0:
-        transforms.append(optax.clip(clip_grad_norm))
+        transforms.append(optax.clip_by_global_norm(clip_grad_norm))
     transforms.append(base)
     tx = optax.chain(*transforms)
     # Wrap schedule in a callable so callers can query lr at any step
@@ -758,7 +872,8 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
               initial_opt_state=None, start_step=0,
               wandb_track_batch_groups=None,
               tol_per_param=None, patience_per_param=None,
-              initial_frozen_mask=None):
+              initial_frozen_mask=None,
+              effective_batch_size=1):
     """Run one optimization trial from starting p_n vector p0 (any length).
 
     phase_schedule: list of (until_step, build_fn) sorted by until_step.
@@ -788,6 +903,9 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
     p = jnp.array(p0, dtype=jnp.float32)
     opt_state = (jax.tree_util.tree_map(jnp.array, initial_opt_state)
                  if initial_opt_state is not None else optimizer.init(p))
+    eff_bs = int(effective_batch_size)
+    if eff_bs < 1:
+        raise ValueError('effective_batch_size must be >= 1')
 
     freeze_enabled = tol_per_param is not None and patience_per_param is not None
     n_dim = int(p.shape[0])
@@ -821,12 +939,6 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
 
     t_start    = time.time()
     multi_phase = len(phase_schedule) > 1
-
-    def _unpack_batch_fn_ret(ret):
-        if len(ret) == 3:
-            return ret[0], ret[1], ret[2]
-        lv, gv = ret
-        return lv, gv, None
 
     # Local cache of built fns per phase index; build_fn itself is the persistent cache.
     _cur_ph_idx  = [-1]
@@ -896,16 +1008,23 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
         step_start = time.time()
         fn = None; batch_fns = None  # drop previous refs so phase transition can free old fns
         ph_idx, batch_fns = _phase_at(step, p)
-        batch_idx = step % len(batch_fns)
-        fn = batch_fns[batch_idx]
-        lv, gv, _ = _unpack_batch_fn_ret(fn(p))
-        jax.block_until_ready((lv, gv))
+        gv_acc = jnp.zeros_like(p)
+        last_batch_idx = None
+        for micro in range(eff_bs):
+            batch_idx = (step * eff_bs + micro) % len(batch_fns)
+            fn = batch_fns[batch_idx]
+            lv, gv, _ = _unpack_batch_fn_ret(fn(p))
+            jax.block_until_ready((lv, gv))
+            gv_acc = gv_acc + gv
+            last_batch_idx = batch_idx
+        gv = gv_acc / float(eff_bs)
         if freeze_enabled:
             active = jnp.asarray(~frozen_np, dtype=jnp.float32)
             gv = gv * active
         updates, opt_state = optimizer.update(gv, opt_state)
         p = optax.apply_updates(p, updates)
-        lv_new, gv_new, pt_new = _unpack_batch_fn_ret(fn(p))
+        fn_eval = batch_fns[last_batch_idx]
+        lv_new, gv_new, pt_new = _unpack_batch_fn_ret(fn_eval(p))
         jax.block_until_ready((lv_new, gv_new))
         step_time = time.time() - step_start
 
@@ -914,7 +1033,7 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
         grad_traj.append(gv_new.tolist())
 
         if use_wandb and _WANDB_AVAILABLE and wandb_track_batch_groups is not None and pt_new is not None:
-            groups = wandb_track_batch_groups[ph_idx][batch_idx]
+            groups = wandb_track_batch_groups[ph_idx][last_batch_idx]
             pt_np = np.asarray(pt_new)
             thin = {'trial': trial_idx}
             for loc_i, (gi, nm) in enumerate(groups):
@@ -1083,6 +1202,13 @@ def apply_noise_to_gt(gt_arrays, simulator, noise_scale, noise_seed):
 def main():
     args = parse_args()
 
+    if args.effective_batch_size < 1:
+        print('error: --effective-batch-size must be >= 1.', file=sys.stderr)
+        raise SystemExit(2)
+    if args.lr_mult_auto_burn_in_steps < 0:
+        print('error: --lr-mult-auto-burn-in-steps must be >= 0.', file=sys.stderr)
+        raise SystemExit(2)
+
     if (args.tol_per_param is None) ^ (args.patience_per_param is None):
         print('error: use both --tol-per-param and --patience-per-param, or neither.',
               file=sys.stderr)
@@ -1185,6 +1311,7 @@ def main():
     print(f'Seed         : {effective_seed}')
     print(f'Noise scale  : {args.noise_scale}')
     print(f'Num buckets  : {args.num_buckets:,}')
+    print(f'Eff batch    : {args.effective_batch_size}')
     print(f'GT step size : {args.gt_step_size} mm  max deposits={args.gt_max_deposits:,}')
     if len(schedule) == 1:
         print(f'Fwd step size: {schedule[0]["step_size"]} mm')
@@ -1446,8 +1573,96 @@ def main():
     factor_grid   = factors.tolist()
     p_n_starts    = (np.log(factors) + np.array(p_n_gts)).tolist()
 
-    lr_multipliers = parse_lr_multipliers(args.lr_multipliers, param_names)
-    if any(s != 1.0 for s in lr_multipliers):
+    all_trials = []
+    if existing_result:
+        all_trials.extend(existing_result['trials'])
+    live_ckpt = (existing_result or {}).get('live_checkpoint')
+
+    lr_spec = args.lr_multipliers
+    want_auto = lr_spec is not None and lr_spec.strip().lower() == 'auto'
+    lr_mult_auto_meta = None
+    stored_mult = None
+    if existing_result and isinstance(existing_result.get('lr_multipliers'), (list, tuple)):
+        stored_mult = [float(x) for x in existing_result['lr_multipliers']]
+        if len(stored_mult) != len(param_names):
+            stored_mult = None
+
+    if want_auto:
+        if stored_mult is not None:
+            lr_multipliers = stored_mult
+            lr_mult_auto_meta = existing_result.get('lr_mult_auto_meta')
+            print('LR multipliers : auto (restored from checkpoint)')
+            if use_wandb and _WANDB_AVAILABLE:
+                _wandb.config.update({
+                    'lr_multipliers_resolved': {
+                        n: float(m) for n, m in zip(param_names, lr_multipliers)},
+                }, allow_val_change=True)
+                if isinstance(lr_mult_auto_meta, dict):
+                    wb_meta = {}
+                    if lr_mult_auto_meta.get('median_abs_grad') is not None:
+                        wb_meta['lr_mult_auto_median_abs_grad'] = lr_mult_auto_meta['median_abs_grad']
+                    if lr_mult_auto_meta.get('burn_in_steps') is not None:
+                        wb_meta['lr_mult_auto_burn_in_steps'] = lr_mult_auto_meta['burn_in_steps']
+                    if lr_mult_auto_meta.get('burn_in_steps_used') is not None:
+                        wb_meta['lr_mult_auto_burn_in_steps_used'] = lr_mult_auto_meta['burn_in_steps_used']
+                    if wb_meta:
+                        _wandb.config.update(wb_meta, allow_val_change=True)
+        else:
+            n_next = len(all_trials)
+            pn_ref = p_n_starts[n_next]
+            n_burn = int(args.lr_mult_auto_burn_in_steps)
+            t_auto = time.time()
+            if n_burn > 0:
+                print(f'LR multipliers : auto — burn-in {n_burn} steps (mean |grad|)...',
+                      flush=True)
+                opt_burnin, _ = make_optax_optimizer(
+                    args.optimizer, args.lr, args.lr_schedule,
+                    args.max_steps,
+                    clip_grad_norm=args.clip_grad_norm,
+                    warmup_steps=args.warmup_steps,
+                    lr_multipliers=None,
+                )
+                mean_abs, n_used = burn_in_mean_abs_grad(
+                    pn_ref, phase_schedule, opt_burnin, n_burn,
+                    effective_batch_size=args.effective_batch_size)
+                jax.block_until_ready(mean_abs)
+                sens_vec = mean_abs
+            else:
+                print('LR multipliers : auto — single grad at trial start (step 0)...',
+                      flush=True)
+                gv0 = sum_grad_batches_at_step(pn_ref, phase_schedule, start_step=0)
+                jax.block_until_ready(gv0)
+                sens_vec = gv0
+                n_used = 0
+            lr_multipliers, med_abs, sens_list = auto_lr_multipliers_from_grad(sens_vec)
+            lr_mult_auto_meta = dict(
+                median_abs_grad=med_abs,
+                abs_grad={n: s for n, s in zip(param_names, sens_list)},
+                burn_in_steps=n_burn,
+                burn_in_steps_used=n_used,
+            )
+            print(f'  done ({time.time() - t_auto:.2f} s)  median(sens)={med_abs:.4e}')
+            print('  resolved      : ' + ', '.join(
+                f'{n}×{s:.4g}' for n, s in zip(param_names, lr_multipliers)))
+            if use_wandb and _WANDB_AVAILABLE:
+                _wandb.config.update({
+                    'lr_multipliers_resolved': {
+                        n: float(m) for n, m in zip(param_names, lr_multipliers)},
+                    'lr_mult_auto_median_abs_grad': med_abs,
+                    'lr_mult_auto_burn_in_steps': n_burn,
+                    'lr_mult_auto_burn_in_steps_used': n_used,
+                }, allow_val_change=True)
+                wb_row = {f'lr_mult/{n}': float(m) for n, m in zip(param_names, lr_multipliers)}
+                wb_row['lr_mult/auto_median_abs_grad'] = med_abs
+                wb_row['lr_mult/auto_burn_in_steps'] = float(n_burn)
+                wb_row['lr_mult/auto_burn_in_steps_used'] = float(n_used)
+                for n, s in zip(param_names, sens_list):
+                    wb_row[f'lr_mult/auto_abs_grad/{n}'] = float(s)
+                _wandb.log(wb_row, step=0)
+    else:
+        lr_multipliers = parse_lr_multipliers(lr_spec, param_names)
+
+    if not want_auto and any(s != 1.0 for s in lr_multipliers):
         pairs = ', '.join(f'{n}×{s}' for n, s in zip(param_names, lr_multipliers) if s != 1.0)
         print(f'LR multipliers : {pairs}')
 
@@ -1458,7 +1673,6 @@ def main():
                                                   lr_multipliers=lr_multipliers)
 
     # ── Trials ────────────────────────────────────────────────────────────────
-    all_trials = []
     result = dict(
         param_names         = param_names,
         param_gts           = gt_vals,
@@ -1467,6 +1681,7 @@ def main():
         optimizer           = args.optimizer,
         lr                  = args.lr,
         lr_schedule         = args.lr_schedule,
+        effective_batch_size= args.effective_batch_size,
         max_steps           = args.max_steps,
         tol                 = args.tol,
         patience            = args.patience,
@@ -1485,7 +1700,10 @@ def main():
         trials              = all_trials,
         run_complete        = False,
         wandb_run_id        = wb_run_id_for_result,
+        lr_multipliers      = lr_multipliers,
     )
+    if lr_mult_auto_meta is not None:
+        result['lr_mult_auto_meta'] = lr_mult_auto_meta
     preemption_state['result'] = result
 
     # ── Intra-trial checkpoint ────────────────────────────────────────────────
@@ -1500,11 +1718,6 @@ def main():
             ckpt['frozen_mask'] = np.asarray(frozen_mask, dtype=bool).tolist()
         result['live_checkpoint'] = ckpt
         _safe_pickle_dump(output_path, result)
-
-    # Pre-populate completed trials from a prior (preempted) run.
-    if existing_result:
-        all_trials.extend(existing_result['trials'])
-    live_ckpt = (existing_result or {}).get('live_checkpoint')
 
     cumulative_steps   = 0
     last_save_at_step  = 0
@@ -1542,6 +1755,7 @@ def main():
             initial_opt_state=init_opt_state,
             start_step=start_step,
             wandb_track_batch_groups=(wandb_track_batch_groups if log_track_losses_wandb else None),
+            effective_batch_size=args.effective_batch_size,
             tol_per_param=(args.tol_per_param if freeze_params_enabled else None),
             patience_per_param=(
                 args.patience_per_param if freeze_params_enabled else None),
