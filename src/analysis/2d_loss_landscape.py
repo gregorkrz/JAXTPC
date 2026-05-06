@@ -1,18 +1,22 @@
 #!/usr/bin/env python
 """
-Compute and plot the loss landscape over a 2-D grid of
-(recomb_alpha, recomb_beta_90) values.
+Compute and plot the loss landscape over a 2-D grid of two SimParams scalars.
 
-Grid is defined relative to GT values:
-    alpha    in [gt * (1 - range_frac), gt * (1 + range_frac)]
-    beta_90  in [gt * (1 - range_frac), gt * (1 + range_frac)]
+Default axes are (recomb_alpha, recomb_beta_90).  Use --param-y and --param-x to
+sweep any distinct pair accepted by 2d_opt.py (e.g. velocity_cm_us + lifetime_us).
 
-Optionally overlays optimization trajectories from 2d_opt.py pkl files.
+Grid limits: --range-frac around each GT value, or --range-y / --range-x MIN MAX,
+or (legacy) --alpha-range / --beta-range when the corresponding default recomb
+parameter is on that axis.
+
+Optionally overlays optimization trajectories from 2d_opt.py pkl files
+(recomb_alpha + recomb_beta_90 only).
 
 Usage
 -----
     python 2d_loss_landscape.py
     python 2d_loss_landscape.py --grid 20 --range-frac 0.2
+    python 2d_loss_landscape.py --param-y velocity_cm_us --param-x lifetime_us
     python 2d_loss_landscape.py --loss sobolev_loss --overlay results/2d_opt
     python 2d_loss_landscape.py --load-pkl results/2d_landscape/landscape_sobolev_loss_diagonal_10x10.pkl
 """
@@ -23,9 +27,19 @@ from dotenv import load_dotenv
 load_dotenv()
 
 import argparse
+import importlib.util
 import os
 import pickle
 import time
+
+# 2d_opt.py is not a valid module name; load by path for param helpers.
+_2d_opt_path = os.path.join(os.path.dirname(__file__), '..', 'opt', '2d_opt.py')
+_spec = importlib.util.spec_from_file_location('jaxtpc_2d_opt', _2d_opt_path)
+_2d_opt = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_2d_opt)
+_get_gt_val = _2d_opt._get_gt_val
+_apply_param = _2d_opt._apply_param
+VALID_PARAMS = _2d_opt.VALID_PARAMS
 
 import jax
 import jax.numpy as jnp
@@ -50,11 +64,6 @@ N_SEGMENTS         = 50_000
 MAX_ACTIVE_BUCKETS = 1000
 #DETECTOR_BOUNDS_MM = ((-300, 300), (-300, 300), (-300, 300))
 
-TYPICAL_SCALES = {
-    'recomb_alpha':   1.0,
-    'recomb_beta_90': 0.2,
-}
-
 _JAX_CACHE_DIR = os.environ.get('JAX_COMPILATION_CACHE_DIR',
                                 os.path.expanduser('~/.cache/jax_compilation_cache'))
 jax.config.update('jax_compilation_cache_dir', _JAX_CACHE_DIR)
@@ -71,6 +80,17 @@ LOSS_LABELS = {
     'l1_loss':                    'L1',
 }
 
+PARAM_LABELS = {
+    'velocity_cm_us':         'drift velocity  (cm/μs)',
+    'lifetime_us':            'electron lifetime  (μs)',
+    'diffusion_trans_cm2_us': 'transverse diffusion  (cm²/μs)',
+    'diffusion_long_cm2_us':  'longitudinal diffusion  (cm²/μs)',
+    'recomb_alpha':           'recombination α',
+    'recomb_beta':            'recombination β',
+    'recomb_beta_90':         'recombination β₉₀',
+    'recomb_R':               'recombination R',
+}
+
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
@@ -81,10 +101,18 @@ def parse_args():
                    help='Grid resolution N: evaluates N×N points (default: 10)')
     p.add_argument('--range-frac', type=float, default=0.15,
                    help='Fractional range around GT on each axis (default: 0.15 → ±15%%)')
+    p.add_argument('--param-y', default='recomb_alpha',
+                   help='Y-axis (row) parameter name (default: recomb_alpha)')
+    p.add_argument('--param-x', default='recomb_beta_90',
+                   help='X-axis (column) parameter name (default: recomb_beta_90)')
+    p.add_argument('--range-y', type=float, nargs=2, metavar=('MIN', 'MAX'), default=None,
+                   help='Explicit Y-axis limits (overrides --range-frac for param-y)')
+    p.add_argument('--range-x', type=float, nargs=2, metavar=('MIN', 'MAX'), default=None,
+                   help='Explicit X-axis limits (overrides --range-frac for param-x)')
     p.add_argument('--alpha-range', type=float, nargs=2, metavar=('MIN', 'MAX'),
-                   help='Explicit alpha limits, e.g. --alpha-range 0.89 0.92 (overrides --range-frac for alpha)')
+                   help='Explicit alpha limits when --param-y is recomb_alpha (legacy)')
     p.add_argument('--beta-range', type=float, nargs=2, metavar=('MIN', 'MAX'),
-                   help='Explicit beta_90 limits, e.g. --beta-range 0.19 0.22 (overrides --range-frac for beta)')
+                   help='Explicit beta_90 limits when --param-x is recomb_beta_90 (legacy)')
     p.add_argument('--loss', default='sobolev_loss,sobolev_loss_geomean_log1p',
                    help='Comma-separated loss(es) to evaluate (default: both Sobolev)')
     p.add_argument('--track-name', default='diagonal',
@@ -112,72 +140,101 @@ def parse_args():
 
 # ── Loss evaluation ────────────────────────────────────────────────────────────
 
-def make_loss_fn(loss_name, simulator, deposits, gt_arrays, weights, gt_params):
-    rp = gt_params.recomb_params
-
-    def fwd(alpha, beta_90):
-        new_rp = rp._replace(alpha=alpha, beta_90=beta_90)
-        params  = gt_params._replace(recomb_params=new_rp)
-        return simulator.forward(params, deposits)
+def make_loss_fn(loss_name, simulator, deposits, gt_arrays, weights, gt_params,
+                 param_y, param_x):
+    def fwd(vy, vx):
+        p = _apply_param(param_y, vy, gt_params)
+        p = _apply_param(param_x, vx, p)
+        return simulator.forward(p, deposits)
 
     if loss_name == 'sobolev_loss':
-        def fn(alpha, beta_90):
-            return sobolev_loss(fwd(alpha, beta_90), gt_arrays, weights)
+        def fn(vy, vx):
+            return sobolev_loss(fwd(vy, vx), gt_arrays, weights)
     elif loss_name == 'sobolev_loss_geomean_log1p':
-        def fn(alpha, beta_90):
-            return sobolev_loss_geomean_log1p(fwd(alpha, beta_90), gt_arrays, weights)
+        def fn(vy, vx):
+            return sobolev_loss_geomean_log1p(fwd(vy, vx), gt_arrays, weights)
     elif loss_name == 'mse_loss':
-        def fn(alpha, beta_90):
-            return mse_loss(fwd(alpha, beta_90), gt_arrays)
+        def fn(vy, vx):
+            return mse_loss(fwd(vy, vx), gt_arrays)
     elif loss_name == 'l1_loss':
-        def fn(alpha, beta_90):
-            return l1_loss(fwd(alpha, beta_90), gt_arrays)
+        def fn(vy, vx):
+            return l1_loss(fwd(vy, vx), gt_arrays)
     else:
         raise ValueError(f'Unknown loss {loss_name!r}')
 
     return jax.jit(fn)
 
 
-def evaluate_grid(loss_fn, alpha_vals, beta_90_vals, compute_gradients=False):
-    """Evaluate loss_fn on all (alpha, beta_90) grid points.
+def evaluate_grid(loss_fn, vals_y, vals_x, param_y, param_x, compute_gradients=False):
+    """Evaluate loss_fn on all (param_y, param_x) grid points.
 
     Returns grid (N, M) always.  With compute_gradients=True also returns
-    grad_alpha (N, M) and grad_beta90 (N, M).
+    ∂L/∂param_y and ∂L/∂param_x as (N, M) arrays.
     """
-    N, M = len(alpha_vals), len(beta_90_vals)
-    grid       = np.zeros((N, M), dtype=np.float32)
-    grad_alpha  = np.zeros((N, M), dtype=np.float32) if compute_gradients else None
-    grad_beta90 = np.zeros((N, M), dtype=np.float32) if compute_gradients else None
+    N, M = len(vals_y), len(vals_x)
+    grid = np.zeros((N, M), dtype=np.float32)
+    grad_y = np.zeros((N, M), dtype=np.float32) if compute_gradients else None
+    grad_x = np.zeros((N, M), dtype=np.float32) if compute_gradients else None
     total = N * M
 
     if compute_gradients:
         val_and_grad_fn = jax.jit(jax.value_and_grad(loss_fn, argnums=(0, 1)))
 
-    for i, a in enumerate(alpha_vals):
-        for j, b in enumerate(beta_90_vals):
-            a_jax = jnp.array(a, dtype=jnp.float32)
-            b_jax = jnp.array(b, dtype=jnp.float32)
+    for i, vy in enumerate(vals_y):
+        for j, vx in enumerate(vals_x):
+            vy_j = jnp.array(vy, dtype=jnp.float32)
+            vx_j = jnp.array(vx, dtype=jnp.float32)
             if compute_gradients:
-                (lv, (ga, gb)) = val_and_grad_fn(a_jax, b_jax)
-                jax.block_until_ready((lv, ga, gb))
-                grad_alpha[i, j]  = float(ga)
-                grad_beta90[i, j] = float(gb)
+                (lv, (gy, gx)) = val_and_grad_fn(vy_j, vx_j)
+                jax.block_until_ready((lv, gy, gx))
+                grad_y[i, j] = float(gy)
+                grad_x[i, j] = float(gx)
             else:
-                lv = loss_fn(a_jax, b_jax)
+                lv = loss_fn(vy_j, vx_j)
                 jax.block_until_ready(lv)
             grid[i, j] = float(lv)
             done = i * M + j + 1
-            grad_str = (f'  dα={float(ga):.3e}  dβ={float(gb):.3e}'
+            grad_str = (f'  d{param_y}={float(gy):.3e}  d{param_x}={float(gx):.3e}'
                         if compute_gradients else '')
-            print(f'  [{done:4d}/{total}]  alpha={a:.4f}  beta_90={b:.4f}'
+            print(f'  [{done:4d}/{total}]  {param_y}={vy:.6g}  {param_x}={vx:.6g}'
                   f'  loss={float(lv):.4e}{grad_str}', flush=True)
 
     if compute_gradients:
-        return grid, grad_alpha, grad_beta90
+        return grid, grad_y, grad_x
     return grid
 
 
 # ── Plotting ───────────────────────────────────────────────────────────────────
+
+def _landscape_axes(landscape):
+    """Normalize axis metadata for old pkls (α/β only) and new generic pair pkls."""
+    py = landscape.get('param_y', 'recomb_alpha')
+    px = landscape.get('param_x', 'recomb_beta_90')
+    vals_y = np.array(landscape.get('vals_y', landscape['alpha_vals']))
+    vals_x = np.array(landscape.get('vals_x', landscape['beta90_vals']))
+    gt_y = float(landscape.get('gt_param_y', landscape['gt_alpha']))
+    gt_x = float(landscape.get('gt_param_x', landscape['gt_beta90']))
+    grad_y = landscape.get('grad_param_y')
+    grad_x = landscape.get('grad_param_x')
+    if grad_y is None and 'grad_alpha' in landscape:
+        grad_y = landscape['grad_alpha']
+    if grad_x is None and 'grad_beta90' in landscape:
+        grad_x = landscape['grad_beta90']
+    # PKLs and in-memory dicts store these as nested lists; plotting needs ndarray ops.
+    if grad_y is not None:
+        grad_y = np.asarray(grad_y, dtype=np.float64)
+    if grad_x is not None:
+        grad_x = np.asarray(grad_x, dtype=np.float64)
+    return py, px, vals_y, vals_x, gt_y, gt_x, grad_y, grad_x
+
+
+def _pair_file_suffix(landscape):
+    py = landscape.get('param_y', 'recomb_alpha')
+    px = landscape.get('param_x', 'recomb_beta_90')
+    if py == 'recomb_alpha' and px == 'recomb_beta_90':
+        return ''
+    return f'_{py}__{px}'
+
 
 def _load_overlay_trajectories(overlay_dir, loss_name, track_name):
     """Load matching 2d_opt pkl trajectories for overlay."""
@@ -203,11 +260,10 @@ def plot_landscape_plotly(landscape, output_dir):
 
     loss_name   = landscape['loss_name']
     track_name  = landscape['track_name']
-    alpha_vals  = np.array(landscape['alpha_vals'])
-    beta90_vals = np.array(landscape['beta90_vals'])
+    param_y, param_x, vals_y, vals_x, gt_y, gt_x, grad_y, grad_x = _landscape_axes(landscape)
+    lbl_y = PARAM_LABELS.get(param_y, param_y)
+    lbl_x = PARAM_LABELS.get(param_x, param_x)
     grid        = np.array(landscape['grid'])
-    gt_alpha    = landscape['gt_alpha']
-    gt_beta90   = landscape['gt_beta90']
     direction   = landscape['direction']
     mom_mev     = landscape['momentum_mev']
     grid_size   = landscape['grid_size']
@@ -218,23 +274,20 @@ def plot_landscape_plotly(landscape, output_dir):
     vmin = np.nanpercentile(grid, 2)
     vmax = np.nanpercentile(grid, 98)
 
-    grad_alpha  = np.array(landscape['grad_alpha'])  if 'grad_alpha'  in landscape else None
-    grad_beta90 = np.array(landscape['grad_beta90']) if 'grad_beta90' in landscape else None
-
     # Build hover text
     def _hover(i, j):
-        s = f'α={alpha_vals[i]:.5f}<br>β₉₀={beta90_vals[j]:.5f}<br>loss={grid[i,j]:.4e}'
-        if grad_alpha is not None:
-            s += (f'<br>∂L/∂α={grad_alpha[i,j]:.3e}'
-                  f'<br>∂L/∂β₉₀={grad_beta90[i,j]:.3e}')
+        s = (f'{param_y}={vals_y[i]:.5g}<br>{param_x}={vals_x[j]:.5g}<br>loss={grid[i,j]:.4e}')
+        if grad_y is not None:
+            s += (f'<br>∂L/∂{param_y}={grad_y[i,j]:.3e}'
+                  f'<br>∂L/∂{param_x}={grad_x[i,j]:.3e}')
         return s
 
-    hover = np.array([[_hover(i, j) for j in range(len(beta90_vals))]
-                      for i in range(len(alpha_vals))])
+    hover = np.array([[_hover(i, j) for j in range(len(vals_x))]
+                      for i in range(len(vals_y))])
 
     heatmap = go.Heatmap(
-        x=beta90_vals.tolist(),
-        y=alpha_vals.tolist(),
+        x=vals_x.tolist(),
+        y=vals_y.tolist(),
         z=grid.tolist(),
         text=hover.tolist(),
         hovertemplate='%{text}<extra></extra>',
@@ -247,11 +300,11 @@ def plot_landscape_plotly(landscape, output_dir):
     )
 
     gt_marker = go.Scatter(
-        x=[gt_beta90], y=[gt_alpha],
+        x=[gt_x], y=[gt_y],
         mode='markers',
         marker=dict(symbol='star', size=14, color='red'),
-        name=f'GT  (α={gt_alpha:.4g}, β₉₀={gt_beta90:.4g})',
-        hovertemplate=f'GT<br>α={gt_alpha:.6g}<br>β₉₀={gt_beta90:.6g}<extra></extra>',
+        name=f'GT  ({param_y}={gt_y:.4g}, {param_x}={gt_x:.4g})',
+        hovertemplate=(f'GT<br>{param_y}={gt_y:.6g}<br>{param_x}={gt_x:.6g}<extra></extra>'),
     )
 
     title = (f'Loss landscape | {loss_label} | track: {track_name} '
@@ -260,17 +313,17 @@ def plot_landscape_plotly(landscape, output_dir):
 
     traces = [heatmap, gt_marker]
 
-    if grad_alpha is not None:
+    if grad_y is not None:
         # Subsample to avoid clutter: aim for ~20×20 arrows max
-        step = max(1, len(alpha_vals) // 20)
-        da = grad_alpha[::step, ::step]
-        db = grad_beta90[::step, ::step]
-        aa = alpha_vals[::step]
-        bb = beta90_vals[::step]
+        step = max(1, len(vals_y) // 20)
+        da = grad_y[::step, ::step]
+        db = grad_x[::step, ::step]
+        aa = vals_y[::step]
+        bb = vals_x[::step]
         # Normalise arrow lengths to a fixed fraction of the axis range
         mag = np.sqrt(da**2 + db**2) + 1e-30
-        scale_a  = (alpha_vals[-1]  - alpha_vals[0])  * 0.03
-        scale_b  = (beta90_vals[-1] - beta90_vals[0]) * 0.03
+        scale_a  = (vals_y[-1]  - vals_y[0])  * 0.03
+        scale_b  = (vals_x[-1] - vals_x[0]) * 0.03
         ua = -da / mag * scale_a   # descent direction
         ub = -db / mag * scale_b
         # One Scatter trace per arrow (x=[tail, head, None], y=[tail, head, None])
@@ -291,8 +344,8 @@ def plot_landscape_plotly(landscape, output_dir):
     fig = go.Figure(data=traces)
     fig.update_layout(
         title=dict(text=title, font=dict(size=12)),
-        xaxis=dict(title='recomb β₉₀'),
-        yaxis=dict(title='recomb α'),
+        xaxis=dict(title=lbl_x),
+        yaxis=dict(title=lbl_y),
         legend=dict(x=0.01, y=0.99),
         width=750, height=600,
     )
@@ -300,8 +353,9 @@ def plot_landscape_plotly(landscape, output_dir):
     noise_scale = landscape.get('noise_scale', 0.0)
     noise_tag   = f'_noise{noise_scale:.3g}'.replace('.', 'p') if noise_scale > 0.0 else ''
     mom_tag     = f'_T{mom_mev:.0f}MeV'
+    pair_slug   = _pair_file_suffix(landscape)
     os.makedirs(output_dir, exist_ok=True)
-    fname = f'landscape_{loss_name}_{track_name}{mom_tag}_{grid_size}x{grid_size}{noise_tag}.html'
+    fname = f'landscape_{loss_name}_{track_name}{mom_tag}{pair_slug}_{grid_size}x{grid_size}{noise_tag}.html'
     out_path = os.path.join(output_dir, fname)
     fig.write_html(out_path)
     print(f'  Saved: {out_path}')
@@ -311,11 +365,10 @@ def _plot_landscape_single(landscape, output_dir, overlay_dir, norm, log_scale):
     """Render one matplotlib landscape figure with the given norm."""
     loss_name   = landscape['loss_name']
     track_name  = landscape['track_name']
-    alpha_vals  = np.array(landscape['alpha_vals'])
-    beta90_vals = np.array(landscape['beta90_vals'])
+    param_y, param_x, vals_y, vals_x, gt_y, gt_x, grad_y, grad_x = _landscape_axes(landscape)
+    lbl_y = PARAM_LABELS.get(param_y, param_y)
+    lbl_x = PARAM_LABELS.get(param_x, param_x)
     grid        = np.array(landscape['grid'])
-    gt_alpha    = landscape['gt_alpha']
-    gt_beta90   = landscape['gt_beta90']
     direction   = landscape['direction']
     mom_mev     = landscape['momentum_mev']
     grid_size   = landscape['grid_size']
@@ -325,45 +378,48 @@ def _plot_landscape_single(landscape, output_dir, overlay_dir, norm, log_scale):
 
     fig, ax = plt.subplots(figsize=(8, 6))
 
-    im = ax.pcolormesh(beta90_vals, alpha_vals, grid,
+    im = ax.pcolormesh(vals_x, vals_y, grid,
                        norm=norm, cmap='viridis', shading='auto')
     cbar = fig.colorbar(im, ax=ax)
     scale_tag = ' (log)' if log_scale else ''
     cbar.set_label(f'{loss_label}{scale_tag}', fontsize=9)
 
     try:
-        ax.contour(beta90_vals, alpha_vals, grid, levels=12,
+        ax.contour(vals_x, vals_y, grid, levels=12,
                    colors='white', linewidths=0.5, alpha=0.4,
                    norm=norm)
     except Exception:
         pass
 
-    if 'grad_alpha' in landscape and 'grad_beta90' in landscape:
-        ga = np.array(landscape['grad_alpha'])
-        gb = np.array(landscape['grad_beta90'])
-        span_a = alpha_vals[-1]  - alpha_vals[0]  or 1.0
-        span_b = beta90_vals[-1] - beta90_vals[0] or 1.0
+    if grad_y is not None:
+        ga = grad_y
+        gb = grad_x
+        span_a = vals_y[-1]  - vals_y[0]  or 1.0
+        span_b = vals_x[-1] - vals_x[0] or 1.0
         u = -gb / span_b
         v = -ga / span_a
-        ax.streamplot(beta90_vals, alpha_vals, u, v,
+        ax.streamplot(vals_x, vals_y, u, v,
                       color='white', linewidth=0.8, arrowsize=1.2,
                       density=1.2, minlength=0.05, zorder=3)
 
-    ax.plot(gt_beta90, gt_alpha, '*', color='red', ms=14, zorder=5,
-            label=f'GT  (α={gt_alpha:.4g}, β₉₀={gt_beta90:.4g})')
+    ax.plot(gt_x, gt_y, '*', color='red', ms=14, zorder=5,
+            label=f'GT  ({param_y}={gt_y:.4g}, {param_x}={gt_x:.4g})')
 
     if overlay_dir is not None:
-        trajs = _load_overlay_trajectories(overlay_dir, loss_name, track_name)
-        for k, traj in enumerate(trajs):
-            label = 'opt trajectories' if k == 0 else None
-            ax.plot(traj[:, 1], traj[:, 0], lw=0.8, alpha=0.5, color='cyan', label=label)
-            ax.plot(traj[0, 1], traj[0, 0], 'o', color='cyan', ms=3, alpha=0.7)
-            ax.annotate('', xy=(traj[-1, 1], traj[-1, 0]),
-                        xytext=(traj[-2, 1], traj[-2, 0]),
-                        arrowprops=dict(arrowstyle='->', color='cyan', lw=0.8))
+        if param_y == 'recomb_alpha' and param_x == 'recomb_beta_90':
+            trajs = _load_overlay_trajectories(overlay_dir, loss_name, track_name)
+            for k, traj in enumerate(trajs):
+                label = 'opt trajectories' if k == 0 else None
+                ax.plot(traj[:, 1], traj[:, 0], lw=0.8, alpha=0.5, color='cyan', label=label)
+                ax.plot(traj[0, 1], traj[0, 0], 'o', color='cyan', ms=3, alpha=0.7)
+                ax.annotate('', xy=(traj[-1, 1], traj[-1, 0]),
+                            xytext=(traj[-2, 1], traj[-2, 0]),
+                            arrowprops=dict(arrowstyle='->', color='cyan', lw=0.8))
+        else:
+            print('  (overlay skipped: trajectories only for recomb_alpha + recomb_beta_90)')
 
-    ax.set_xlabel('recomb β₉₀', fontsize=10)
-    ax.set_ylabel('recomb α', fontsize=10)
+    ax.set_xlabel(lbl_x, fontsize=10)
+    ax.set_ylabel(lbl_y, fontsize=10)
     title_scale = '  [log color scale]' if log_scale else ''
     ax.set_title(
         f'Loss landscape  |  {loss_label}  |  track: {track_name}  '
@@ -378,8 +434,9 @@ def _plot_landscape_single(landscape, output_dir, overlay_dir, norm, log_scale):
     noise_tag   = f'_noise{noise_scale:.3g}'.replace('.', 'p') if noise_scale > 0.0 else ''
     log_suffix  = '_log' if log_scale else ''
     mom_tag     = f'_T{mom_mev:.0f}MeV'
+    pair_slug   = _pair_file_suffix(landscape)
     os.makedirs(output_dir, exist_ok=True)
-    fname = f'landscape_{loss_name}_{track_name}{mom_tag}_{grid_size}x{grid_size}{noise_tag}{log_suffix}.pdf'
+    fname = f'landscape_{loss_name}_{track_name}{mom_tag}{pair_slug}_{grid_size}x{grid_size}{noise_tag}{log_suffix}.pdf'
     out_path = os.path.join(output_dir, fname)
     fig.savefig(out_path, bbox_inches='tight')
     plt.close(fig)
@@ -435,6 +492,12 @@ def main():
     for name in loss_names:
         if name not in VALID_LOSSES:
             raise ValueError(f'Unknown loss {name!r}')
+    if args.param_y not in VALID_PARAMS or args.param_x not in VALID_PARAMS:
+        raise ValueError(
+            f'Unknown param. Choose from {VALID_PARAMS!r}; got '
+            f'{args.param_y!r}, {args.param_x!r}')
+    if args.param_y == args.param_x:
+        raise ValueError('--param-y and --param-x must differ')
 
     os.makedirs(args.results_dir, exist_ok=True)
 
@@ -450,6 +513,7 @@ def main():
     # ── Build simulator ────────────────────────────────────────────────────────
     print(f'JAX devices : {jax.devices()}')
     print(f'Grid        : {args.grid}×{args.grid}  range ±{args.range_frac*100:.0f}%')
+    print(f'Axes        : Y={args.param_y}  X={args.param_x}')
     print(f'Losses      : {loss_names}')
     print(f'Track       : {args.track_name}  direction={direction}')
 
@@ -494,9 +558,10 @@ def main():
         velocity_cm_us = jnp.array(GT_VELOCITY_CM_US),
     )
 
-    gt_alpha  = float(gt_params.recomb_params.alpha)
-    gt_beta90 = float(gt_params.recomb_params.beta_90)
-    print(f'GT  alpha={gt_alpha:.6g}  beta_90={gt_beta90:.6g}')
+    recomb_model = simulator.recomb_model
+    gt_y = _get_gt_val(args.param_y, gt_params, recomb_model)
+    gt_x = _get_gt_val(args.param_x, gt_params, recomb_model)
+    print(f'GT  {args.param_y}={gt_y:.6g}  {args.param_x}={gt_x:.6g}')
 
     print('Computing GT forward pass...')
     t0 = time.time()
@@ -522,14 +587,27 @@ def main():
 
     # ── Grid ──────────────────────────────────────────────────────────────────
     N = args.grid
-    f = args.range_frac
-    a_lo, a_hi = args.alpha_range if args.alpha_range else (gt_alpha  * (1 - f), gt_alpha  * (1 + f))
-    b_lo, b_hi = args.beta_range  if args.beta_range  else (gt_beta90 * (1 - f), gt_beta90 * (1 + f))
-    alpha_vals  = np.linspace(a_lo, a_hi, N)
-    beta90_vals = np.linspace(b_lo, b_hi, N)
+    rf = args.range_frac
+    if args.range_y is not None:
+        y_lo, y_hi = args.range_y
+    elif args.alpha_range is not None and args.param_y == 'recomb_alpha':
+        y_lo, y_hi = args.alpha_range
+    else:
+        y_lo, y_hi = gt_y * (1 - rf), gt_y * (1 + rf)
+    if args.range_x is not None:
+        x_lo, x_hi = args.range_x
+    elif args.beta_range is not None and args.param_x == 'recomb_beta_90':
+        x_lo, x_hi = args.beta_range
+    else:
+        x_lo, x_hi = gt_x * (1 - rf), gt_x * (1 + rf)
+    vals_y = np.linspace(y_lo, y_hi, N)
+    vals_x = np.linspace(x_lo, x_hi, N)
 
-    # range_frac stored in pkl is approximate when explicit limits are used
-    f = max(abs(a_hi - gt_alpha) / gt_alpha, abs(b_hi - gt_beta90) / gt_beta90)
+    # approximate relative span (for plot subtitles)
+    f = max(
+        abs(y_hi - gt_y) / max(abs(gt_y), 1e-30),
+        abs(x_hi - gt_x) / max(abs(gt_x), 1e-30),
+    )
 
     # ── Loop over losses ───────────────────────────────────────────────────────
     for loss_name in loss_names:
@@ -537,28 +615,31 @@ def main():
         print(f'  Loss: {loss_name}')
         print(f'{"#" * 60}')
 
-        loss_fn = make_loss_fn(loss_name, simulator, deposits, gt_arrays, weights, gt_params)
+        loss_fn = make_loss_fn(
+            loss_name, simulator, deposits, gt_arrays, weights, gt_params,
+            args.param_y, args.param_x)
 
         # Warm up
         print('  Compiling loss fn...')
         t0 = time.time()
-        _ = loss_fn(jnp.array(gt_alpha, dtype=jnp.float32),
-                    jnp.array(gt_beta90, dtype=jnp.float32))
+        gy = jnp.array(gt_y, dtype=jnp.float32)
+        gx = jnp.array(gt_x, dtype=jnp.float32)
+        _ = loss_fn(gy, gx)
         jax.block_until_ready(_)
-        _ = loss_fn(jnp.array(gt_alpha, dtype=jnp.float32),
-                    jnp.array(gt_beta90, dtype=jnp.float32))
+        _ = loss_fn(gy, gx)
         jax.block_until_ready(_)
         print(f'  Done ({time.time() - t0:.1f} s)')
 
         print(f'  Evaluating {N}×{N} grid ({N*N} points)'
               f'{"  + gradients" if args.gradients else ""}...')
         t0 = time.time()
-        result = evaluate_grid(loss_fn, alpha_vals, beta90_vals,
-                               compute_gradients=args.gradients)
+        result = evaluate_grid(
+            loss_fn, vals_y, vals_x, args.param_y, args.param_x,
+            compute_gradients=args.gradients)
         print(f'  Grid done in {time.time() - t0:.1f} s')
 
         if args.gradients:
-            grid, grad_alpha_grid, grad_beta90_grid = result
+            grid, grad_y_grid, grad_x_grid = result
         else:
             grid = result
 
@@ -570,19 +651,32 @@ def main():
             momentum_mev = args.momentum,
             grid_size    = N,
             range_frac   = f,
-            gt_alpha     = gt_alpha,
-            gt_beta90    = gt_beta90,
-            alpha_vals   = alpha_vals.tolist(),
-            beta90_vals  = beta90_vals.tolist(),
+            param_y      = args.param_y,
+            param_x      = args.param_x,
+            gt_param_y   = gt_y,
+            gt_param_x   = gt_x,
+            vals_y       = vals_y.tolist(),
+            vals_x       = vals_x.tolist(),
+            gt_alpha     = float(gt_y),
+            gt_beta90    = float(gt_x),
+            alpha_vals   = vals_y.tolist(),
+            beta90_vals  = vals_x.tolist(),
             grid         = grid.tolist(),
             noise_scale  = args.noise_scale,
             noise_seed   = args.noise_seed,
         )
         if args.gradients:
-            landscape['grad_alpha']  = grad_alpha_grid.tolist()
-            landscape['grad_beta90'] = grad_beta90_grid.tolist()
+            landscape['grad_param_y'] = grad_y_grid.tolist()
+            landscape['grad_param_x'] = grad_x_grid.tolist()
+            landscape['grad_alpha']   = grad_y_grid.tolist()
+            landscape['grad_beta90']  = grad_x_grid.tolist()
 
-        pkl_name = f'landscape_{loss_name}_{args.track_name}_T{args.momentum:.0f}MeV_{N}x{N}{noise_tag}.pkl'
+        if args.param_y == 'recomb_alpha' and args.param_x == 'recomb_beta_90':
+            pkl_name = f'landscape_{loss_name}_{args.track_name}_T{args.momentum:.0f}MeV_{N}x{N}{noise_tag}.pkl'
+        else:
+            pair_tag = f'{args.param_y}__{args.param_x}'
+            pkl_name = (f'landscape_{loss_name}_{args.track_name}_T{args.momentum:.0f}MeV_'
+                        f'{pair_tag}_{N}x{N}{noise_tag}.pkl')
         pkl_path = os.path.join(args.results_dir, pkl_name)
         with open(pkl_path, 'wb') as f_out:
             pickle.dump(landscape, f_out)

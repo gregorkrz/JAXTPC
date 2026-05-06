@@ -1,0 +1,22 @@
+# 2-D loss landscapes: velocity_cm_us (Y axis) vs every other EMB parameter (X axis).
+# Six grids total, spread 2+2+1+1 across four GPUs (perlmutter_run.py plan file).
+#
+# Each job: diagonal_100 MeV track, Sobolev geomean log1p, 20×20 grid, ±3% around GT,
+# gradients on.  PKLs/plots land under $RESULTS_DIR/2d_landscape/velocity_vs_params/
+#
+# Requires generalized axes in src/analysis/2d_loss_landscape.py (--param-y / --param-x).
+
+time_limit: "02:00:00"
+command_timeout: 50
+
+gpus:
+  0:
+    - python src/analysis/2d_loss_landscape.py --param-y velocity_cm_us --param-x lifetime_us --track-name diagonal_100MeV --direction 1,1,1 --momentum 100.0 --grid 20 --range-frac 0.03 --loss sobolev_loss_geomean_log1p --gradients --results-dir $RESULTS_DIR/2d_landscape/velocity_vs_params
+    - python src/analysis/2d_loss_landscape.py --param-y velocity_cm_us --param-x diffusion_trans_cm2_us --track-name diagonal_100MeV --direction 1,1,1 --momentum 100.0 --grid 20 --range-frac 0.03 --loss sobolev_loss_geomean_log1p --gradients --results-dir $RESULTS_DIR/2d_landscape/velocity_vs_params
+  1:
+    - python src/analysis/2d_loss_landscape.py --param-y velocity_cm_us --param-x diffusion_long_cm2_us --track-name diagonal_100MeV --direction 1,1,1 --momentum 100.0 --grid 20 --range-frac 0.03 --loss sobolev_loss_geomean_log1p --gradients --results-dir $RESULTS_DIR/2d_landscape/velocity_vs_params
+    - python src/analysis/2d_loss_landscape.py --param-y velocity_cm_us --param-x recomb_alpha --track-name diagonal_100MeV --direction 1,1,1 --momentum 100.0 --grid 20 --range-frac 0.03 --loss sobolev_loss_geomean_log1p --gradients --results-dir $RESULTS_DIR/2d_landscape/velocity_vs_params
+  2:
+    - python src/analysis/2d_loss_landscape.py --param-y velocity_cm_us --param-x recomb_beta_90 --track-name diagonal_100MeV --direction 1,1,1 --momentum 100.0 --grid 20 --range-frac 0.03 --loss sobolev_loss_geomean_log1p --gradients --results-dir $RESULTS_DIR/2d_landscape/velocity_vs_params
+  3:
+    - python src/analysis/2d_loss_landscape.py --param-y velocity_cm_us --param-x recomb_R --track-name diagonal_100MeV --direction 1,1,1 --momentum 100.0 --grid 20 --range-frac 0.03 --loss sobolev_loss_geomean_log1p --gradients --results-dir $RESULTS_DIR/2d_landscape/velocity_vs_params
