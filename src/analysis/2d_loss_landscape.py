@@ -141,6 +141,8 @@ def parse_args():
     p.add_argument('--output-pkl', default=None,
                    help='Explicit path for the landscape pickle (parent dirs created); '
                         'overrides default filename in --results-dir')
+    p.add_argument('--no-plots', action='store_true',
+                   help='Skip figure exports (matplotlib + optional Plotly); write pkl only')
     return p.parse_args()
 
 

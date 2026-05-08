@@ -2,18 +2,17 @@
 """
 3-D energy-deposit (dE) visualizations and 2-D wire-plane GT signals.
 
-**Default:** 12 random muons ``Muon1_{T}MeV``, … (``T`` ∈ {100, 500, 1000} MeV)
-plus one fixed **Muon_diagCross_1000MeV** (1000 MeV: start (2000,2000,2000) mm,
-direction toward (-2000,-2000,-2000) mm). Random tracks are reproducible via
-``--seed``. Override with ``--tracks`` (``+``-separated ``name:dx,dy,dz:T`` specs)
-or ``--start-position-mm`` for one vertex shared by all tracks.
+**Default:** 12 random muons ``Muon1_{T}MeV``, … plus **three** fixed 1000 MeV chords across
+East+West: **Muon_diagCross_1000MeV** ((2000,2000,2000) mm toward (‑2000)³ mm),
+**Muon_throughEw_skew02_1000MeV**, and **Muon_throughWe_skew03_1000MeV**
+(oblique headings through both drift volumes).
 
 Outputs
 -------
   • One Plotly HTML per track: semi-transparent active-volume boxes from config
     plus 3-D scatter of segment positions coloured by dE (shared dE colour scale
     across all HTML files).
-  • One PDF: N rows × 6 columns (default N=13) — rows are tracks, columns are
+  • One PDF: N rows × 6 columns (default N=15) — rows are tracks, columns are
     U1, V1, Y1, U2, V2, Y2 (GT forward response, electrons; shared symmetric
     colour scale across all panels).
   • ``track_catalog.pdf`` — table of track name, T (MeV), and (dx, dy, dz).
@@ -347,7 +346,8 @@ def parse_args():
     p.add_argument('--tracks', default=None,
                    help="If set: '+'-separated name:dx,dy,dz:T specs. "
                         f'If omitted: {N_DEFAULT_BOUNDARY_MUONS} random boundary muons '
-                        f'plus one diagonal cross at 1000 MeV (100/500/1000 MeV random part, --seed).')
+                        f'plus three fixed 1000 MeV chords through East+West (random part '
+                        f'T ∈ {{100,500,1000}} MeV, --seed).')
     p.add_argument('--seed', type=int, default=42,
                    help='RNG seed for default random muons (default: 42)')
     p.add_argument('--signal-percentile', type=float, default=99.0,
@@ -387,7 +387,8 @@ def main():
     if args.tracks is None:
         specs = generate_random_boundary_tracks(
             cfg.volumes, n=N_DEFAULT_BOUNDARY_MUONS, seed=args.seed)
-        print(f'Default mode: {len(specs)} tracks ({N_DEFAULT_BOUNDARY_MUONS} random + diagonal cross, seed={args.seed})')
+        print(f'Default mode: {len(specs)} tracks ({N_DEFAULT_BOUNDARY_MUONS} random + '
+              f'3 fixed East–West chords, seed={args.seed})')
     else:
         specs = parse_mixed_tracks(args.tracks)
 

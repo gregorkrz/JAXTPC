@@ -7,16 +7,41 @@ from __future__ import annotations
 
 import numpy as np
 
-# Random x-face muons count; ``generate_random_boundary_tracks`` appends one fixed
-# diagonal cross-detector muon by default (total default tracks = this + 1).
+# Random x-face muons count. By default ``generate_random_boundary_tracks`` also adds
+# three fixed 1000 MeV chords through East+West (one body diagonal + two skew chords).
 N_DEFAULT_BOUNDARY_MUONS = 12
 _MIN_INWARD_DIR_DX = 0.12
 
-# Full-volume diagonal (1000 MeV): start at +++ corner mm, toward --- corner; direction (−1,−1,−1) normalized.
+# Full-volume body diagonal (1000 MeV).
 _DIAG_CROSS_START_MM = (2000.0, 2000.0, 2000.0)
 _DIAG_CROSS_END_MM = (-2000.0, -2000.0, -2000.0)
 
+# Two oblique chords: start mm, target mm defining unit velocity (cross cathode × both volumes).
+_FIXED_THROUGH_BOTH_CHORDS = (
+    ('Muon_throughEw_skew02_1000MeV',
+     (-2100.0, 750.0, -550.0),
+     (2100.0, -520.0, 420.0)),
+    ('Muon_throughWe_skew03_1000MeV',
+     (2100.0, -620.0, 480.0),
+     (-2100.0, 580.0, -490.0)),
+)
+
 _MUON_ENERGIES_MEV = (100, 500, 1000)
+
+
+def _balanced_boundary_energies_mev(rng, n: int) -> list[int]:
+    """Return ``n`` energies spread as evenly as possible across ``_MUON_ENERGIES_MEV``."""
+    if n < 0:
+        raise ValueError('n must be non-negative')
+    if n == 0:
+        return []
+    per_energy, remainder = divmod(n, len(_MUON_ENERGIES_MEV))
+    energies: list[int] = []
+    for i, t_mev in enumerate(sorted(_MUON_ENERGIES_MEV, reverse=True)):
+        count = per_energy + (1 if i < remainder else 0)
+        energies.extend([int(t_mev)] * count)
+    rng.shuffle(energies)
+    return energies
 
 
 def _inside_any_volume_mask(positions_mm, volumes) -> np.ndarray:
@@ -122,21 +147,39 @@ def _random_vertex_outer_x_face_mm(rng, volumes, start_side: str):
     return (x, y, z)
 
 
-def _diagonal_cross_detector_track():
-    """1000 MeV, unit direction from start toward (-2000,-2000,-2000) mm (body diagonal)."""
-    a = np.asarray(_DIAG_CROSS_START_MM, dtype=np.float64)
-    b = np.asarray(_DIAG_CROSS_END_MM, dtype=np.float64)
+def _fixed_chord_muon_track(name: str, start_mm, toward_mm, momentum_mev: float = 1000.0):
+    """Fixed T; unit ``direction`` points from ``start_mm`` toward ``toward_mm`` (mm)."""
+    a = np.asarray(start_mm, dtype=np.float64)
+    b = np.asarray(toward_mm, dtype=np.float64)
     v = b - a
     nrm = float(np.linalg.norm(v))
     if nrm < 1e-9:
-        raise ValueError('Diagonal cross track: zero length')
+        raise ValueError(f'Track {name!r}: zero chord length')
     u = v / nrm
     return dict(
-        name='Muon_diagCross_1000MeV',
+        name=name,
         direction=tuple(float(x) for x in u),
-        momentum_mev=1000.0,
+        momentum_mev=float(momentum_mev),
         start_position_mm=tuple(float(x) for x in a),
     )
+
+
+def _diagonal_cross_detector_track():
+    """1000 MeV body-diagonal chord (see ``_DIAG_CROSS_*`` constants)."""
+    return _fixed_chord_muon_track(
+        'Muon_diagCross_1000MeV',
+        _DIAG_CROSS_START_MM,
+        _DIAG_CROSS_END_MM,
+        momentum_mev=1000.0,
+    )
+
+
+def _oblique_through_both_volume_muons():
+    """Two 1000 MeV skew chords, East↔West, distinct from body diagonal."""
+    return [
+        _fixed_chord_muon_track(name, a, b, momentum_mev=1000.0)
+        for name, a, b in _FIXED_THROUGH_BOTH_CHORDS
+    ]
 
 
 def generate_random_boundary_tracks(
@@ -146,18 +189,27 @@ def generate_random_boundary_tracks(
     *,
     include_diagonal_cross_muon: bool = True,
 ):
-    """Generate ``n`` random boundary-start muon specs, optionally plus one fixed diagonal.
+    """Generate ``n`` random boundary-start muon specs, optionally plus three fixed chords.
 
-    The optional extra muon has T=1000 MeV, starts at (2000, 2000, 2000) mm and
-    travels along the body diagonal toward (-2000, -2000, -2000) mm (unit direction).
+    When ``include_diagonal_cross_muon`` is True, appends (1000 MeV each):
+
+      * ``Muon_diagCross_1000MeV``: (2000,2000,2000) mm toward (−2000,−2000,−2000) mm;
+      * ``Muon_throughEw_skew02_1000MeV`` — oblique chord from East side toward West;
+      * ``Muon_throughWe_skew03_1000MeV`` — oblique chord from West side toward East.
+
+    Each chord samples both drift volumes before energy loss terminates the propagated track
+    inside active LAr (see ``particle_generator.generate_muon_track`` + filtering).
 
     Returns list[dict] with keys:
       - name, direction, momentum_mev, start_position_mm
+
+    Random-track energies are balanced across ``(1000, 500, 100)`` as evenly as
+    possible (default ``n=12`` gives ``4`` tracks per energy).
     """
     rng = np.random.default_rng(seed)
     specs = []
-    for i in range(1, n + 1):
-        t_mev = int(rng.choice(_MUON_ENERGIES_MEV))
+    random_track_energies = _balanced_boundary_energies_mev(rng, n)
+    for i, t_mev in enumerate(random_track_energies, start=1):
         start_side = 'east' if rng.integers(0, 2) == 0 else 'west'
         start_mm = _random_vertex_outer_x_face_mm(rng, volumes, start_side)
         direction = _random_inward_direction(rng, start_side)
@@ -169,4 +221,5 @@ def generate_random_boundary_tracks(
         ))
     if include_diagonal_cross_muon:
         specs.append(_diagonal_cross_detector_track())
+        specs.extend(_oblique_through_both_volume_muons())
     return specs
