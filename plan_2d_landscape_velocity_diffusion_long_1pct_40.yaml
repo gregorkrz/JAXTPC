@@ -1,0 +1,12 @@
+# 2-D loss landscape: drift velocity vs longitudinal diffusion.
+# Grid 40×40, ±1% around GT on both axes (small patch for local curvature / coupling).
+#
+# Run on Perlmutter login node, e.g.:
+#   python perlmutter_run_local.py plan_2d_landscape_velocity_diffusion_long_1pct_40.yaml
+
+time_limit: "03:00:00"
+command_timeout: 90
+
+gpus:
+  0:
+    - python src/analysis/2d_loss_landscape.py --param-y velocity_cm_us --param-x diffusion_long_cm2_us --track-name diagonal_100MeV --direction 1,1,1 --momentum 100.0 --grid 40 --range-frac 0.01 --loss sobolev_loss_geomean_log1p --gradients --results-dir $RESULTS_DIR/2d_landscape/velocity_vs_diffusion_long_1pct_40

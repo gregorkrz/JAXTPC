@@ -48,7 +48,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
 from tools.geometry import generate_detector
-from tools.loader import build_deposit_data
+from tools.random_boundary_tracks import filter_track_inside_volumes
 from tools.losses import make_sobolev_weight, sobolev_loss, sobolev_loss_geomean_log1p, mse_loss, l1_loss
 from tools.noise import generate_noise
 from tools.particle_generator import generate_muon_track
@@ -135,6 +135,12 @@ def parse_args():
                         '0.0 = no noise (default), 1.0 = realistic noise.')
     p.add_argument('--noise-seed', type=int, default=0,
                    help='Seed for the noise draw (default: 0)')
+    p.add_argument('--start-position-mm', type=float, nargs=3, default=None,
+                   metavar=('X', 'Y', 'Z'),
+                   help='Muon vertex in mm (default: 0 0 0). Use with boundary tracks from launch_2d_landscape_pairs.')
+    p.add_argument('--output-pkl', default=None,
+                   help='Explicit path for the landscape pickle (parent dirs created); '
+                        'overrides default filename in --results-dir')
     return p.parse_args()
 
 
@@ -506,7 +512,8 @@ def main():
         print(f'Loading landscape from {args.load_pkl!r}')
         with open(args.load_pkl, 'rb') as f:
             landscape = pickle.load(f)
-        plot_landscape(landscape, args.results_dir, overlay_dir=args.overlay)
+        if not args.no_plots:
+            plot_landscape(landscape, args.results_dir, overlay_dir=args.overlay)
         print('Done.')
         return
 
@@ -515,7 +522,8 @@ def main():
     print(f'Grid        : {args.grid}×{args.grid}  range ±{args.range_frac*100:.0f}%')
     print(f'Axes        : Y={args.param_y}  X={args.param_x}')
     print(f'Losses      : {loss_names}')
-    print(f'Track       : {args.track_name}  direction={direction}')
+    print(f'Track       : {args.track_name}  direction={direction}  '
+          f'start_mm={tuple(args.start_position_mm) if args.start_position_mm is not None else (0.0, 0.0, 0.0)}')
 
     print('\nBuilding differentiable simulator...')
     detector_config = generate_detector(CONFIG_PATH)
@@ -532,15 +540,20 @@ def main():
         track_config=None,
     )
 
-    print(f'Generating muon track  direction={direction}  T={args.momentum} MeV...')
+    start_mm = (0.0, 0.0, 0.0)
+    if args.start_position_mm is not None:
+        start_mm = tuple(float(x) for x in args.start_position_mm)
+
+    print(f'Generating muon track  direction={direction}  T={args.momentum} MeV  start_mm={start_mm}...')
     track = generate_muon_track(
-        start_position_mm=(0.0, 0.0, 0.0),
+        start_position_mm=start_mm,
         direction=direction,
         kinetic_energy_mev=args.momentum,
         step_size_mm=0.1,
         track_id=1,
         #detector_bounds_mm=DETECTOR_BOUNDS_MM,
     )
+    track = filter_track_inside_volumes(track, simulator.config.volumes)
     deposits = build_deposit_data(
         track['position'], track['de'], track['dx'], simulator.config,
         theta=track['theta'], phi=track['phi'],
@@ -649,6 +662,7 @@ def main():
             track_name   = args.track_name,
             direction    = direction,
             momentum_mev = args.momentum,
+            start_position_mm = list(start_mm),
             grid_size    = N,
             range_frac   = f,
             param_y      = args.param_y,
@@ -671,18 +685,23 @@ def main():
             landscape['grad_alpha']   = grad_y_grid.tolist()
             landscape['grad_beta90']  = grad_x_grid.tolist()
 
-        if args.param_y == 'recomb_alpha' and args.param_x == 'recomb_beta_90':
-            pkl_name = f'landscape_{loss_name}_{args.track_name}_T{args.momentum:.0f}MeV_{N}x{N}{noise_tag}.pkl'
+        if args.output_pkl:
+            pkl_path = os.path.abspath(args.output_pkl)
+            os.makedirs(os.path.dirname(pkl_path) or '.', exist_ok=True)
         else:
-            pair_tag = f'{args.param_y}__{args.param_x}'
-            pkl_name = (f'landscape_{loss_name}_{args.track_name}_T{args.momentum:.0f}MeV_'
-                        f'{pair_tag}_{N}x{N}{noise_tag}.pkl')
-        pkl_path = os.path.join(args.results_dir, pkl_name)
+            if args.param_y == 'recomb_alpha' and args.param_x == 'recomb_beta_90':
+                pkl_name = f'landscape_{loss_name}_{args.track_name}_T{args.momentum:.0f}MeV_{N}x{N}{noise_tag}.pkl'
+            else:
+                pair_tag = f'{args.param_y}__{args.param_x}'
+                pkl_name = (f'landscape_{loss_name}_{args.track_name}_T{args.momentum:.0f}MeV_'
+                            f'{pair_tag}_{N}x{N}{noise_tag}.pkl')
+            pkl_path = os.path.join(args.results_dir, pkl_name)
         with open(pkl_path, 'wb') as f_out:
             pickle.dump(landscape, f_out)
         print(f'  Saved pkl: {pkl_path}')
 
-        plot_landscape(landscape, args.results_dir, overlay_dir=args.overlay)
+        if not args.no_plots:
+            plot_landscape(landscape, args.results_dir, overlay_dir=args.overlay)
 
     print('\nDone.')
 
