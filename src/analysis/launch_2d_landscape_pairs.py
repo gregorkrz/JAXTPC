@@ -24,9 +24,12 @@ Usage
 
   # Override Slurm settings per run
   python src/analysis/launch_2d_landscape_pairs.py --account neutrino --partition ampere
+
+/sdf/home/g/gregork/envs/base_env/bin/python src/analysis/launch_2d_landscape_pairs.py --gradients --dry-run
+
 """
+
 import argparse
-import os
 import shlex
 import subprocess
 import sys
@@ -48,7 +51,7 @@ from tools.random_boundary_tracks import (  # noqa: E402
 ACCOUNT      = "mli:nu-ml-dev"
 PARTITION    = "ampere"
 QOS = "normal"  # type: Optional[str]  # e.g. "normal"; None omits the #SBATCH --qos line
-TIME         = "00:30:00"
+TIME         = "00:15:00"
 MEM          = "32G"
 GPUS         = "1"
 CPUS_PER_GPU = 1
@@ -74,7 +77,6 @@ VALID_PARAMS = (  # type: Tuple[str, ...]
     'diffusion_trans_cm2_us',
     'diffusion_long_cm2_us',
     'recomb_alpha',
-    'recomb_beta',
     'recomb_beta_90',
     'recomb_R',
 )
@@ -180,7 +182,7 @@ def _inner_cmd(track, param_y, param_x, run_date, results_dir, args):
         '--param-y', param_y,
         '--param-x', param_x,
         '--track-name', track['name'],
-        '--direction', direction_str,
+        '--direction=' + direction_str,
         '--momentum', str(track['momentum_mev']),
         '--grid', str(args.grid),
         '--range-frac', str(args.range_frac),
@@ -276,10 +278,10 @@ def parse_args() -> argparse.Namespace:
                    help='RNG seed for random boundary tracks (default: 42)')
     p.add_argument('--run-date', default=None,
                    help='YYYYMMDD output subdir (default: today)')
-    p.add_argument('--results-dir', default=None,
-                   help='Output root (default: $RESULTS_DIR or "results")')
-    p.add_argument('--grid', type=int, default=10)
-    p.add_argument('--range-frac', type=float, default=0.15)
+    p.add_argument('--results-dir', default='/fs/ddn/sdf/group/atlas/d/gregork/jaxtpc/results',
+                   help='Output root (default: /fs/ddn/sdf/group/atlas/d/gregork/jaxtpc/results)')
+    p.add_argument('--grid', type=int, default=40)
+    p.add_argument('--range-frac', type=float, default=0.03)
     p.add_argument('--loss', default='sobolev_loss_geomean_log1p')
     p.add_argument('--gradients', action='store_true')
     p.add_argument('--noise-scale', type=float, default=0.0)
@@ -312,7 +314,7 @@ def main() -> None:
     args = parse_args()
 
     run_date    = args.run_date or date.today().strftime('%Y%m%d')
-    results_dir = args.results_dir or os.environ.get('RESULTS_DIR', 'results')
+    results_dir = args.results_dir
 
     yaml_params = None  # type: Optional[List[str]]
     if args.tracks_yaml is not None:
@@ -346,6 +348,15 @@ def main() -> None:
         )
         print(f'\n--- DRY RUN: {pending}/{total} jobs pending, {total - pending} already done ---')
         if args.verbose:
+            failing = [
+                (ti, track, py, px)
+                for ti, track in enumerate(tracks)
+                for py, px in pairs
+                if not _out_pkl(track, py, px, run_date, results_dir).exists()
+            ]
+            print(f'\nPending jobs ({len(failing)}):')
+            for ti, track, py, px in failing:
+                print(f'  [{ti:2d}] {track["name"]:<40s}  {py} vs {px}')
             print()
             for track in tracks:
                 for param_y, param_x in pairs:

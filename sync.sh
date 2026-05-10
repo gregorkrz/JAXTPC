@@ -22,9 +22,9 @@ if [[ "$MODE" == "pm" ]]; then
     rsync -av --progress --stats \
         --exclude="__pycache__" \
         --exclude=".venv" \
-        --exclude="plots" \
+        --exclude="/plots" \
         --exclude=".env" \
-        --exclude="results" \
+        --exclude="/results" \
         --exclude ".git" \
         . "$REMOTE_PATH"
     echo "Done."

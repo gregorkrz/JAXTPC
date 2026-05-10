@@ -48,6 +48,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 
 from tools.geometry import generate_detector
+from tools.loader import build_deposit_data
 from tools.random_boundary_tracks import filter_track_inside_volumes
 from tools.losses import make_sobolev_weight, sobolev_loss, sobolev_loss_geomean_log1p, mse_loss, l1_loss
 from tools.noise import generate_noise

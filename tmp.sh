@@ -1,0 +1,1 @@
+APPTAINER_CACHEDIR=/sdf/scratch/atlas/gregork/apptainer_cache APPTAINER_TMPDIR=/sdf/scratch/atlas/gregork/apptainer_tmp apptainer shell --nv --bind /sdf/home/g/gregork/jaxtpc --bind /fs/ddn/sdf/group/atlas/d/gregork/jaxtpc docker://gkrz/jaxtpc:v2
