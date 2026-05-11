@@ -273,6 +273,12 @@ def parse_args():
                    help='Log to W&B every this many steps (default: 50).')
     p.add_argument('--newton-damping', type=float, default=1e-3,
                    help='Damping for Newton optimizer (lambda in H + lambda*I). Default 1e-3.')
+    p.add_argument('--adam-beta2', type=float, default=ADAM_BETA2,
+                   help=f'Adam beta2 (second-moment decay). Default {ADAM_BETA2}.')
+    p.add_argument('--init-from-wandb-run', default=None, metavar='RUN_ID',
+                   help='Start trial 0 from the last logged param values of an existing W&B run '
+                        '(fetches params/<name>_physical from the run summary). '
+                        'Remaining trials use random starts as usual.')
     return p.parse_args()
 
 
@@ -770,7 +776,7 @@ def _scale_by_vector(scales):
 
 
 def make_optax_optimizer(optimizer_name, lr, lr_schedule, max_steps, clip_grad_norm=0.0,
-                         warmup_steps=0, lr_multipliers=None):
+                         warmup_steps=0, lr_multipliers=None, adam_beta2=ADAM_BETA2):
     if warmup_steps > 0:
         warmup = optax.linear_schedule(init_value=0.0, end_value=lr, transition_steps=warmup_steps)
         if lr_schedule == 'cosine':
@@ -782,7 +788,7 @@ def make_optax_optimizer(optimizer_name, lr, lr_schedule, max_steps, clip_grad_n
         schedule = optax.cosine_decay_schedule(init_value=lr, decay_steps=max_steps)
     else:
         schedule = lr
-    if optimizer_name == 'adam':         base = optax.adam(schedule, b1=ADAM_BETA1, b2=ADAM_BETA2, eps=ADAM_EPS)
+    if optimizer_name == 'adam':         base = optax.adam(schedule, b1=ADAM_BETA1, b2=adam_beta2, eps=ADAM_EPS)
     elif optimizer_name == 'sgd':          base = optax.sgd(schedule)
     elif optimizer_name == 'momentum_sgd': base = optax.sgd(schedule, momentum=MOMENTUM)
     elif optimizer_name == 'newton':
@@ -1068,6 +1074,7 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
         ph_idx, batch_fns = _phase_at(step, p)
         gv_acc = jnp.zeros_like(p)
         last_batch_idx = None
+        newton_step_metrics = None
         if newton_damping is not None:
             # Newton update path: accumulate grad and hessian
             hv_acc = jnp.zeros((n_dim, n_dim), dtype=jnp.float32)
@@ -1086,14 +1093,18 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
                 gv_avg = gv_avg * active
             H_reg = hv_avg + newton_damping * jnp.eye(n_dim, dtype=jnp.float32)
             delta_p = jnp.linalg.solve(H_reg, -gv_avg)
+            delta_norm_unclipped = float(jnp.linalg.norm(delta_p))
             if clip_grad_norm > 0:
-                delta_norm = jnp.linalg.norm(delta_p)
                 delta_p = jnp.where(
-                    delta_norm > clip_grad_norm,
-                    delta_p * (clip_grad_norm / (delta_norm + 1e-30)),
+                    delta_norm_unclipped > clip_grad_norm,
+                    delta_p * (clip_grad_norm / (delta_norm_unclipped + 1e-30)),
                     delta_p)
             lr = float(schedule_fn(step)) if schedule_fn is not None else 1.0
             p = p + lr * delta_p
+            newton_step_metrics = {
+                'newton_step_norm_unclipped': delta_norm_unclipped,
+                'newton_step_norm': float(jnp.linalg.norm(delta_p)) * lr,
+            }
             fn_eval = batch_fns[last_batch_idx]
             lv_new, gv_new, _ = fn_eval(p)
             pt_new = None
@@ -1169,7 +1180,8 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
                                 schedule_fn=schedule_fn,
                                 lr_multipliers=lr_multipliers,
                                 phase=ph_idx if multi_phase else None,
-                                extra_metrics=freeze_metrics)
+                                extra_metrics={**(freeze_metrics or {}),
+                                               **(newton_step_metrics or {})})
             if checkpoint_callback is not None:
                 checkpoint_callback(
                     step + 1, p, opt_state,
@@ -1288,6 +1300,33 @@ def apply_noise_to_gt(gt_arrays, simulator, noise_scale, noise_seed):
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
+
+def fetch_init_params_from_wandb(run_id, param_names, scales, wandb_project):
+    """Fetch last physical param values from a W&B run and return a p_n list.
+
+    Uses the run summary (last logged value per key).  Raises ValueError if any
+    params/<name>_physical key is missing from the summary.
+    """
+    if not _WANDB_AVAILABLE:
+        raise RuntimeError('wandb not installed; cannot use --init-from-wandb-run')
+    api = _wandb.Api()
+    run = api.run(f"{wandb_project}/{run_id}")
+    summary = run.summary
+    p_n_init = []
+    for name, scale in zip(param_names, scales):
+        key = f"params/{name}_physical"
+        val = summary.get(key)
+        if val is None:
+            available = sorted(k for k in summary.keys() if k.startswith('params/'))
+            raise ValueError(
+                f"Key {key!r} not in W&B run {run_id} summary.\n"
+                f"Available params/* keys: {available}"
+            )
+        p_n = float(np.log(float(val) / scale))
+        p_n_init.append(p_n)
+        print(f"  {name}: {float(val):.6g}  (p_n={p_n:.4f})")
+    return p_n_init
+
 
 def main():
     args = parse_args()
@@ -1667,6 +1706,16 @@ def main():
     factor_grid   = factors.tolist()
     p_n_starts    = (np.log(factors) + np.array(p_n_gts)).tolist()
 
+    if args.init_from_wandb_run:
+        print(f'\nFetching initial params from W&B run {args.init_from_wandb_run!r}...')
+        p_n_from_run = fetch_init_params_from_wandb(
+            args.init_from_wandb_run, param_names, scales, args.wandb_project)
+        p_n_starts[0] = p_n_from_run
+        factor_grid[0] = [float(np.exp(pn - pngt))
+                          for pn, pngt in zip(p_n_from_run, p_n_gts)]
+        print(f'  → trial 0 initialised from W&B run '
+              f'(remaining {args.N - 1} trial(s) use random starts)')
+
     all_trials = []
     if existing_result:
         all_trials.extend(existing_result['trials'])
@@ -1765,7 +1814,8 @@ def main():
                                                       args.max_steps,
                                                       clip_grad_norm=args.clip_grad_norm,
                                                       warmup_steps=args.warmup_steps,
-                                                      lr_multipliers=lr_multipliers)
+                                                      lr_multipliers=lr_multipliers,
+                                                      adam_beta2=args.adam_beta2)
     else:
         lr_multipliers = [1.0] * len(param_names)
         optimizer = None

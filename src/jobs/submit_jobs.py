@@ -281,6 +281,8 @@ def make_opt_command(
     log_interval=None,
     lr_mult_auto_burn_in_steps=None,
     newton_damping=None,
+    adam_beta2=None,
+    init_from_wandb_run=None,
 ):
     """Return a run_optimization.py command string with the given settings."""
     parts = [
@@ -343,6 +345,10 @@ def make_opt_command(
         parts.append(f"--log-interval {int(log_interval)}")
     if newton_damping is not None:
         parts.append(f"--newton-damping {newton_damping}")
+    if adam_beta2 is not None:
+        parts.append(f"--adam-beta2 {adam_beta2}")
+    if init_from_wandb_run is not None:
+        parts.append(f"--init-from-wandb-run {init_from_wandb_run}")
     return " ".join(parts)
 
 
@@ -1989,7 +1995,7 @@ def profile_15_Tracks_Newton_allParams_BS1(
 ):
     """Newton optimizer on all 7 params, 15-track boundary ensemble.
 
-    Fine forward pass (0.1 mm / 50k deposits), lr=1.0, damping=1e-3,
+    Coarse forward pass (1 mm / 5k deposits), lr=1.0, damping=1e-3,
     batch_size=1 / effective_batch_size=15 (all 15 tracks per optimizer step).
     """
     shared = dict(
@@ -2002,15 +2008,137 @@ def profile_15_Tracks_Newton_allParams_BS1(
         N=1,
         range_lo=0.9,
         range_hi=1.1,
-        results_base="$RESULTS_DIR/opt/tracks15_boundary_cos30k/newton_allParams_ebs15",
+        results_base="$RESULTS_DIR/opt/tracks15_boundary_cos30k/newton_allParams_coarse1mm_ebs15",
         grad_clip=1.0,
         warmup_steps=1000,  # no-op for Newton
         num_buckets=1000,
-        step_size=0.1,
-        max_num_deposits=50000,
+        step_size=1.0,
+        max_num_deposits=5000,
         batch_size=1,
         effective_batch_size=15,
+        gt_step_size=1.0,
+        gt_max_deposits=5000,
         newton_damping=1e-3,
+        log_interval=5,
+    )
+    params = ",".join(PARAM_LIST)
+    command = make_opt_command(
+        params=params,
+        tracks=TRACKS_15_BOUNDARY,
+        optimizer="newton",
+        seed=42,
+        noise_scale=0.0,
+        wandb_tags=wandb_tags,
+        **shared,
+    )
+    if not print_sbatch_only:
+        print(command)
+    s3df_submit(
+        command,
+        time="04:00:00",
+        submit=submit,
+        mem_gb=64,
+        print_sbatch_command=print_sbatch_only,
+    )
+
+
+def profile_15_Tracks_Newton_allParams_BS1_DampClipSweep(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """Sweep over 8 combinations of newton_damping × clip_grad_norm, all with seed=42.
+
+    damping in [0.001, 1.0] × clip in [1.0, 0.1, 0.01, 0.001] = 8 jobs.
+    Each combination gets a unique results_base so output paths don't collide.
+    All other settings identical to profile_15_Tracks_Newton_allParams_BS1.
+    """
+    params = ",".join(PARAM_LIST)
+    lr = 1e-4
+    for damping in [0.01]:
+        for clip in [-1]:
+            damping_str = f"{damping}".replace(".", "p")
+            clip_str = f"{clip}".replace(".", "p")
+            lr_str = f"{lr}".replace(".", "p")
+            results_base = (
+                f"$RESULTS_DIR/opt/tracks15_boundary_cos30k"
+                f"/newton_allParams_sweep/d{damping_str}_c{clip_str}_lr{lr_str}"
+            )
+            command = make_opt_command(
+                params=params,
+                tracks=TRACKS_15_BOUNDARY,
+                optimizer="newton",
+                seed=42,
+                noise_scale=0.0,
+                loss="sobolev_loss_geomean_log1p",
+                lr=lr,
+                lr_schedule="cosine",
+                max_steps=30000,
+                tol=1e-6,
+                patience=2000,
+                N=1,
+                range_lo=0.9,
+                range_hi=1.1,
+                results_base=results_base,
+                grad_clip=clip,
+                warmup_steps=1000,
+                num_buckets=1000,
+                step_size=1.0,
+                max_num_deposits=5000,
+                batch_size=1,
+                effective_batch_size=15,
+                gt_step_size=1.0,
+                gt_max_deposits=5000,
+                newton_damping=damping,
+                log_interval=5,
+                wandb_tags=(wandb_tags or []) + ["15_Tracks_Newton_allParams_BS1_DampClipSweep"],
+            )
+            if not print_sbatch_only:
+                print(command)
+            s3df_submit(
+                command,
+                time="04:00:00",
+                submit=submit,
+                mem_gb=64,
+                print_sbatch_command=print_sbatch_only,
+            )
+
+
+def profile_15_Tracks_Newton_allParams_BS1_Damping1p0(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """Same as ``profile_15_Tracks_Newton_allParams_BS1`` but with newton_damping=1.0.
+
+    Higher damping regularises the Hessian inverse in flat directions (lifetime_us,
+    diffusion params, recomb_alpha) and prevents the initial Newton step from blowing
+    those parameters to unphysical values.
+    """
+    shared = dict(
+        loss="sobolev_loss_geomean_log1p",
+        lr=1.0,
+        lr_schedule="cosine",
+        max_steps=30000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base="$RESULTS_DIR/opt/tracks15_boundary_cos30k/newton_allParams_coarse1mm_ebs15_damping1p0",
+        grad_clip=1.0,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=1.0,
+        max_num_deposits=5000,
+        batch_size=1,
+        effective_batch_size=15,
+        gt_step_size=1.0,
+        gt_max_deposits=5000,
+        newton_damping=1.0,
+        log_interval=5,
     )
     params = ",".join(PARAM_LIST)
     command = make_opt_command(
@@ -2079,6 +2207,127 @@ def profile_15_Tracks_Adam_default_BS15_LR4e4(
     )
 
 
+def profile_15_Tracks_Adam_Beta2Sweep_NoClip(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """Sweep over 5 Adam beta2 values with clip disabled, seed=42.
+
+    beta2 in [0.9, 0.99, 0.999, 0.9999, 0.99999].  All other settings match
+    run 4t0kxso1 (lr=0.001, cosine, coarse 1mm/5k, eff_bs=5), except
+    clip_grad_norm=0 (disabled).  Motivation: with clip=1.0 the velocity_cm_us
+    gradient (34k) crushes diffusion_trans into Adam's eps regime; removing clip
+    lets each param's second moment adapt independently, and varying beta2
+    controls how quickly that adaptation tracks the current gradient scale.
+    """
+    params = ",".join(PARAM_LIST)
+    for beta2 in [0.9, 0.99, 0.999, 0.9999, 0.99999]:
+        beta2_str = f"{beta2}".replace(".", "p")
+        results_base = (
+            f"$RESULTS_DIR/opt/tracks15_boundary_cos30k"
+            f"/adam_beta2sweep_noclip/b2_{beta2_str}"
+        )
+        command = make_opt_command(
+            params=params,
+            tracks=TRACKS_15_BOUNDARY,
+            optimizer="adam",
+            seed=42,
+            noise_scale=0.0,
+            loss="sobolev_loss_geomean_log1p",
+            lr=0.001,
+            lr_schedule="cosine",
+            max_steps=30000,
+            tol=1e-6,
+            patience=2000,
+            N=1,
+            range_lo=0.9,
+            range_hi=1.1,
+            results_base=results_base,
+            grad_clip=0.0,
+            warmup_steps=1000,
+            num_buckets=1000,
+            step_size=1.0,
+            max_num_deposits=5000,
+            batch_size=3,
+            effective_batch_size=5,
+            gt_step_size=1.0,
+            gt_max_deposits=5000,
+            adam_beta2=beta2,
+            log_interval=50,
+            wandb_tags=(wandb_tags or []) + ["15_Tracks_Adam_Beta2Sweep_NoClip"],
+        )
+        if not print_sbatch_only:
+            print(command)
+        s3df_submit(
+            command,
+            time="08:00:00",
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+        )
+
+
+def profile_15_Tracks_Newton_ContinueFrom_eizhqsj0(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """Newton continuation from Adam run eizhqsj0.
+
+    Picks up where the Adam run left off: initialises trial 0 from the last
+    logged params/<name>_physical values of run eizhqsj0, then runs Newton
+    with damping=0.01, lr=1.0, no gradient clipping.
+    All other settings match profile_15_Tracks_Newton_allParams_BS1.
+    """
+    params = ",".join(PARAM_LIST)
+    results_base = (
+        "$RESULTS_DIR/opt/tracks15_boundary_cos30k"
+        "/newton_allParams_continue_eizhqsj0"
+    )
+    command = make_opt_command(
+        params=params,
+        tracks=TRACKS_15_BOUNDARY,
+        optimizer="newton",
+        seed=42,
+        noise_scale=0.0,
+        loss="sobolev_loss_geomean_log1p",
+        lr=1.0,
+        lr_schedule="cosine",
+        max_steps=30000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base=results_base,
+        grad_clip=-1,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=1.0,
+        max_num_deposits=5000,
+        batch_size=1,
+        effective_batch_size=15,
+        gt_step_size=1.0,
+        gt_max_deposits=5000,
+        newton_damping=0.01,
+        log_interval=5,
+        init_from_wandb_run="eizhqsj0",
+        wandb_tags=(wandb_tags or []) + ["15_Tracks_Newton_ContinueFrom_eizhqsj0"],
+    )
+    if not print_sbatch_only:
+        print(command)
+    s3df_submit(
+        command,
+        time="04:00:00",
+        submit=submit,
+        mem_gb=64,
+        print_sbatch_command=print_sbatch_only,
+    )
+
+
 PROFILES = {
     "3_part_schedule": profile_3_part_schedule,
     "2_part_schedule": profile_2_part_schedule,
@@ -2124,6 +2373,10 @@ PROFILES = {
     "15_Tracks_Newton_recombAlpha_velocity_BS1": profile_15_Tracks_Newton_recombAlpha_velocity_BS1,
     "15_Tracks_Newton_diffRecomb_BS1": profile_15_Tracks_Newton_diffRecomb_BS1,
     "15_Tracks_Newton_allParams_BS1": profile_15_Tracks_Newton_allParams_BS1,
+    "15_Tracks_Newton_allParams_BS1_Damping1p0": profile_15_Tracks_Newton_allParams_BS1_Damping1p0,
+    "15_Tracks_Newton_allParams_BS1_DampClipSweep": profile_15_Tracks_Newton_allParams_BS1_DampClipSweep,
+    "15_Tracks_Newton_ContinueFrom_eizhqsj0": profile_15_Tracks_Newton_ContinueFrom_eizhqsj0,
+    "15_Tracks_Adam_Beta2Sweep_NoClip": profile_15_Tracks_Adam_Beta2Sweep_NoClip,
     "15_Tracks_Adam_default_BS15_LR4e4": profile_15_Tracks_Adam_default_BS15_LR4e4,
 }
 

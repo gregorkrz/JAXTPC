@@ -1,3 +1,5 @@
+This is a differentiable LArTPC simulation repo written in JAX. We experiment with simulation parameter calibration using src/scripts/run_optimization.py. The loss landscape is generated using scripts/jobs_Landscape.sh.
+
 Use the Python interpreter at .venv/bin/python. If the command should run on S3DF, just print it using the "/sdf/home/g/gregork/envs/base_env/bin/python" interpreter. Add important things you learned about the project to this file, so that you can use this context later.
 If you run the sync_results_to_remote.sh script, the results/ and plots/ folders will be available for access by external collaborators on URL https://static.gregor.science/55ZKUmPYcUSwDfW5st/JAXTPC/<results/plots>/...
 
