@@ -201,7 +201,7 @@ def track_and_forward(simulator, spec, start_position_mm):
     return track, planes
 
 
-def write_edep_3d_html(track, spec, path, de_min, de_max, de_range, volumes):
+def write_edep_3d_html(track, spec, path, de_min, de_max, de_range, volumes, stats=None):
     pos = np.asarray(track['position'])
     de = np.asarray(track['de'])
     fig = go.Figure()
@@ -227,11 +227,16 @@ def write_edep_3d_html(track, spec, path, de_min, de_max, de_range, volumes):
             text=[f'dE={v:.5f} MeV' for v in de],
             hovertemplate='%{text}<br>x=%{x:.2f}<br>y=%{y:.2f}<br>z=%{z:.2f}<extra></extra>',
         ))
-    title = (
-        f"{spec['name']} — no deposits" if len(de) == 0 else
-        f"Energy deposits — {spec['name']}  dir={spec['direction']}  "
-        f"T={spec['momentum_mev']:.0f} MeV"
-    )
+    if len(de) == 0:
+        title = f"{spec['name']} — no deposits"
+    else:
+        stats_str = ''
+        if stats is not None:
+            stats_str = (f"  |  N={stats['n_deposits']:,}  "
+                         f"mean dE={stats['mean_de']:.4g} MeV  "
+                         f"total dE={stats['total_de']:.4g} MeV")
+        title = (f"Energy deposits — {spec['name']}  dir={spec['direction']}  "
+                 f"T={spec['momentum_mev']:.0f} MeV{stats_str}")
     fig.update_layout(
         title=title,
         scene=dict(
@@ -241,30 +246,56 @@ def write_edep_3d_html(track, spec, path, de_min, de_max, de_range, volumes):
             aspectmode='data',
         ),
         legend=dict(yanchor='top', y=0.99, xanchor='left', x=0.01),
-        margin=dict(l=0, r=0, b=0, t=50),
+        margin=dict(l=0, r=0, b=0, t=60),
     )
     fig.write_html(path)
 
 
-def write_edep_index_html(specs, output_dir):
+def write_edep_index_html(specs, output_dir, stats=None):
     """Single-page picker: iframe loads ``edep_3d_<stem>.html`` for the selected track."""
     if not specs:
         return
+    has_stats = stats is not None and len(stats) == len(specs)
     option_lines = []
+    stats_js_rows = []
     for i, spec in enumerate(specs):
         basename = f'edep_3d_{_safe_stem(spec["name"])}.html'
         d = spec['direction']
         dir_str = f'({d[0]:.6g}, {d[1]:.6g}, {d[2]:.6g})'
-        label = (
-            f'{spec["name"]} — T={spec["momentum_mev"]:.6g} MeV — dir={dir_str}'
-        )
+        label = f'{spec["name"]} — T={spec["momentum_mev"]:.6g} MeV — dir={dir_str}'
         sel = ' selected' if i == 0 else ''
         option_lines.append(
             f'        <option value="{html.escape(basename, quote=True)}"{sel}>'
             f'{html.escape(label)}</option>'
         )
+        if has_stats:
+            st = stats[i]
+            stats_js_rows.append(
+                f'  {{n: {st["n_deposits"]}, mean: {st["mean_de"]:.6g}, total: {st["total_de"]:.6g}}}'
+            )
+
     first = f'edep_3d_{_safe_stem(specs[0]["name"])}.html'
     options_block = '\n'.join(option_lines)
+
+    if has_stats:
+        stats_js = 'const STATS = [\n' + ',\n'.join(stats_js_rows) + '\n];'
+        stats_panel = """
+  <div id="stats-bar" style="margin:0.4rem 0;font-size:0.85rem;color:#444;font-family:monospace;background:#f5f5f5;padding:0.3rem 0.6rem;border-radius:4px;display:inline-block"></div>"""
+        stats_script = """
+    function updateStats(idx) {
+      const s = STATS[idx];
+      document.getElementById('stats-bar').textContent =
+        'N deposits: ' + s.n.toLocaleString() +
+        '   mean dE: ' + s.mean.toPrecision(4) + ' MeV' +
+        '   total dE: ' + s.total.toPrecision(4) + ' MeV';
+    }
+    updateStats(sel.selectedIndex);
+    sel.addEventListener('change', () => { frame.src = sel.value; updateStats(sel.selectedIndex); });"""
+    else:
+        stats_js = ''
+        stats_panel = ''
+        stats_script = "    sel.addEventListener('change', () => { frame.src = sel.value; });"
+
     page = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -278,10 +309,10 @@ def write_edep_index_html(specs, output_dir):
     select {{ min-width: min(40rem, 100%); max-width: 100%; font-size: 0.9rem; }}
     iframe {{
       width: 100%;
-      height: calc(100vh - 6rem);
+      height: calc(100vh - 8rem);
       border: 1px solid #ccc;
       border-radius: 4px;
-      margin-top: 1rem;
+      margin-top: 0.5rem;
     }}
   </style>
 </head>
@@ -292,12 +323,13 @@ def write_edep_index_html(specs, output_dir):
     <select id="track-select" aria-label="Choose track">
 {options_block}
     </select>
-  </p>
+  </p>{stats_panel}
   <iframe id="plot-frame" title="Plotly 3D energy deposits" src="{html.escape(first, quote=True)}"></iframe>
   <script>
+    {stats_js}
     const sel = document.getElementById('track-select');
     const frame = document.getElementById('plot-frame');
-    sel.addEventListener('change', () => {{ frame.src = sel.value; }});
+{stats_script}
   </script>
 </body>
 </html>
@@ -308,18 +340,27 @@ def write_edep_index_html(specs, output_dir):
     print(f'  Saved {path}')
 
 
-def write_track_catalog_pdf(specs, path):
-    """Single-page PDF: index, name, kinetic energy, unit direction components."""
+def write_track_catalog_pdf(specs, path, stats=None):
+    """Single-page PDF: index, name, kinetic energy, unit direction components, optional stats."""
     n = len(specs)
     fig_h = min(22.0, max(4.0, 0.55 * n + 1.5))
-    fig, ax = plt.subplots(figsize=(11, fig_h))
+    has_stats = stats is not None and len(stats) == len(specs)
+    fig, ax = plt.subplots(figsize=(14 if has_stats else 11, fig_h))
     ax.axis('off')
     headers = ['#', 'name', 'T (MeV)', '(dx, dy, dz)']
+    if has_stats:
+        headers += ['N deposits', 'mean dE (MeV)', 'total dE (MeV)']
     rows = []
     for i, s in enumerate(specs, start=1):
         d = s['direction']
         dir_str = f'({d[0]:.6g}, {d[1]:.6g}, {d[2]:.6g})'
-        rows.append([str(i), s['name'], f'{s["momentum_mev"]:.6g}', dir_str])
+        row = [str(i), s['name'], f'{s["momentum_mev"]:.6g}', dir_str]
+        if has_stats:
+            st = stats[i - 1]
+            row += [f'{st["n_deposits"]:,}',
+                    f'{st["mean_de"]:.4g}',
+                    f'{st["total_de"]:.4g}']
+        rows.append(row)
     tbl = ax.table(
         cellText=rows,
         colLabels=headers,
@@ -332,7 +373,8 @@ def write_track_catalog_pdf(specs, path):
     for j in range(len(headers)):
         tbl[(0, j)].set_facecolor('#e0e0e0')
         tbl[(0, j)].set_text_props(weight='bold')
-    ax.set_title('Tracks — name, kinetic energy, direction', fontsize=12, pad=6)
+    ax.set_title('Tracks — name, kinetic energy, direction' +
+                 (' + deposit stats' if has_stats else ''), fontsize=12, pad=6)
     fig.savefig(path, bbox_inches='tight')
     plt.close(fig)
     print(f'  Saved {path}')
@@ -393,7 +435,6 @@ def main():
         specs = parse_mixed_tracks(args.tracks)
 
     catalog_path = os.path.join(args.output_dir, 'track_catalog.pdf')
-    write_track_catalog_pdf(specs, catalog_path)
 
     east_mm, west_mm = outer_boundary_starts_mm(cfg.volumes)
     if args.start_position_mm is not None:
@@ -406,6 +447,7 @@ def main():
     all_de = []
     all_planes = []
     tracks_raw = []
+    track_stats = []
     for spec in specs:
         if args.start_position_mm is not None:
             start_mm = tuple(args.start_position_mm)
@@ -422,8 +464,15 @@ def main():
         print(f'    ({time.time() - t0:.1f} s)')
         tracks_raw.append(track)
         de = np.asarray(track['de'])
+        n_dep = len(de)
+        mean_de = float(np.mean(de)) if n_dep > 0 else 0.0
+        total_de = float(np.sum(de)) if n_dep > 0 else 0.0
+        print(f'    N_deposits={n_dep:,}  mean_dE={mean_de:.4g} MeV  total_dE={total_de:.4g} MeV')
+        track_stats.append(dict(n_deposits=n_dep, mean_de=mean_de, total_de=total_de))
         all_de.append(de)
         all_planes.append(planes)
+
+    write_track_catalog_pdf(specs, catalog_path, stats=track_stats)
 
     de_all = np.concatenate(all_de) if all_de else np.array([0.0])
     de_min, de_max = float(np.min(de_all)), float(np.max(de_all))
@@ -452,7 +501,8 @@ def main():
         stem = _safe_stem(spec['name'])
         html_path = os.path.join(args.output_dir, f'edep_3d_{stem}.html')
         write_edep_3d_html(
-            tracks_raw[i], spec, html_path, de_min, de_max, de_range, cfg.volumes)
+            tracks_raw[i], spec, html_path, de_min, de_max, de_range, cfg.volumes,
+            stats=track_stats[i])
         print(f'  Saved {html_path}')
 
         planes = all_planes[i]
@@ -483,7 +533,7 @@ def main():
             ax.set_xlabel('t (μs)', fontsize=7)
             ax.tick_params(axis='both', labelsize=6)
 
-    write_edep_index_html(specs, args.output_dir)
+    write_edep_index_html(specs, args.output_dir, stats=track_stats)
 
     cbar = fig_pdf.colorbar(
         im, ax=axes.ravel().tolist(), shrink=0.35, aspect=60, pad=0.02, label='signal (e⁻)')

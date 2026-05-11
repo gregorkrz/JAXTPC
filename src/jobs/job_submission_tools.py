@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import List, Optional
 
 PARTITION  = "ampere"
-ACCOUNT    = "neutrino"
+ACCOUNT    = "mli:nu-ml-dev"
+QOS        = "normal"
 REMOTE_DIR = "/sdf/home/g/gregork/jaxtpc"
 JOBS_DIR   = Path(__file__).parents[2] / "jobs"
 
@@ -80,6 +81,7 @@ def s3df_submit(command: str, *, time: str = "02:00:00", gpus: int = 1,
         f"#SBATCH --job-name={name}",
         f"#SBATCH --account={ACCOUNT}",
         f"#SBATCH --partition={PARTITION}",
+        f"#SBATCH --qos={QOS}",
         f"#SBATCH --time={time}",
         f"#SBATCH --gpus={gpus}",
         f"#SBATCH --cpus-per-gpu={cpus_per_gpu}",

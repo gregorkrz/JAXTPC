@@ -134,7 +134,7 @@ _BETA_VARIANTS = frozenset({'recomb_beta', 'recomb_beta_90'})
 _BASE_PARAMS   = frozenset(VALID_PARAMS) - _BETA_VARIANTS
 
 VALID_LOSSES     = ('sobolev_loss', 'sobolev_loss_geomean_log1p', 'mse_loss', 'l1_loss')
-VALID_OPTIMIZERS = ('adam', 'sgd', 'momentum_sgd')
+VALID_OPTIMIZERS = ('adam', 'sgd', 'momentum_sgd', 'newton')
 
 TYPICAL_SCALES = {
     'velocity_cm_us':         0.1,
@@ -271,6 +271,8 @@ def parse_args():
                    help='Comma-separated W&B run tags (e.g. "sched_v2,fine_stage").')
     p.add_argument('--log-interval', type=int, default=50,
                    help='Log to W&B every this many steps (default: 50).')
+    p.add_argument('--newton-damping', type=float, default=1e-3,
+                   help='Damping for Newton optimizer (lambda in H + lambda*I). Default 1e-3.')
     return p.parse_args()
 
 
@@ -444,12 +446,16 @@ def build_loss_fn(loss_name, fwd_fn, gt_arrays, weights):
     return jax.jit(jax.value_and_grad(fn))
 
 
-def build_phase_fns(loss_name, simulator, setter, batches, *, return_per_track_loss=False):
+def build_phase_fns(loss_name, simulator, setter, batches, *, return_per_track_loss=False,
+                    return_hessian=False):
     """Return one callable per batch in a phase.
 
     Default ``fn(p) -> (loss, grad)``. When ``return_per_track_loss=True``,
     ``fn(p) -> (loss, grad, per_track_losses)`` where ``per_track_losses`` has
     shape ``(batch_size,)`` and sums to ``loss``.
+    When ``return_hessian=True``, ``fn(p) -> (loss, grad, hessian)`` where
+    ``hessian`` has shape ``(n_params, n_params)``. Mutually exclusive with
+    ``return_per_track_loss``.
 
     All batches with the same size share a single compiled XLA kernel — only
     the deposit/gt/wt arrays differ between calls, so JAX compiles once per
@@ -457,6 +463,8 @@ def build_phase_fns(loss_name, simulator, setter, batches, *, return_per_track_l
 
     batches: list of (batch_deposits, batch_gts, batch_wts)
     """
+    if return_hessian and return_per_track_loss:
+        raise ValueError('return_hessian and return_per_track_loss are mutually exclusive')
     cfg = simulator.config
     n_volumes = cfg.n_volumes
     n_planes_per_vol = cfg.volumes[0].n_planes
@@ -464,17 +472,19 @@ def build_phase_fns(loss_name, simulator, setter, batches, *, return_per_track_l
     planes = tuple(range(n_planes))
     _batched_diff = jax.vmap(simulator._forward_diff, in_axes=(None, 0))
 
-    # Pre-pad and stack deposits per batch.
-    # gts/wts are kept as-is (lists of tuples) — no duplicate allocation.
+    # Pre-pad and stack deposits per batch as numpy arrays (host memory).
+    # gts/wts are already numpy (moved to CPU after GT computation).
+    # All three are explicit JIT arguments so JAX transfers them to device per call,
+    # keeping only one batch's data on GPU at a time.
     processed = []
     for batch_deposits, batch_gts, batch_wts in batches:
         bs = len(batch_deposits)
         stacked_list = []
         for dep in batch_deposits:
             dep_padded = pad_deposit_data(dep, cfg.total_pad)
-            s = jax.tree.map(lambda *xs: jnp.stack(xs), *dep_padded.volumes)
+            s = jax.tree.map(lambda *xs: np.stack(xs), *dep_padded.volumes)
             stacked_list.append(s)
-        batch_deps = jax.tree.map(lambda *xs: jnp.stack(xs), *stacked_list)
+        batch_deps = jax.tree.map(lambda *xs: np.stack(xs), *stacked_list)
         processed.append((bs, batch_deps, batch_gts, batch_wts))
 
     # One compiled function per unique batch size (last batch may be smaller).
@@ -483,11 +493,46 @@ def build_phase_fns(loss_name, simulator, setter, batches, *, return_per_track_l
     compiled_cache = {}
 
     def _get_compiled(bs):
-        key = (bs, return_per_track_loss)
+        key = (bs, return_per_track_loss, return_hessian)
         if key in compiled_cache:
             return compiled_cache[key]
 
-        if return_per_track_loss:
+        if return_hessian:
+            def fn_scalar(p_n_vec, batch_deps, batch_gts, batch_wts):
+                batch_deps = jax.lax.stop_gradient(batch_deps)
+                all_signals = _batched_diff(setter(p_n_vec), batch_deps)
+                total = 0.0
+                for b in range(bs):
+                    pred = tuple(
+                        all_signals[b, v, pl]
+                        for v in range(n_volumes)
+                        for pl in range(n_planes_per_vol)
+                    )
+                    gt_b  = tuple(jax.lax.stop_gradient(batch_gts[b][p]) for p in range(n_planes))
+                    wts_b = tuple(jax.lax.stop_gradient(batch_wts[b][p]) for p in range(n_planes))
+                    if loss_name == 'sobolev_loss':
+                        total = total + sobolev_loss(pred, gt_b, wts_b, planes)
+                    elif loss_name == 'sobolev_loss_geomean_log1p':
+                        total = total + sobolev_loss_geomean_log1p(pred, gt_b, wts_b, planes)
+                    elif loss_name == 'mse_loss':
+                        total = total + mse_loss(pred, gt_b)
+                    elif loss_name == 'l1_loss':
+                        total = total + l1_loss(pred, gt_b)
+                    else:
+                        raise ValueError(f'Unknown loss {loss_name!r}')
+                return total
+
+            _grad_fn = jax.grad(fn_scalar, argnums=0)
+
+            def fn_newton(p_n_vec, batch_deps, batch_gts, batch_wts):
+                val, grad = jax.value_and_grad(fn_scalar, argnums=0)(
+                    p_n_vec, batch_deps, batch_gts, batch_wts)
+                hess = jax.jacfwd(_grad_fn, argnums=0)(
+                    p_n_vec, batch_deps, batch_gts, batch_wts)
+                return val, grad, hess
+
+            compiled = jax.jit(fn_newton)
+        elif return_per_track_loss:
             def fn(p_n_vec, batch_deps, batch_gts, batch_wts):
                 batch_deps = jax.lax.stop_gradient(batch_deps)
                 all_signals = _batched_diff(setter(p_n_vec), batch_deps)
@@ -546,6 +591,11 @@ def build_phase_fns(loss_name, simulator, setter, batches, *, return_per_track_l
         return compiled
 
     def _make_fn(compiled, deps, gts, wts):
+        if return_hessian:
+            def call(p):
+                val, grad, hess = compiled(p, deps, gts, wts)
+                return val, grad, hess
+            return call
         if return_per_track_loss:
             def call(p):
                 (lv, pt), gv = compiled(p, deps, gts, wts)
@@ -735,6 +785,9 @@ def make_optax_optimizer(optimizer_name, lr, lr_schedule, max_steps, clip_grad_n
     if optimizer_name == 'adam':         base = optax.adam(schedule, b1=ADAM_BETA1, b2=ADAM_BETA2, eps=ADAM_EPS)
     elif optimizer_name == 'sgd':          base = optax.sgd(schedule)
     elif optimizer_name == 'momentum_sgd': base = optax.sgd(schedule, momentum=MOMENTUM)
+    elif optimizer_name == 'newton':
+        raise ValueError(
+            'Newton optimizer bypasses optax entirely — do not call make_optax_optimizer for newton')
     else: raise ValueError(f'Unknown optimizer {optimizer_name!r}')
     transforms = []
     if lr_multipliers is not None and any(s != 1.0 for s in lr_multipliers):
@@ -873,7 +926,9 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
               wandb_track_batch_groups=None,
               tol_per_param=None, patience_per_param=None,
               initial_frozen_mask=None,
-              effective_batch_size=1):
+              effective_batch_size=1,
+              newton_damping=None,
+              clip_grad_norm=0.0):
     """Run one optimization trial from starting p_n vector p0 (any length).
 
     phase_schedule: list of (until_step, build_fn) sorted by until_step.
@@ -901,8 +956,11 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
       total_time_s, stopped_early, steps_run
     """
     p = jnp.array(p0, dtype=jnp.float32)
-    opt_state = (jax.tree_util.tree_map(jnp.array, initial_opt_state)
-                 if initial_opt_state is not None else optimizer.init(p))
+    if newton_damping is not None:
+        opt_state = None
+    else:
+        opt_state = (jax.tree_util.tree_map(jnp.array, initial_opt_state)
+                     if initial_opt_state is not None else optimizer.init(p))
     eff_bs = int(effective_batch_size)
     if eff_bs < 1:
         raise ValueError('effective_batch_size must be >= 1')
@@ -1010,22 +1068,54 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
         ph_idx, batch_fns = _phase_at(step, p)
         gv_acc = jnp.zeros_like(p)
         last_batch_idx = None
-        for micro in range(eff_bs):
-            batch_idx = (step * eff_bs + micro) % len(batch_fns)
-            fn = batch_fns[batch_idx]
-            lv, gv, _ = _unpack_batch_fn_ret(fn(p))
-            jax.block_until_ready((lv, gv))
-            gv_acc = gv_acc + gv
-            last_batch_idx = batch_idx
-        gv = gv_acc / float(eff_bs)
-        if freeze_enabled:
-            active = jnp.asarray(~frozen_np, dtype=jnp.float32)
-            gv = gv * active
-        updates, opt_state = optimizer.update(gv, opt_state)
-        p = optax.apply_updates(p, updates)
-        fn_eval = batch_fns[last_batch_idx]
-        lv_new, gv_new, pt_new = _unpack_batch_fn_ret(fn_eval(p))
-        jax.block_until_ready((lv_new, gv_new))
+        if newton_damping is not None:
+            # Newton update path: accumulate grad and hessian
+            hv_acc = jnp.zeros((n_dim, n_dim), dtype=jnp.float32)
+            for micro in range(eff_bs):
+                batch_idx = (step * eff_bs + micro) % len(batch_fns)
+                fn = batch_fns[batch_idx]
+                lv, gv, hv = fn(p)
+                jax.block_until_ready((lv, gv, hv))
+                gv_acc = gv_acc + gv
+                hv_acc = hv_acc + hv
+                last_batch_idx = batch_idx
+            gv_avg = gv_acc / float(eff_bs)
+            hv_avg = hv_acc / float(eff_bs)
+            if freeze_enabled:
+                active = jnp.asarray(~frozen_np, dtype=jnp.float32)
+                gv_avg = gv_avg * active
+            H_reg = hv_avg + newton_damping * jnp.eye(n_dim, dtype=jnp.float32)
+            delta_p = jnp.linalg.solve(H_reg, -gv_avg)
+            if clip_grad_norm > 0:
+                delta_norm = jnp.linalg.norm(delta_p)
+                delta_p = jnp.where(
+                    delta_norm > clip_grad_norm,
+                    delta_p * (clip_grad_norm / (delta_norm + 1e-30)),
+                    delta_p)
+            lr = float(schedule_fn(step)) if schedule_fn is not None else 1.0
+            p = p + lr * delta_p
+            fn_eval = batch_fns[last_batch_idx]
+            lv_new, gv_new, _ = fn_eval(p)
+            pt_new = None
+            jax.block_until_ready((lv_new, gv_new))
+        else:
+            # Adam / SGD path
+            for micro in range(eff_bs):
+                batch_idx = (step * eff_bs + micro) % len(batch_fns)
+                fn = batch_fns[batch_idx]
+                lv, gv, _ = _unpack_batch_fn_ret(fn(p))
+                jax.block_until_ready((lv, gv))
+                gv_acc = gv_acc + gv
+                last_batch_idx = batch_idx
+            gv = gv_acc / float(eff_bs)
+            if freeze_enabled:
+                active = jnp.asarray(~frozen_np, dtype=jnp.float32)
+                gv = gv * active
+            updates, opt_state = optimizer.update(gv, opt_state)
+            p = optax.apply_updates(p, updates)
+            fn_eval = batch_fns[last_batch_idx]
+            lv_new, gv_new, pt_new = _unpack_batch_fn_ret(fn_eval(p))
+            jax.block_until_ready((lv_new, gv_new))
         step_time = time.time() - step_start
 
         param_traj.append(p.tolist())
@@ -1092,7 +1182,7 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
         total_time_s     = time.time() - t_start,
         stopped_early    = stopped_early,
         steps_run        = len(param_traj) - 1,
-        final_opt_state  = _serialize_opt_state(opt_state),
+        final_opt_state  = (_serialize_opt_state(opt_state) if opt_state is not None else None),
     )
     if freeze_enabled:
         out['frozen_mask_final'] = frozen_np.tolist()
@@ -1201,6 +1291,7 @@ def apply_noise_to_gt(gt_arrays, simulator, noise_scale, noise_seed):
 
 def main():
     args = parse_args()
+    is_newton = args.optimizer == 'newton'
 
     if args.effective_batch_size < 1:
         print('error: --effective-batch-size must be >= 1.', file=sys.stderr)
@@ -1460,8 +1551,9 @@ def main():
 
         wts = tuple(make_sobolev_weight(a.shape[0], a.shape[1], max_pad=SOBOLEV_MAX_PAD)
                     for a in gt)
-        gt_signals_per_track.append(gt)
-        gt_weights_per_track.append(wts)
+        # Move to CPU after computation to free GPU memory; JAX JIT transfers back per call.
+        gt_signals_per_track.append(tuple(np.array(a) for a in gt))
+        gt_weights_per_track.append(tuple(np.array(a) for a in wts))
 
     signal_rms = float(np.mean(sig_rms_acc))
     if args.noise_scale > 0.0:
@@ -1482,7 +1574,8 @@ def main():
     wandb_track_batch_groups = []   # [phase][batch] -> [(global_track_idx, name), ...]
 
     log_track_losses_wandb = (
-        use_wandb and len(track_specs) < WANDB_PER_TRACK_LOSS_MAX_TRACKS)
+        use_wandb and len(track_specs) < WANDB_PER_TRACK_LOSS_MAX_TRACKS
+        and not is_newton)
 
     for ph_idx, phase in enumerate(schedule):
         sim_ph = _get_sim(phase['max_num_deposits'])
@@ -1551,7 +1644,8 @@ def main():
                     t0 = time.time()
                     fns = build_phase_fns(
                         args.loss, sim_ph, setter, batches,
-                        return_per_track_loss=log_track_losses_wandb)
+                        return_per_track_loss=log_track_losses_wandb,
+                        return_hessian=is_newton)
                     for fn in fns:
                         out = fn(p)
                         jax.block_until_ready(out)
@@ -1579,7 +1673,7 @@ def main():
     live_ckpt = (existing_result or {}).get('live_checkpoint')
 
     lr_spec = args.lr_multipliers
-    want_auto = lr_spec is not None and lr_spec.strip().lower() == 'auto'
+    want_auto = (not is_newton) and lr_spec is not None and lr_spec.strip().lower() == 'auto'
     lr_mult_auto_meta = None
     stored_mult = None
     if existing_result and isinstance(existing_result.get('lr_multipliers'), (list, tuple)):
@@ -1659,18 +1753,23 @@ def main():
                 for n, s in zip(param_names, sens_list):
                     wb_row[f'lr_mult/auto_abs_grad/{n}'] = float(s)
                 _wandb.log(wb_row, step=0)
-    else:
+    elif not is_newton:
         lr_multipliers = parse_lr_multipliers(lr_spec, param_names)
 
-    if not want_auto and any(s != 1.0 for s in lr_multipliers):
-        pairs = ', '.join(f'{n}×{s}' for n, s in zip(param_names, lr_multipliers) if s != 1.0)
-        print(f'LR multipliers : {pairs}')
+    if not is_newton:
+        if not want_auto and any(s != 1.0 for s in lr_multipliers):
+            pairs = ', '.join(f'{n}×{s}' for n, s in zip(param_names, lr_multipliers) if s != 1.0)
+            print(f'LR multipliers : {pairs}')
 
-    optimizer, schedule_fn = make_optax_optimizer(args.optimizer, args.lr, args.lr_schedule,
-                                                  args.max_steps,
-                                                  clip_grad_norm=args.clip_grad_norm,
-                                                  warmup_steps=args.warmup_steps,
-                                                  lr_multipliers=lr_multipliers)
+        optimizer, schedule_fn = make_optax_optimizer(args.optimizer, args.lr, args.lr_schedule,
+                                                      args.max_steps,
+                                                      clip_grad_norm=args.clip_grad_norm,
+                                                      warmup_steps=args.warmup_steps,
+                                                      lr_multipliers=lr_multipliers)
+    else:
+        lr_multipliers = [1.0] * len(param_names)
+        optimizer = None
+        schedule_fn = lambda _s: args.lr
 
     # ── Trials ────────────────────────────────────────────────────────────────
     result = dict(
@@ -1712,7 +1811,7 @@ def main():
             trial_idx = trial_idx,
             step      = step,
             p         = p.tolist(),
-            opt_state = _serialize_opt_state(opt_state),
+            opt_state = (_serialize_opt_state(opt_state) if opt_state is not None else None),
         )
         if frozen_mask is not None:
             ckpt['frozen_mask'] = np.asarray(frozen_mask, dtype=bool).tolist()
@@ -1760,6 +1859,8 @@ def main():
             patience_per_param=(
                 args.patience_per_param if freeze_params_enabled else None),
             initial_frozen_mask=init_frozen_mask,
+            newton_damping=(args.newton_damping if is_newton else None),
+            clip_grad_norm=args.clip_grad_norm,
         )
         all_trials.append(trial)
         result.pop('live_checkpoint', None)

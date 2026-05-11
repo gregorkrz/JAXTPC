@@ -171,10 +171,10 @@ def build_js_data(records):
 
         has_grad = r['grad_y'] is not None and r['grad_x'] is not None
         entry = {
-            'vals_y':   _round(r['vals_y']),
-            'vals_x':   _round(r['vals_x']),
-            'gt_y':     _round(r['gt_y']) if r['gt_y'] is not None else None,
-            'gt_x':     _round(r['gt_x']) if r['gt_x'] is not None else None,
+            'vals_y':   r['vals_y'],
+            'vals_x':   r['vals_x'],
+            'gt_y':     r['gt_y'],
+            'gt_x':     r['gt_x'],
             'grid':     _round(r['grid']),
             'has_grad': has_grad,
         }
@@ -248,6 +248,11 @@ select:focus{outline:none;border-color:#e05070}
       <h2>Options</h2>
       <div class="row"><input type="checkbox" id="chk-noise"><label for="chk-noise">Noise</label></div>
       <div class="row"><input type="checkbox" id="chk-grad" checked><label for="chk-grad">Gradient streamlines</label></div>
+      <div class="row" style="gap:5px;margin-top:3px">
+        <label for="sld-density" style="white-space:nowrap;font-size:12px">Arrow density</label>
+        <input type="range" id="sld-density" min="2" max="20" step="1" value="8" style="flex:1;accent-color:#e05070">
+        <span id="lbl-density" style="font-size:11px;color:#aaa;min-width:18px;text-align:right">8</span>
+      </div>
     </div>
 
     <div class="ctrl">
@@ -311,7 +316,7 @@ function toRegularArray(g){{
 function computeArrows(valsX, valsY, gradX, gradY, nGrid){{
   const nx=valsX.length, ny=valsY.length;
   const rangeX=valsX[nx-1]-valsX[0], rangeY=valsY[ny-1]-valsY[0];
-  const arrowFrac=0.45/nGrid;  // fraction of each axis range
+  const arrowFrac=0.45/nGrid/4;  // fraction of each axis range
   const stepX=Math.max(1,Math.round(nx/nGrid));
   const stepY=Math.max(1,Math.round(ny/nGrid));
   const lineX=[], lineY=[], tipX=[], tipY=[], tipAngle=[];
@@ -467,13 +472,16 @@ function render(){{
   const zDataMax=flatZ.length?flatZ.reduce((a,b)=>Math.max(a,b),-Infinity):1;
   const sld=document.getElementById('sld-zmax');
   const inp=document.getElementById('inp-zmax');
-  sld.min=zDataMin.toFixed(2); sld.max=zDataMax.toFixed(2);
-  if(!_zmaxLocked){{sld.value=zDataMax.toFixed(2);inp.value=zDataMax.toFixed(2);}}
+  sld.min=zDataMin.toFixed(5); sld.max=zDataMax.toFixed(5);
+  if(!_zmaxLocked){{sld.value=zDataMax.toFixed(5);inp.value=zDataMax.toFixed(5);}}
   const threshold=Math.min(zDataMax,Math.max(zDataMin,parseFloat(inp.value)||zDataMax));
+  const plotZmax=Math.max(threshold,zDataMin+1e-9);
   const zMean=flatZ.length?flatZ.reduce((a,b)=>a+b,0)/flatZ.length:0;
-  const aboveThresh=flatZ.filter(v=>v>threshold).length;
+  const aboveThresh=flatZ.filter(v=>v>plotZmax).length;
   document.getElementById('debug-stats').innerHTML=
     'cells: '+nx*ny+' ('+flatZ.length+' valid, '+aboveThresh+' grayed)<br>'+
+    'x: '+valsX[0].toPrecision(4)+' … '+valsX[nx-1].toPrecision(4)+'<br>'+
+    'y: '+valsY[0].toPrecision(4)+' … '+valsY[ny-1].toPrecision(4)+'<br>'+
     'log₁₀ min: '+zDataMin.toFixed(3)+'<br>'+
     'log₁₀ max: '+zDataMax.toFixed(3)+'<br>'+
     'log₁₀ mean: '+zMean.toFixed(3);
@@ -484,14 +492,14 @@ function render(){{
   traces.push({{
     type:'heatmap', x:valsX, y:valsY, z:logZ,
     colorscale:VIRIDIS_GRAY, showscale:true,
-    zmin:zDataMin, zmax:threshold,
+    zmin:zDataMin, zmax:plotZmax,
     colorbar:{{title:{{text:'log₁₀(loss)',side:'right'}},thickness:14,len:.9,tickfont:{{color:'#bbb'}},titlefont:{{color:'#bbb'}}}},
     hovertemplate:pl(paramX)+': %{{x:.5g}}<br>'+pl(paramY)+': %{{y:.5g}}<br>log₁₀(loss): %{{z:.3f}}<extra></extra>',
   }});
 
   // Gradient arrows
   if(hasGrad&&sumGX){{
-    const nGrid=Math.max(4,Math.min(12,Math.floor(Math.sqrt(nx*ny)/2)));
+    const nGrid=parseInt(document.getElementById('sld-density').value);
     const gxArr=toRegularArray(sumGX), gyArr=toRegularArray(sumGY);
     const arr=computeArrows(valsX,valsY,gxArr,gyArr,nGrid);
     traces.push({{
@@ -554,6 +562,10 @@ buildParamDropdowns();
 buildTrackList();
 document.getElementById('chk-noise').addEventListener('change',()=>{{_zmaxLocked=false;render();}});
 document.getElementById('chk-grad').addEventListener('change',render);
+document.getElementById('sld-density').addEventListener('input',()=>{{
+  document.getElementById('lbl-density').textContent=document.getElementById('sld-density').value;
+  render();
+}});
 document.getElementById('sld-zmax').addEventListener('input',()=>{{
   document.getElementById('inp-zmax').value=parseFloat(document.getElementById('sld-zmax').value).toFixed(2);
   _zmaxLocked=true; render();

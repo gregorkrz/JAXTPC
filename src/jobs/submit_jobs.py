@@ -44,6 +44,9 @@ Available profiles
   longitudinal_transverse_diffusion Same setup; optimize diffusion_long_cm2_us and diffusion_trans_cm2_us together
   timing_study_diag50mev           Seven jobs: single 50 MeV diagonal track, deposit pads 5k–100k, 1000 steps (OOM sweep)
   timing_study_cont                Three jobs: same setup, deposit pads 45k / 50k / 55k only
+  15_Tracks_Adam_default_BS1       15-track boundary ensemble (seed=42), no LR multipliers, batch-size 1, single job
+  15_Tracks_Adam_default_BS1_AutoMultipliers  Same; with --lr-multipliers auto
+  15_Tracks_Adam_default_BS15      Same; accumulates gradients over all 15 tracks (--effective-batch-size 15)
   no_schedule_less_params         No phase schedule; sweep n_params=3..7 always including
                                   diffusion_long_cm2_us, then other physics (transverse diffusion last).
                                   Same tracks/seeds as fine_nosched_bs1 (20 Slurm jobs).
@@ -99,6 +102,27 @@ TRACKS_24_MIXED_XYZ = (
 
 # Single track (same physics tag as diagonal_50MeV in TRACKS_12)
 TRACK_DIAG_50MEV = "diagonal_50MeV:1,1,1:50"
+
+# 15-track boundary ensemble from tools/random_boundary_tracks.generate_random_boundary_tracks
+# (n=12 random x-face muons, seed=42, balanced across 100/500/1000 MeV) plus three fixed chords.
+# Directions are frozen here; regenerate with: generate_random_boundary_tracks(_VOLUMES, n=12, seed=42)
+TRACKS_15_BOUNDARY = (
+    "Muon1_1000MeV:-0.747872530,0.661463000,0.056154945:1000"
+    "+Muon2_500MeV:-0.641581737,0.275323919,-0.715939672:500"
+    "+Muon3_500MeV:-0.483652826,0.868350593,-0.109759697:500"
+    "+Muon4_100MeV:-0.694627880,0.476880059,0.538588450:100"
+    "+Muon5_100MeV:-0.448568523,-0.712616910,0.539410252:100"
+    "+Muon6_1000MeV:-0.624672693,-0.613017831,0.483728401:1000"
+    "+Muon7_500MeV:-0.610394124,-0.747896572,0.260901765:500"
+    "+Muon8_1000MeV:0.773174642,0.198385012,0.602365637:1000"
+    "+Muon9_500MeV:-0.931562076,-0.204366326,-0.300710000:500"
+    "+Muon10_100MeV:0.754859526,-0.437194999,0.488924973:100"
+    "+Muon11_1000MeV:-0.482051010,0.584842086,0.652369955:1000"
+    "+Muon12_100MeV:-0.553810025,-0.123483953,-0.823435589:100"
+    "+Muon_diagCross_1000MeV:-0.577350269,-0.577350269,-0.577350269:1000"
+    "+Muon_throughEw_skew02_1000MeV:0.934631179,-0.282614666,0.215855296:1000"
+    "+Muon_throughWe_skew03_1000MeV:-0.938658230,0.268188066,-0.216785353:1000"
+)
 
 
 def _tracks_mixed_xyz_plus_random(
@@ -225,6 +249,7 @@ def make_opt_command(
     params=ALL_PARAMS,
     tracks="diagonal_100MeV:1,1,1:100",
     loss="sobolev_loss_geomean_log1p",
+    optimizer="adam",
     lr=0.001,
     lr_schedule="constant",
     max_steps=5000,
@@ -255,6 +280,7 @@ def make_opt_command(
     patience_per_param=None,
     log_interval=None,
     lr_mult_auto_burn_in_steps=None,
+    newton_damping=None,
 ):
     """Return a run_optimization.py command string with the given settings."""
     parts = [
@@ -262,6 +288,7 @@ def make_opt_command(
         f"--params {params}",
         f"--tracks {tracks}",
         f"--loss {loss}",
+        f"--optimizer {optimizer}",
         f"--lr {lr}",
         f"--lr-schedule {lr_schedule}",
         f"--max-steps {max_steps}",
@@ -314,6 +341,8 @@ def make_opt_command(
         parts.append(f"--patience-per-param {patience_per_param}")
     if log_interval is not None:
         parts.append(f"--log-interval {int(log_interval)}")
+    if newton_damping is not None:
+        parts.append(f"--newton-damping {newton_damping}")
     return " ".join(parts)
 
 
@@ -1548,6 +1577,508 @@ def profile_timing_study_cont(*, submit=True, print_sbatch_only=False, wandb_tag
         )
 
 
+def profile_15_Tracks_Adam_default_BS1(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """15-track boundary ensemble (seed=42), Adam, no LR multipliers, batch-size 1, seed 42.
+
+    Same core setup as ``profile_tracks12_mixed_cos30k_nosched_auto_clip1_noparamfreeze``
+    (cosine LR, 30k steps, warmup 1k, clip 1.0, patience 2000, no per-param freeze) but:
+      - tracks: TRACKS_15_BOUNDARY (the same 15 tracks used in 2D landscape plots)
+      - no ``--lr-multipliers`` (uniform per-param LR)
+      - single job at seed=42
+    """
+    shared = dict(
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.0001,
+        lr_schedule="cosine",
+        max_steps=30000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base="$RESULTS_DIR/opt/tracks15_boundary_cos30k/nosched_bs1",
+        grad_clip=1.0,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=0.1,
+        max_num_deposits=50000,
+        batch_size=1,
+    )
+    params = ",".join(PARAM_LIST)
+    command = make_opt_command(
+        params=params,
+        tracks=TRACKS_15_BOUNDARY,
+        seed=42,
+        noise_scale=0.0,
+        wandb_tags=wandb_tags,
+        **shared,
+    )
+    if not print_sbatch_only:
+        print(command)
+    s3df_submit(
+        command,
+        time="04:00:00",
+        submit=submit,
+        mem_gb=64,
+        print_sbatch_command=print_sbatch_only,
+    )
+
+
+def profile_15_Tracks_Adam_default_BS1_AutoMultipliers(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """Same as ``profile_15_Tracks_Adam_default_BS1`` but with ``--lr-multipliers auto``."""
+    shared = dict(
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.0001,
+        lr_schedule="cosine",
+        max_steps=30000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base="$RESULTS_DIR/opt/tracks15_boundary_cos30k/nosched_automult_bs1",
+        grad_clip=1.0,
+        lr_multipliers="auto",
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=0.1,
+        max_num_deposits=50000,
+        batch_size=1,
+    )
+    params = ",".join(PARAM_LIST)
+    command = make_opt_command(
+        params=params,
+        tracks=TRACKS_15_BOUNDARY,
+        seed=42,
+        noise_scale=0.0,
+        wandb_tags=wandb_tags,
+        **shared,
+    )
+    if not print_sbatch_only:
+        print(command)
+    s3df_submit(
+        command,
+        time="04:00:00",
+        submit=submit,
+        mem_gb=64,
+        print_sbatch_command=print_sbatch_only,
+    )
+
+
+def profile_15_Tracks_Adam_default_BS15(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """Same as ``profile_15_Tracks_Adam_default_BS1`` but accumulates gradients over all 15 tracks.
+
+    Uses ``--effective-batch-size 15`` so each optimizer step sees the gradient summed
+    across all 15 tracks before applying Adam; ``--batch-size 1`` keeps memory usage low.
+    """
+    shared = dict(
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.0001,
+        lr_schedule="cosine",
+        max_steps=30000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base="$RESULTS_DIR/opt/tracks15_boundary_cos30k/nosched_ebs15",
+        grad_clip=1.0,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=0.1,
+        max_num_deposits=50000,
+        batch_size=1,
+        effective_batch_size=15,
+    )
+    params = ",".join(PARAM_LIST)
+    command = make_opt_command(
+        params=params,
+        tracks=TRACKS_15_BOUNDARY,
+        seed=42,
+        noise_scale=0.0,
+        wandb_tags=wandb_tags,
+        **shared,
+    )
+    if not print_sbatch_only:
+        print(command)
+    s3df_submit(
+        command,
+        time="04:00:00",
+        submit=submit,
+        mem_gb=64,
+        print_sbatch_command=print_sbatch_only,
+    )
+
+
+def profile_15_Tracks_Adam_default_BS15_coarse1mm(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """Same as ``profile_15_Tracks_Adam_default_BS15`` but coarse forward pass: 1 mm step, 5k deposits.
+
+    Uses ``--batch-size 5 --effective-batch-size 3``: 3 vmap batches of (5,5,5) tracks cover
+    all 15 per optimizer step. batch_size=15 and 7 OOM during XLA compilation.
+    GT also uses 1 mm / 5k deposits to match the forward pass.
+    """
+    shared = dict(
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.0001,
+        lr_schedule="cosine",
+        max_steps=30000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base="$RESULTS_DIR/opt/tracks15_boundary_cos30k/nosched_coarse1mm_vmap5",
+        grad_clip=1.0,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=1.0,
+        max_num_deposits=5000,
+        batch_size=5,
+        effective_batch_size=3,
+        gt_step_size=1.0,
+        gt_max_deposits=5000,
+    )
+    params = ",".join(PARAM_LIST)
+    command = make_opt_command(
+        params=params,
+        tracks=TRACKS_15_BOUNDARY,
+        seed=42,
+        noise_scale=0.0,
+        wandb_tags=wandb_tags,
+        **shared,
+    )
+    if not print_sbatch_only:
+        print(command)
+    s3df_submit(
+        command,
+        time="04:00:00",
+        submit=submit,
+        mem_gb=64,
+        print_sbatch_command=print_sbatch_only,
+    )
+
+
+def profile_15_Tracks_Adam_default_BS15_coarse1mm_LR1e3(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """Same as ``profile_15_Tracks_Adam_default_BS15_coarse1mm`` but lr=1e-3."""
+    shared = dict(
+        loss="sobolev_loss_geomean_log1p",
+        lr=1e-3,
+        lr_schedule="cosine",
+        max_steps=30000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base="$RESULTS_DIR/opt/tracks15_boundary_cos30k/nosched_coarse1mm_vmap5_lr1e3",
+        grad_clip=1.0,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=1.0,
+        max_num_deposits=5000,
+        batch_size=5,
+        effective_batch_size=3,
+        gt_step_size=1.0,
+        gt_max_deposits=5000,
+    )
+    params = ",".join(PARAM_LIST)
+    command = make_opt_command(
+        params=params,
+        tracks=TRACKS_15_BOUNDARY,
+        seed=42,
+        noise_scale=0.0,
+        wandb_tags=wandb_tags,
+        **shared,
+    )
+    if not print_sbatch_only:
+        print(command)
+    s3df_submit(
+        command,
+        time="04:00:00",
+        submit=submit,
+        mem_gb=64,
+        print_sbatch_command=print_sbatch_only,
+    )
+
+
+def profile_15_Tracks_Adam_default_BS15_coarse1mm_LR1e3_NoVelocity(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """Same as ``profile_15_Tracks_Adam_default_BS15_coarse1mm_LR1e3`` but omits ``velocity_cm_us`` from params."""
+    shared = dict(
+        loss="sobolev_loss_geomean_log1p",
+        lr=1e-3,
+        lr_schedule="cosine",
+        max_steps=30000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base="$RESULTS_DIR/opt/tracks15_boundary_cos30k/nosched_coarse1mm_vmap5_lr1e3_no_vel",
+        grad_clip=1.0,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=1.0,
+        max_num_deposits=5000,
+        batch_size=5,
+        effective_batch_size=3,
+        gt_step_size=1.0,
+        gt_max_deposits=5000,
+    )
+    params = ",".join(p for p in PARAM_LIST if p != "velocity_cm_us")
+    command = make_opt_command(
+        params=params,
+        tracks=TRACKS_15_BOUNDARY,
+        seed=42,
+        noise_scale=0.0,
+        wandb_tags=wandb_tags,
+        **shared,
+    )
+    if not print_sbatch_only:
+        print(command)
+    s3df_submit(
+        command,
+        time="04:00:00",
+        submit=submit,
+        mem_gb=64,
+        print_sbatch_command=print_sbatch_only,
+    )
+
+
+def profile_15_Tracks_Newton_recombAlpha_velocity_BS1(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """Newton optimizer on recomb_alpha + velocity_cm_us only, 15-track boundary ensemble.
+
+    LR=1.0 (pure Newton step scale), damping=1e-3 (H + 1e-3*I), coarse forward pass
+    (1 mm / 5k deposits), batch_size=1 / effective_batch_size=15 to accumulate
+    gradient + Hessian over all 15 tracks per optimizer step.
+    """
+    shared = dict(
+        loss="sobolev_loss_geomean_log1p",
+        lr=1.0,
+        lr_schedule="cosine",  # no-op for Newton
+        max_steps=30000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base="$RESULTS_DIR/opt/tracks15_boundary_cos30k/newton_recombAlpha_velocity_coarse1mm_ebs15",
+        grad_clip=1.0,
+        warmup_steps=1000,  # no-op for Newton
+        num_buckets=1000,
+        step_size=1.0,
+        max_num_deposits=5000,
+        batch_size=1,
+        effective_batch_size=15,
+        gt_step_size=1.0,
+        gt_max_deposits=5000,
+        newton_damping=1e-3,
+    )
+    command = make_opt_command(
+        params="recomb_alpha,velocity_cm_us",
+        tracks=TRACKS_15_BOUNDARY,
+        optimizer="newton",
+        seed=42,
+        noise_scale=0.0,
+        wandb_tags=wandb_tags,
+        **shared,
+    )
+    if not print_sbatch_only:
+        print(command)
+    s3df_submit(
+        command,
+        time="04:00:00",
+        submit=submit,
+        mem_gb=64,
+        print_sbatch_command=print_sbatch_only,
+    )
+
+
+def profile_15_Tracks_Newton_diffRecomb_BS1(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """Newton optimizer on diffusion + recomb block (5 params), 15-track boundary ensemble.
+
+    Params: diffusion_trans, diffusion_long, recomb_alpha, recomb_beta_90, recomb_R.
+    Fine forward pass (0.1 mm / 50k deposits), lr=1.0, damping=1e-3,
+    batch_size=1 / effective_batch_size=15 (all 15 tracks per optimizer step).
+    """
+    shared = dict(
+        loss="sobolev_loss_geomean_log1p",
+        lr=1.0,
+        lr_schedule="cosine",  # no-op for Newton
+        max_steps=30000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base="$RESULTS_DIR/opt/tracks15_boundary_cos30k/newton_diffRecomb_ebs15",
+        grad_clip=1.0,
+        warmup_steps=1000,  # no-op for Newton
+        num_buckets=1000,
+        step_size=0.1,
+        max_num_deposits=50000,
+        batch_size=1,
+        effective_batch_size=15,
+        newton_damping=1e-3,
+    )
+    params = "diffusion_trans_cm2_us,diffusion_long_cm2_us,recomb_alpha,recomb_beta_90,recomb_R"
+    command = make_opt_command(
+        params=params,
+        tracks=TRACKS_15_BOUNDARY,
+        optimizer="newton",
+        seed=42,
+        noise_scale=0.0,
+        wandb_tags=wandb_tags,
+        **shared,
+    )
+    if not print_sbatch_only:
+        print(command)
+    s3df_submit(
+        command,
+        time="04:00:00",
+        submit=submit,
+        mem_gb=64,
+        print_sbatch_command=print_sbatch_only,
+    )
+
+
+def profile_15_Tracks_Newton_allParams_BS1(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """Newton optimizer on all 7 params, 15-track boundary ensemble.
+
+    Fine forward pass (0.1 mm / 50k deposits), lr=1.0, damping=1e-3,
+    batch_size=1 / effective_batch_size=15 (all 15 tracks per optimizer step).
+    """
+    shared = dict(
+        loss="sobolev_loss_geomean_log1p",
+        lr=1.0,
+        lr_schedule="cosine",  # no-op for Newton
+        max_steps=30000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base="$RESULTS_DIR/opt/tracks15_boundary_cos30k/newton_allParams_ebs15",
+        grad_clip=1.0,
+        warmup_steps=1000,  # no-op for Newton
+        num_buckets=1000,
+        step_size=0.1,
+        max_num_deposits=50000,
+        batch_size=1,
+        effective_batch_size=15,
+        newton_damping=1e-3,
+    )
+    params = ",".join(PARAM_LIST)
+    command = make_opt_command(
+        params=params,
+        tracks=TRACKS_15_BOUNDARY,
+        optimizer="newton",
+        seed=42,
+        noise_scale=0.0,
+        wandb_tags=wandb_tags,
+        **shared,
+    )
+    if not print_sbatch_only:
+        print(command)
+    s3df_submit(
+        command,
+        time="04:00:00",
+        submit=submit,
+        mem_gb=64,
+        print_sbatch_command=print_sbatch_only,
+    )
+
+
+def profile_15_Tracks_Adam_default_BS15_LR4e4(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """Same as ``profile_15_Tracks_Adam_default_BS15`` but lr=4e-4 (≈ sqrt(15) × 1e-4 scaling rule)."""
+    shared = dict(
+        loss="sobolev_loss_geomean_log1p",
+        lr=4e-4,
+        lr_schedule="cosine",
+        max_steps=30000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base="$RESULTS_DIR/opt/tracks15_boundary_cos30k/nosched_ebs15_lr4e4",
+        grad_clip=1.0,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=0.1,
+        max_num_deposits=50000,
+        batch_size=1,
+        effective_batch_size=15,
+    )
+    params = ",".join(PARAM_LIST)
+    command = make_opt_command(
+        params=params,
+        tracks=TRACKS_15_BOUNDARY,
+        seed=42,
+        noise_scale=0.0,
+        wandb_tags=wandb_tags,
+        **shared,
+    )
+    if not print_sbatch_only:
+        print(command)
+    s3df_submit(
+        command,
+        time="04:00:00",
+        submit=submit,
+        mem_gb=64,
+        print_sbatch_command=print_sbatch_only,
+    )
+
+
 PROFILES = {
     "3_part_schedule": profile_3_part_schedule,
     "2_part_schedule": profile_2_part_schedule,
@@ -1584,6 +2115,16 @@ PROFILES = {
     "longitudinal_transverse_diffusion": profile_longitudinal_transverse_diffusion,
     "timing_study_diag50mev": profile_timing_study_diag50mev,
     "timing_study_cont": profile_timing_study_cont,
+    "15_Tracks_Adam_default_BS1": profile_15_Tracks_Adam_default_BS1,
+    "15_Tracks_Adam_default_BS1_AutoMultipliers": profile_15_Tracks_Adam_default_BS1_AutoMultipliers,
+    "15_Tracks_Adam_default_BS15": profile_15_Tracks_Adam_default_BS15,
+    "15_Tracks_Adam_default_BS15_coarse1mm": profile_15_Tracks_Adam_default_BS15_coarse1mm,
+    "15_Tracks_Adam_default_BS15_coarse1mm_LR1e3": profile_15_Tracks_Adam_default_BS15_coarse1mm_LR1e3,
+    "15_Tracks_Adam_default_BS15_coarse1mm_LR1e3_NoVelocity": profile_15_Tracks_Adam_default_BS15_coarse1mm_LR1e3_NoVelocity,
+    "15_Tracks_Newton_recombAlpha_velocity_BS1": profile_15_Tracks_Newton_recombAlpha_velocity_BS1,
+    "15_Tracks_Newton_diffRecomb_BS1": profile_15_Tracks_Newton_diffRecomb_BS1,
+    "15_Tracks_Newton_allParams_BS1": profile_15_Tracks_Newton_allParams_BS1,
+    "15_Tracks_Adam_default_BS15_LR4e4": profile_15_Tracks_Adam_default_BS15_LR4e4,
 }
 
 
