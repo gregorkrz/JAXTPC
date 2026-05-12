@@ -64,7 +64,8 @@ def _sbatch_job_name(command: str) -> str:
 def s3df_submit(command: str, *, time: str = "02:00:00", gpus: int = 1,
                 mem_gb: int = 32, cpus_per_gpu: int = 1, submit: bool = False,
                 print_sbatch_command: bool = False,
-                sbatch_commands_out: Optional[List[str]] = None) -> Path:
+                sbatch_commands_out: Optional[List[str]] = None,
+                dependency: Optional[str] = None) -> Optional[str]:
     JOBS_DIR.mkdir(exist_ok=True)
 
     command = _ensure_python_opt_command(command)
@@ -109,11 +110,20 @@ def s3df_submit(command: str, *, time: str = "02:00:00", gpus: int = 1,
     path.write_text(script)
 
     if submit:
-        result = subprocess.run(["sbatch", str(path)], universal_newlines=True,
+        sbatch_cmd = ["sbatch"]
+        if dependency:
+            sbatch_cmd.append(f"--dependency=afterany:{dependency}")
+        sbatch_cmd.append(str(path))
+        result = subprocess.run(sbatch_cmd, universal_newlines=True,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        print(result.stdout.strip() or result.stderr.strip())
+        out = result.stdout.strip() or result.stderr.strip()
+        print(out)
+        parts = out.split()
+        return parts[-1] if parts and parts[-1].isdigit() else None
     elif print_sbatch_command:
         line = f"sbatch {path.resolve()}"
+        if dependency:
+            line = f"sbatch --dependency=afterany:<prev_job_id> {path.resolve()}"
         if sbatch_commands_out is not None:
             sbatch_commands_out.append(line)
         else:
@@ -121,4 +131,4 @@ def s3df_submit(command: str, *, time: str = "02:00:00", gpus: int = 1,
     else:
         print(f"wrote {path}")
 
-    return path
+    return None

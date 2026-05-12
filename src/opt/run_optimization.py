@@ -276,9 +276,13 @@ def parse_args():
     p.add_argument('--adam-beta2', type=float, default=ADAM_BETA2,
                    help=f'Adam beta2 (second-moment decay). Default {ADAM_BETA2}.')
     p.add_argument('--init-from-wandb-run', default=None, metavar='RUN_ID',
-                   help='Start trial 0 from the last logged param values of an existing W&B run '
-                        '(fetches params/<name>_physical from the run summary). '
+                   help='Start trial 0 from param values of an existing W&B run '
+                        '(fetches params/<name>_physical). '
                         'Remaining trials use random starts as usual.')
+    p.add_argument('--init-from-wandb-step', type=int, default=-1, metavar='STEP',
+                   help='Step to read from --init-from-wandb-run. '
+                        '-1 (default) uses the run summary (last logged value). '
+                        'A non-negative value fetches that exact logged step.')
     return p.parse_args()
 
 
@@ -1082,7 +1086,7 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
                 batch_idx = (step * eff_bs + micro) % len(batch_fns)
                 fn = batch_fns[batch_idx]
                 lv, gv, hv = fn(p)
-                jax.block_until_ready((lv, gv, hv))
+                #jax.block_until_ready((lv, gv, hv))
                 gv_acc = gv_acc + gv
                 hv_acc = hv_acc + hv
                 last_batch_idx = batch_idx
@@ -1115,7 +1119,7 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
                 batch_idx = (step * eff_bs + micro) % len(batch_fns)
                 fn = batch_fns[batch_idx]
                 lv, gv, _ = _unpack_batch_fn_ret(fn(p))
-                jax.block_until_ready((lv, gv))
+                #jax.block_until_ready((lv, gv))
                 gv_acc = gv_acc + gv
                 last_batch_idx = batch_idx
             gv = gv_acc / float(eff_bs)
@@ -1301,26 +1305,41 @@ def apply_noise_to_gt(gt_arrays, simulator, noise_scale, noise_seed):
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-def fetch_init_params_from_wandb(run_id, param_names, scales, wandb_project):
-    """Fetch last physical param values from a W&B run and return a p_n list.
+def fetch_init_params_from_wandb(run_id, param_names, scales, wandb_project, step=-1):
+    """Fetch physical param values from a W&B run and return a p_n list.
 
-    Uses the run summary (last logged value per key).  Raises ValueError if any
-    params/<name>_physical key is missing from the summary.
+    step=-1 (default): use the run summary (last logged value).
+    step>=0: fetch that specific logged step via scan_history.
+    Raises ValueError if any params/<name>_physical key is missing.
     """
     if not _WANDB_AVAILABLE:
         raise RuntimeError('wandb not installed; cannot use --init-from-wandb-run')
     api = _wandb.Api()
     run = api.run(f"{wandb_project}/{run_id}")
-    summary = run.summary
-    p_n_init = []
-    for name, scale in zip(param_names, scales):
-        key = f"params/{name}_physical"
-        val = summary.get(key)
-        if val is None:
-            available = sorted(k for k in summary.keys() if k.startswith('params/'))
+    keys = [f"params/{name}_physical" for name in param_names]
+
+    if step < 0:
+        source = run.summary
+        row = {k: source.get(k) for k in keys}
+        step_label = 'summary (latest)'
+    else:
+        rows = list(run.scan_history(keys=keys, min_step=step, max_step=step + 1))
+        if not rows:
             raise ValueError(
-                f"Key {key!r} not in W&B run {run_id} summary.\n"
-                f"Available params/* keys: {available}"
+                f"No history row found at step {step} in W&B run {run_id}. "
+                f"Check that this step was actually logged."
+            )
+        row = rows[0]
+        step_label = f'step {step}'
+
+    p_n_init = []
+    for name, scale, key in zip(param_names, scales, keys):
+        val = row.get(key)
+        if val is None:
+            available = sorted(k for k in run.summary.keys() if k.startswith('params/'))
+            raise ValueError(
+                f"Key {key!r} not found at {step_label} in W&B run {run_id}.\n"
+                f"Available params/* keys in summary: {available}"
             )
         p_n = float(np.log(float(val) / scale))
         p_n_init.append(p_n)
@@ -1707,9 +1726,13 @@ def main():
     p_n_starts    = (np.log(factors) + np.array(p_n_gts)).tolist()
 
     if args.init_from_wandb_run:
-        print(f'\nFetching initial params from W&B run {args.init_from_wandb_run!r}...')
+        _step_label = (f'step {args.init_from_wandb_step}'
+                       if args.init_from_wandb_step >= 0 else 'latest')
+        print(f'\nFetching initial params from W&B run {args.init_from_wandb_run!r} '
+              f'({_step_label})...')
         p_n_from_run = fetch_init_params_from_wandb(
-            args.init_from_wandb_run, param_names, scales, args.wandb_project)
+            args.init_from_wandb_run, param_names, scales, args.wandb_project,
+            step=args.init_from_wandb_step)
         p_n_starts[0] = p_n_from_run
         factor_grid[0] = [float(np.exp(pn - pngt))
                           for pn, pngt in zip(p_n_from_run, p_n_gts)]

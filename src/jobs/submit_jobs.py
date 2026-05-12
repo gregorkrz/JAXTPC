@@ -283,6 +283,7 @@ def make_opt_command(
     newton_damping=None,
     adam_beta2=None,
     init_from_wandb_run=None,
+    init_from_wandb_step=None,
 ):
     """Return a run_optimization.py command string with the given settings."""
     parts = [
@@ -349,6 +350,8 @@ def make_opt_command(
         parts.append(f"--adam-beta2 {adam_beta2}")
     if init_from_wandb_run is not None:
         parts.append(f"--init-from-wandb-run {init_from_wandb_run}")
+    if init_from_wandb_step is not None:
+        parts.append(f"--init-from-wandb-step {init_from_wandb_step}")
     return " ".join(parts)
 
 
@@ -2207,6 +2210,66 @@ def profile_15_Tracks_Adam_default_BS15_LR4e4(
     )
 
 
+def profile_15Trk_Adam_Noise_20260511(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """Sweep over 5 Adam beta2 values with clip disabled, seed=42.
+
+    beta2 in [0.9, 0.99, 0.999, 0.9999, 0.99999].  All other settings match
+    run 4t0kxso1 (lr=0.001, cosine, coarse 1mm/5k, eff_bs=5), except
+    clip_grad_norm=0 (disabled).  Motivation: with clip=1.0 the velocity_cm_us
+    gradient (34k) crushes diffusion_trans into Adam's eps regime; removing clip
+    lets each param's second moment adapt independently, and varying beta2
+    controls how quickly that adaptation tracks the current gradient scale.
+    """
+    params = ",".join(PARAM_LIST)
+    beta2 = 0.9
+    results_base = (
+        f"$RESULTS_DIR/opt/Adam_Noise_20260511"
+    )
+    command = make_opt_command(
+        params=params,
+        tracks=TRACKS_15_BOUNDARY,
+        optimizer="adam",
+        seed=42,
+        noise_scale=1.0,
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.001,
+        lr_schedule="cosine",
+        max_steps=30000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base=results_base,
+        grad_clip=0.0,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=1.0,
+        max_num_deposits=5000,
+        batch_size=5,
+        effective_batch_size=3,
+        gt_step_size=1.0,
+        gt_max_deposits=5000,
+        adam_beta2=beta2,
+        log_interval=50,
+        wandb_tags=(wandb_tags or []) + ["Adam_Noise_20260511"],
+    )
+    if not print_sbatch_only:
+        print(command)
+    s3df_submit(
+        command,
+        time="05:00:00",
+        submit=submit,
+        mem_gb=64,
+        print_sbatch_command=print_sbatch_only,
+    )
+
+
 def profile_15_Tracks_Adam_Beta2Sweep_NoClip(
     *,
     submit=True,
@@ -2268,7 +2331,64 @@ def profile_15_Tracks_Adam_Beta2Sweep_NoClip(
             print_sbatch_command=print_sbatch_only,
         )
 
+def profile_15_Tracks_Newton_ContinueFrom_eizhqsj0_step1k(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """Newton continuation from Adam run eizhqsj0.
 
+    Picks up where the Adam run left off: initialises trial 0 from the last
+    logged params/<name>_physical values of run eizhqsj0, then runs Newton
+    with damping=0.01, lr=1.0, no gradient clipping.
+    All other settings match profile_15_Tracks_Newton_allParams_BS1.
+    """
+    params = ",".join(PARAM_LIST)
+    results_base = (
+        "$RESULTS_DIR/opt/tracks15_boundary_cos30k"
+        "/newton_allParams_continue_eizhqsj0"
+    )
+    command = make_opt_command(
+        params=params,
+        tracks=TRACKS_15_BOUNDARY,
+        optimizer="newton",
+        seed=42,
+        noise_scale=0.0,
+        loss="sobolev_loss_geomean_log1p",
+        lr=1.0,
+        lr_schedule="cosine",
+        max_steps=30000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        results_base=results_base,
+        grad_clip=-1,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=1.0,
+        max_num_deposits=5000,
+        batch_size=1,
+        effective_batch_size=15,
+        gt_step_size=1.0,
+        gt_max_deposits=5000,
+        newton_damping=0.01,
+        log_interval=5,
+        init_from_wandb_run="eizhqsj0",
+        init_from_wandb_step=1000,
+        wandb_tags=(wandb_tags or []) + ["15_Tracks_Newton_ContinueFrom_eizhqsj0_Step1k"],
+    )
+    if not print_sbatch_only:
+        print(command)
+    s3df_submit(
+        command,
+        time="00:30:00",
+        submit=submit,
+        mem_gb=32,
+        print_sbatch_command=print_sbatch_only,
+    )
 def profile_15_Tracks_Newton_ContinueFrom_eizhqsj0(
     *,
     submit=True,
@@ -2328,6 +2448,70 @@ def profile_15_Tracks_Newton_ContinueFrom_eizhqsj0(
     )
 
 
+def profile_15Trk_Adam_NoiseSeedSweep_3k(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """Seed sweep (43–47) × noise on/off, 3k steps, identical to Adam_Noise_20260511 otherwise.
+
+    10 jobs total: 5 seeds × 2 noise conditions (noise_scale=1.0 and noise_scale=0.0).
+    All other settings match profile_15Trk_Adam_Noise_20260511:
+    lr=0.001, cosine, beta2=0.9, no clip, coarse 1mm/5k, bs=5, eff_bs=3.
+    """
+    params = ",".join(PARAM_LIST)
+    shared = dict(
+        params=params,
+        tracks=TRACKS_15_BOUNDARY,
+        optimizer="adam",
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.001,
+        lr_schedule="cosine",
+        max_steps=3000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        grad_clip=0.0,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=1.0,
+        max_num_deposits=5000,
+        batch_size=5,
+        effective_batch_size=3,
+        gt_step_size=1.0,
+        gt_max_deposits=5000,
+        adam_beta2=0.9,
+        log_interval=50,
+    )
+    for noise_scale in [1.0, 0.0]:
+        noise_tag = "noise" if noise_scale > 0.0 else "nonoise"
+        prev_job = None
+        for seed in [43, 44, 45, 46, 47]:
+            results_base = (
+                f"$RESULTS_DIR/opt/Adam_NoiseSeedSweep_3k/{noise_tag}"
+            )
+            command = make_opt_command(
+                seed=seed,
+                noise_scale=noise_scale,
+                results_base=results_base,
+                wandb_tags=(wandb_tags or []) + ["Adam_NoiseSeedSweep_3k", noise_tag],
+                **shared,
+            )
+            if not print_sbatch_only:
+                print(command)
+            prev_job = s3df_submit(
+                command,
+                time="01:05:00",
+                submit=submit,
+                mem_gb=64,
+                print_sbatch_command=print_sbatch_only,
+                dependency=prev_job,
+            )
+
+
 PROFILES = {
     "3_part_schedule": profile_3_part_schedule,
     "2_part_schedule": profile_2_part_schedule,
@@ -2378,6 +2562,9 @@ PROFILES = {
     "15_Tracks_Newton_ContinueFrom_eizhqsj0": profile_15_Tracks_Newton_ContinueFrom_eizhqsj0,
     "15_Tracks_Adam_Beta2Sweep_NoClip": profile_15_Tracks_Adam_Beta2Sweep_NoClip,
     "15_Tracks_Adam_default_BS15_LR4e4": profile_15_Tracks_Adam_default_BS15_LR4e4,
+    "15_Tracks_Newton_ContinueFrom_eizhqsj0_step1k": profile_15_Tracks_Newton_ContinueFrom_eizhqsj0_step1k,
+    "Adam_Noise_20260511": profile_15Trk_Adam_Noise_20260511,
+    "Adam_NoiseSeedSweep_3k": profile_15Trk_Adam_NoiseSeedSweep_3k,
 }
 
 
