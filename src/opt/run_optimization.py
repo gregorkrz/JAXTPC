@@ -283,6 +283,10 @@ def parse_args():
                    help='Step to read from --init-from-wandb-run. '
                         '-1 (default) uses the run summary (last logged value). '
                         'A non-negative value fetches that exact logged step.')
+    p.add_argument('--gt-param-multiplier', type=float, default=1.0,
+                   help='Multiply all optimized GT parameter values by this factor before '
+                        'generating the reference signal (default: 1.0, i.e. no shift). '
+                        'Use 1.2 to shift the true parameters 20%% upward.')
     return p.parse_args()
 
 
@@ -1561,6 +1565,14 @@ def main():
         lifetime_us    = jnp.array(GT_LIFETIME_US),
         velocity_cm_us = jnp.array(GT_VELOCITY_CM_US),
     )
+
+    if args.gt_param_multiplier != 1.0:
+        for _pname in param_names:
+            _val = _get_gt_val(_pname, gt_params, gt_sim.recomb_model) * args.gt_param_multiplier
+            gt_params = _apply_param(_pname, _val, gt_params)
+        print(f'GT params scaled by {args.gt_param_multiplier}x:')
+        for _pname in param_names:
+            print(f'  {_pname}: {_get_gt_val(_pname, gt_params, gt_sim.recomb_model):.6g}')
 
     # ── Setter ────────────────────────────────────────────────────────────────
     setter, gt_vals, scales, p_n_gts = make_nparam_setter(

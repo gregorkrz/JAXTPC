@@ -60,9 +60,31 @@ import math
 import os
 import pickle
 import random
+import re
 import sys
+from pathlib import Path
 
 from job_submission_tools import s3df_submit
+
+# ---------------------------------------------------------------------------
+# Resolve RESULTS_DIR: environment variable takes precedence; fall back to
+# parsing the project-root .env file (same file sourced inside sbatch jobs).
+# ---------------------------------------------------------------------------
+def _read_results_dir_from_env_file() -> str | None:
+    env_file = Path(__file__).parents[2] / ".env"
+    try:
+        text = env_file.read_text()
+    except OSError:
+        return None
+    m = re.search(r'^\s*(?:export\s+)?RESULTS_DIR\s*=\s*(.+)$', text, re.MULTILINE)
+    if not m:
+        return None
+    val = m.group(1).strip().strip('"').strip("'")
+    if not os.path.isabs(val):
+        val = str(Path(__file__).parents[2] / val)
+    return val
+
+_RESULTS_DIR: str = os.environ.get("RESULTS_DIR") or _read_results_dir_from_env_file() or "results"
 
 # All params compatible with the EMB recombination model
 ALL_PARAMS = (
@@ -183,6 +205,51 @@ def params_growing_with_long_diffusion(n_params: int) -> str:
     return ",".join(names)
 
 
+def _seed_is_complete(results_base: str, noise_tag: str, seed: int, verbose: bool = False) -> bool:
+    """Return True if a complete result pkl exists for this (results_base, noise_tag, seed).
+
+    Expands $RESULTS_DIR so this works both locally (if set) and on S3DF.
+    Scans results_base/noise_tag/*/result_{seed}.pkl — the extra subdirectory
+    level is the auto-generated folder_name from run_optimization.py.
+    Returns False (i.e. "needs submission") if the directory doesn't exist.
+    """
+    resolved = results_base.replace("$RESULTS_DIR", _RESULTS_DIR)
+    base = os.path.join(resolved, noise_tag)
+    pattern = os.path.join(base, "**", f"result_{seed}.pkl")
+    if verbose:
+        print(f"  checking {pattern}  [RESULTS_DIR={_RESULTS_DIR}]")
+    matches = glob.glob(pattern, recursive=True)
+    if not matches:
+        if verbose:
+            if not os.path.isdir(base):
+                print(f"    → directory does not exist: {base}")
+            else:
+                print(f"    → no result_{seed}.pkl found under {base}")
+        return False
+    for pkl_path in matches:
+        if verbose:
+            print(f"    found: {pkl_path}")
+        try:
+            with open(pkl_path, "rb") as f:
+                data = pickle.load(f)
+        except Exception as exc:
+            if verbose:
+                print(f"    → unreadable ({exc})")
+            continue
+        trials = data.get("trials") or []
+        n_expected = data.get("N", -1)
+        live = bool(data.get("live_checkpoint"))
+        incomplete = _optimization_pickle_incomplete(data)
+        if verbose:
+            if incomplete:
+                print(f"    → incomplete: {len(trials)}/{n_expected} trials, live_checkpoint={live}")
+            else:
+                print(f"    → complete: {len(trials)}/{n_expected} trials ✓")
+        if not incomplete:
+            return True
+    return False
+
+
 def _optimization_pickle_incomplete(data) -> bool:
     """True when this result pickle needs another Slurm/job run.
 
@@ -275,6 +342,7 @@ def make_opt_command(
     schedule_batch_sizes=None,
     gt_step_size=None,
     gt_max_deposits=None,
+    gt_param_multiplier=None,
     wandb_tags=None,
     tol_per_param=None,
     patience_per_param=None,
@@ -334,6 +402,8 @@ def make_opt_command(
         parts.append(f"--gt-step-size {gt_step_size}")
     if gt_max_deposits is not None:
         parts.append(f"--gt-max-deposits {gt_max_deposits}")
+    if gt_param_multiplier is not None:
+        parts.append(f"--gt-param-multiplier {gt_param_multiplier}")
     if wandb_tags:
         tags_csv = ",".join(w.strip() for w in wandb_tags if str(w).strip())
         if tags_csv:
@@ -2512,6 +2582,211 @@ def profile_15Trk_Adam_NoiseSeedSweep_3k(
             )
 
 
+def profile_15Trk_Adam_NoiseSeedSweep_3k_GT2(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+    skip_complete=False,
+    verbose=False,
+):
+    """Like Adam_NoiseSeedSweep_3k but GT parameters shifted 20% up (multiplier=1.2).
+
+    10 jobs total: 5 seeds × 2 noise conditions. No dependency chain; all jobs run in parallel.
+    """
+    params = ",".join(PARAM_LIST)
+    shared = dict(
+        params=params,
+        tracks=TRACKS_15_BOUNDARY,
+        optimizer="adam",
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.001,
+        lr_schedule="cosine",
+        max_steps=3000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        grad_clip=0.0,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=1.0,
+        max_num_deposits=5000,
+        batch_size=5,
+        effective_batch_size=3,
+        gt_step_size=1.0,
+        gt_max_deposits=5000,
+        gt_param_multiplier=1.2,
+        adam_beta2=0.9,
+        log_interval=50,
+    )
+    results_base = "$RESULTS_DIR/opt/Adam_NoiseSeedSweep_3k_GT2"
+    for noise_scale in [1.0, 0.0]:
+        noise_tag = "noise" if noise_scale > 0.0 else "nonoise"
+        for seed in [43, 44, 45, 46, 47]:
+            if verbose or skip_complete:
+                is_done = _seed_is_complete(results_base, noise_tag, seed, verbose=verbose)
+                if is_done and skip_complete:
+                    print(f"  SKIP complete: {noise_tag} seed={seed}")
+                    continue
+                elif not is_done and verbose:
+                    print(f"  → will submit: {noise_tag} seed={seed}")
+
+            command = make_opt_command(
+                seed=seed,
+                noise_scale=noise_scale,
+                results_base=f"{results_base}/{noise_tag}",
+                wandb_tags=(wandb_tags or []) + ["Adam_NoiseSeedSweep_3k_GT2", noise_tag],
+                **shared,
+            )
+            if not print_sbatch_only:
+                print(command)
+            s3df_submit(
+                command,
+                time="01:05:00",
+                submit=submit,
+                mem_gb=64,
+                print_sbatch_command=print_sbatch_only,
+            )
+
+
+def profile_15Trk_Adam_NoiseSeedSweep_3k_0p1mm_step_GT(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+    skip_complete=False,
+    verbose=False,
+):
+    """Like Adam_NoiseSeedSweep_3k but GT uses 0.1mm step / 50k deposits; bs=1, eff_bs=15.
+
+    4 jobs total: 2 seeds (43, 44) × 2 noise conditions. No dependency chain; all parallel.
+    """
+    params = ",".join(PARAM_LIST)
+    shared = dict(
+        params=params,
+        tracks=TRACKS_15_BOUNDARY,
+        optimizer="adam",
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.001,
+        lr_schedule="cosine",
+        max_steps=3000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        grad_clip=0.0,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=1.0,
+        max_num_deposits=5000,
+        batch_size=1,
+        effective_batch_size=15,
+        gt_step_size=0.1,
+        gt_max_deposits=50000,
+        adam_beta2=0.9,
+        log_interval=50,
+    )
+    results_base = "$RESULTS_DIR/opt/Adam_NoiseSeedSweep_3k_0p1mm_step_GT"
+    for noise_scale in [1.0, 0.0]:
+        noise_tag = "noise" if noise_scale > 0.0 else "nonoise"
+        for seed in [43, 44]:
+            if verbose or skip_complete:
+                is_done = _seed_is_complete(results_base, noise_tag, seed, verbose=verbose)
+                if is_done and skip_complete:
+                    print(f"  SKIP complete: {noise_tag} seed={seed}")
+                    continue
+                elif not is_done and verbose:
+                    print(f"  → will submit: {noise_tag} seed={seed}")
+
+            command = make_opt_command(
+                seed=seed,
+                noise_scale=noise_scale,
+                results_base=f"{results_base}/{noise_tag}",
+                wandb_tags=(wandb_tags or []) + ["Adam_NoiseSeedSweep_3k_0p1mm_step_GT", noise_tag],
+                **shared,
+            )
+            if not print_sbatch_only:
+                print(command)
+            s3df_submit(
+                command,
+                time="04:05:00",
+                submit=submit,
+                mem_gb=64,
+                print_sbatch_command=print_sbatch_only,
+            )
+
+
+def profile_15Trk_Adam_NoiseSeedSweep_3k_0p1mm_step_GT_and_sim(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+    skip_complete=False,
+    verbose=False,
+):
+    """Like Adam_NoiseSeedSweep_3k but both GT and sim use 0.1mm step / 50k deposits; bs=1, eff_bs=15.
+
+    4 jobs total: 2 seeds (43, 44) × 2 noise conditions. No dependency chain; all parallel.
+    """
+    params = ",".join(PARAM_LIST)
+    shared = dict(
+        params=params,
+        tracks=TRACKS_15_BOUNDARY,
+        optimizer="adam",
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.001,
+        lr_schedule="cosine",
+        max_steps=3000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        grad_clip=0.0,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=0.1,
+        max_num_deposits=50000,
+        batch_size=1,
+        effective_batch_size=15,
+        gt_step_size=0.1,
+        gt_max_deposits=50000,
+        adam_beta2=0.9,
+        log_interval=50,
+    )
+    results_base = "$RESULTS_DIR/opt/Adam_NoiseSeedSweep_3k_0p1mm_step_GT_and_sim"
+    for noise_scale in [1.0, 0.0]:
+        noise_tag = "noise" if noise_scale > 0.0 else "nonoise"
+        for seed in [43, 44]:
+            if verbose or skip_complete:
+                is_done = _seed_is_complete(results_base, noise_tag, seed, verbose=verbose)
+                if is_done and skip_complete:
+                    print(f"  SKIP complete: {noise_tag} seed={seed}")
+                    continue
+                elif not is_done and verbose:
+                    print(f"  → will submit: {noise_tag} seed={seed}")
+
+            command = make_opt_command(
+                seed=seed,
+                noise_scale=noise_scale,
+                results_base=f"{results_base}/{noise_tag}",
+                wandb_tags=(wandb_tags or []) + ["Adam_NoiseSeedSweep_3k_0p1mm_step_GT_and_sim", noise_tag],
+                **shared,
+            )
+            if not print_sbatch_only:
+                print(command)
+            s3df_submit(
+                command,
+                time="04:05:00",
+                submit=submit,
+                mem_gb=64,
+                print_sbatch_command=print_sbatch_only,
+            )
+
+
 PROFILES = {
     "3_part_schedule": profile_3_part_schedule,
     "2_part_schedule": profile_2_part_schedule,
@@ -2565,6 +2840,9 @@ PROFILES = {
     "15_Tracks_Newton_ContinueFrom_eizhqsj0_step1k": profile_15_Tracks_Newton_ContinueFrom_eizhqsj0_step1k,
     "Adam_Noise_20260511": profile_15Trk_Adam_Noise_20260511,
     "Adam_NoiseSeedSweep_3k": profile_15Trk_Adam_NoiseSeedSweep_3k,
+    "Adam_NoiseSeedSweep_3k_GT2": profile_15Trk_Adam_NoiseSeedSweep_3k_GT2,
+    "Adam_NoiseSeedSweep_3k_0p1mm_step_GT": profile_15Trk_Adam_NoiseSeedSweep_3k_0p1mm_step_GT,
+    "Adam_NoiseSeedSweep_3k_0p1mm_step_GT_and_sim": profile_15Trk_Adam_NoiseSeedSweep_3k_0p1mm_step_GT_and_sim,
 }
 
 
@@ -2607,6 +2885,19 @@ if __name__ == "__main__":
         help="Memory in GB for resubmitted jobs (default: 32)",
     )
     parser.add_argument(
+        "--skip-complete",
+        action="store_true",
+        help="Skip (seed, noise) combinations that already have a complete result pkl. "
+             "Checks $RESULTS_DIR on the current machine, so run this on S3DF where $RESULTS_DIR is set.",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="For each (seed, noise) combination: print which pkl was checked and why it is "
+             "complete or incomplete. Does not submit anything on its own; combine with "
+             "--skip-complete to also suppress already-done jobs.",
+    )
+    parser.add_argument(
         "--wandb-extra-tags",
         default=None,
         metavar="TAGS",
@@ -2635,10 +2926,18 @@ if __name__ == "__main__":
             wandb_tags.extend(
                 t.strip() for t in args.wandb_extra_tags.split(",") if t.strip()
             )
-        PROFILES[args.profile](
+        profile_fn = PROFILES[args.profile]
+        import inspect as _inspect
+        extra = {}
+        if "skip_complete" in _inspect.signature(profile_fn).parameters:
+            extra["skip_complete"] = args.skip_complete
+        if "verbose" in _inspect.signature(profile_fn).parameters:
+            extra["verbose"] = args.verbose
+        profile_fn(
             submit=not args.print_commands,
             print_sbatch_only=args.print_commands,
             wandb_tags=wandb_tags,
+            **extra,
         )
     else:
         parser.error("Provide a profile or use --restart-preempted RESULTS_DIR.")
