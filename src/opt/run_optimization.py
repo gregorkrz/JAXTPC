@@ -287,6 +287,9 @@ def parse_args():
                    help='Multiply all optimized GT parameter values by this factor before '
                         'generating the reference signal (default: 1.0, i.e. no shift). '
                         'Use 1.2 to shift the true parameters 20%% upward.')
+    p.add_argument('--gt-lifetime-us', type=float, default=None,
+                   help='Override the GT electron lifetime in μs (default: use GT_LIFETIME_US '
+                        f'= {GT_LIFETIME_US:.0f} μs). E.g. 6000 for 6 ms.')
     return p.parse_args()
 
 
@@ -1567,10 +1570,13 @@ def main():
         return _sim_cache[n_seg]
 
     gt_sim = _get_sim(args.gt_max_deposits)
+    gt_lifetime = args.gt_lifetime_us if args.gt_lifetime_us is not None else GT_LIFETIME_US
     gt_params = gt_sim.default_sim_params._replace(
-        lifetime_us    = jnp.array(GT_LIFETIME_US),
+        lifetime_us    = jnp.array(gt_lifetime),
         velocity_cm_us = jnp.array(GT_VELOCITY_CM_US),
     )
+    if args.gt_lifetime_us is not None:
+        print(f'GT lifetime overridden: {gt_lifetime:.0f} μs ({gt_lifetime / 1000:.1f} ms)')
 
     if args.gt_param_multiplier != 1.0:
         for _pname in param_names:

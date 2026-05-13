@@ -174,6 +174,8 @@ def _tracks_mixed_xyz_plus_random(
 TRACKS_50_MIXED_RANDOM = _tracks_mixed_xyz_plus_random()
 
 PARAM_LIST = [p.strip() for p in ALL_PARAMS.split(",") if p.strip()]
+PARAM_LIST_NO_DIFF = [p for p in PARAM_LIST
+                      if p not in ("diffusion_trans_cm2_us", "diffusion_long_cm2_us")]
 
 # Joint fits with longitudinal diffusion + growing nuisance set (transverse diffusion last).
 _LONG_DIFF_GROW_EXTRAS = (
@@ -343,6 +345,7 @@ def make_opt_command(
     gt_step_size=None,
     gt_max_deposits=None,
     gt_param_multiplier=None,
+    gt_lifetime_us=None,
     wandb_tags=None,
     tol_per_param=None,
     patience_per_param=None,
@@ -404,6 +407,8 @@ def make_opt_command(
         parts.append(f"--gt-max-deposits {gt_max_deposits}")
     if gt_param_multiplier is not None:
         parts.append(f"--gt-param-multiplier {gt_param_multiplier}")
+    if gt_lifetime_us is not None:
+        parts.append(f"--gt-lifetime-us {gt_lifetime_us}")
     if wandb_tags:
         tags_csv = ",".join(w.strip() for w in wandb_tags if str(w).strip())
         if tags_csv:
@@ -2651,6 +2656,190 @@ def profile_15Trk_Adam_NoiseSeedSweep_3k_GT2(
             )
 
 
+def profile_15Trk_Adam_NoiseSeedSweep_3k_GT3(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """Like Adam_NoiseSeedSweep_3k (GT1) but GT electron lifetime = 6 ms (6000 μs).
+
+    10 jobs total: 5 seeds × 2 noise conditions. Two dependency chains (one per
+    noise condition), each serialising the 5 seeds so only one job runs at a time.
+    """
+    params = ",".join(PARAM_LIST)
+    shared = dict(
+        params=params,
+        tracks=TRACKS_15_BOUNDARY,
+        optimizer="adam",
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.001,
+        lr_schedule="cosine",
+        max_steps=3000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        grad_clip=0.0,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=1.0,
+        max_num_deposits=5000,
+        batch_size=5,
+        effective_batch_size=3,
+        gt_step_size=1.0,
+        gt_max_deposits=5000,
+        gt_lifetime_us=6000.0,
+        adam_beta2=0.9,
+        log_interval=50,
+    )
+    for noise_scale in [1.0, 0.0]:
+        noise_tag = "noise" if noise_scale > 0.0 else "nonoise"
+        prev_job = None
+        for seed in [43, 44, 45, 46, 47]:
+            results_base = (
+                f"$RESULTS_DIR/opt/Adam_NoiseSeedSweep_3k_GT3/{noise_tag}"
+            )
+            command = make_opt_command(
+                seed=seed,
+                noise_scale=noise_scale,
+                results_base=results_base,
+                wandb_tags=(wandb_tags or []) + ["Adam_NoiseSeedSweep_3k_GT3", noise_tag],
+                **shared,
+            )
+            if not print_sbatch_only:
+                print(command)
+            prev_job = s3df_submit(
+                command,
+                time="01:05:00",
+                submit=submit,
+                mem_gb=64,
+                print_sbatch_command=print_sbatch_only,
+                dependency=prev_job,
+            )
+
+
+def profile_15Trk_Adam_NoiseSeedSweep_3k_NoDiff(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """Like Adam_NoiseSeedSweep_3k (GT1) but optimizes all params except diffusion.
+
+    5 jobs total: 5 seeds × noise only. One dependency chain serialising the seeds.
+    Parameters: velocity_cm_us, lifetime_us, recomb_alpha, recomb_beta_90, recomb_R.
+    """
+    params = ",".join(PARAM_LIST_NO_DIFF)
+    shared = dict(
+        params=params,
+        tracks=TRACKS_15_BOUNDARY,
+        optimizer="adam",
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.001,
+        lr_schedule="cosine",
+        max_steps=3000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        grad_clip=0.0,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=1.0,
+        max_num_deposits=5000,
+        batch_size=5,
+        effective_batch_size=3,
+        gt_step_size=1.0,
+        gt_max_deposits=5000,
+        adam_beta2=0.9,
+        log_interval=50,
+    )
+    noise_tag = "noise"
+    prev_job = None
+    for seed in [43, 44, 45, 46, 47]:
+        command = make_opt_command(
+            seed=seed,
+            noise_scale=1.0,
+            results_base=f"$RESULTS_DIR/opt/Adam_NoiseSeedSweep_3k_NoDiff/{noise_tag}",
+            wandb_tags=(wandb_tags or []) + ["Adam_NoiseSeedSweep_3k_NoDiff", noise_tag],
+            **shared,
+        )
+        if not print_sbatch_only:
+            print(command)
+        prev_job = s3df_submit(
+            command,
+            time="01:05:00",
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+            dependency=prev_job,
+        )
+
+
+def profile_15Trk_Adam_NoiseSeedSweep_3k_GT2_NoDiff(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+):
+    """Like Adam_NoiseSeedSweep_3k_GT2 but optimizes all params except diffusion.
+
+    5 jobs total: 5 seeds × noise only. One dependency chain serialising the seeds.
+    Parameters: velocity_cm_us, lifetime_us, recomb_alpha, recomb_beta_90, recomb_R.
+    GT parameters shifted 20% up (gt_param_multiplier=1.2).
+    """
+    params = ",".join(PARAM_LIST_NO_DIFF)
+    shared = dict(
+        params=params,
+        tracks=TRACKS_15_BOUNDARY,
+        optimizer="adam",
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.001,
+        lr_schedule="cosine",
+        max_steps=3000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        grad_clip=0.0,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=1.0,
+        max_num_deposits=5000,
+        batch_size=5,
+        effective_batch_size=3,
+        gt_step_size=1.0,
+        gt_max_deposits=5000,
+        gt_param_multiplier=1.2,
+        adam_beta2=0.9,
+        log_interval=50,
+    )
+    noise_tag = "noise"
+    prev_job = None
+    for seed in [43, 44, 45, 46, 47]:
+        command = make_opt_command(
+            seed=seed,
+            noise_scale=1.0,
+            results_base=f"$RESULTS_DIR/opt/Adam_NoiseSeedSweep_3k_GT2_NoDiff/{noise_tag}",
+            wandb_tags=(wandb_tags or []) + ["Adam_NoiseSeedSweep_3k_GT2_NoDiff", noise_tag],
+            **shared,
+        )
+        if not print_sbatch_only:
+            print(command)
+        prev_job = s3df_submit(
+            command,
+            time="01:05:00",
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+            dependency=prev_job,
+        )
+
+
 def profile_15Trk_Adam_NoiseSeedSweep_3k_0p1mm_step_GT(
     *,
     submit=True,
@@ -2966,6 +3155,9 @@ PROFILES = {
     "Adam_Noise_20260511": profile_15Trk_Adam_Noise_20260511,
     "Adam_NoiseSeedSweep_3k": profile_15Trk_Adam_NoiseSeedSweep_3k,
     "Adam_NoiseSeedSweep_3k_GT2": profile_15Trk_Adam_NoiseSeedSweep_3k_GT2,
+    "Adam_NoiseSeedSweep_3k_GT3": profile_15Trk_Adam_NoiseSeedSweep_3k_GT3,
+    "Adam_NoiseSeedSweep_3k_NoDiff": profile_15Trk_Adam_NoiseSeedSweep_3k_NoDiff,
+    "Adam_NoiseSeedSweep_3k_GT2_NoDiff": profile_15Trk_Adam_NoiseSeedSweep_3k_GT2_NoDiff,
     "Adam_NoiseSeedSweep_3k_0p1mm_step_GT": profile_15Trk_Adam_NoiseSeedSweep_3k_0p1mm_step_GT,
     "Adam_NoiseSeedSweep_3k_0p1mm_step_GT_and_sim": profile_15Trk_Adam_NoiseSeedSweep_3k_0p1mm_step_GT_and_sim,
     "Adam_NoiseSeedSweep_3k_Cont_Newton": profile_Adam_NoiseSeedSweep_3k_Cont_Newton,

@@ -340,6 +340,207 @@ def write_edep_index_html(specs, output_dir, stats=None):
     print(f'  Saved {path}')
 
 
+_STEP_SIZES_MM  = [1.0, 0.5, 0.1]
+_STEP_COLORS    = ['tab:blue', 'tab:orange', 'tab:green']
+_STEP_LABELS    = ['1 mm', '0.5 mm', '0.1 mm']
+
+
+def _build_step_size_tracks(specs, tracks_01mm, start_positions_mm, cfg):
+    """Return dict[(track_idx, step_size_mm) -> track] for all 3 step sizes.
+
+    The 0.1 mm entries reuse ``tracks_01mm`` (already filtered); the 1 mm and
+    0.5 mm entries are generated fresh and filtered inside volumes.
+    """
+    result = {}
+    for i, (spec, start_mm) in enumerate(zip(specs, start_positions_mm)):
+        for ss in _STEP_SIZES_MM:
+            if ss == 0.1:
+                result[(i, ss)] = tracks_01mm[i]
+            else:
+                track = generate_muon_track(
+                    start_position_mm=start_mm,
+                    direction=spec['direction'],
+                    kinetic_energy_mev=spec['momentum_mev'],
+                    step_size_mm=ss,
+                    track_id=1,
+                )
+                result[(i, ss)] = filter_track_inside_volumes(track, cfg.volumes)
+    return result
+
+
+def _shared_bins(arrays, n_bins, plo=0.5, phi=99.5):
+    all_vals = np.concatenate([a for a in arrays if len(a) > 0])
+    return np.linspace(float(np.percentile(all_vals, plo)),
+                       float(np.percentile(all_vals, phi)), n_bins + 1)
+
+
+def write_dedx_distributions_pdf(specs, step_tracks, output_dir):
+    """dE/dx histograms per track for step sizes 1, 0.5, 0.1 mm.
+
+    Layout: 2 rows × N_tracks columns.
+      Row 0 — linear scale.
+      Row 1 — log scale (same bins).
+    The 3 step sizes are overlaid in each panel.
+    ``step_tracks`` is the dict returned by ``_build_step_size_tracks``.
+    """
+    n_tracks = max(i for i, _ in step_tracks) + 1
+
+    # Build dE/dx arrays from pre-generated tracks.
+    all_dedx = {}
+    for i in range(n_tracks):
+        for ss in _STEP_SIZES_MM:
+            track = step_tracks[(i, ss)]
+            de    = np.asarray(track['de'])
+            all_dedx[(i, ss)] = de / (ss / 10.0) if len(de) > 0 else np.array([])
+
+    bin_edges = _shared_bins(list(all_dedx.values()), n_bins=80)
+
+    col_w = max(2.5, min(3.5, 45.0 / n_tracks))
+    fig, axes = plt.subplots(
+        2, n_tracks,
+        figsize=(col_w * n_tracks, 5.5),
+        constrained_layout=True,
+    )
+    axes = np.asarray(axes)
+    if axes.ndim == 1:
+        axes = axes.reshape(2, 1)
+
+    fig.suptitle(
+        'dE/dx distributions per track — step sizes 0.1 / 0.5 / 1 mm (shared bins)',
+        fontsize=11,
+    )
+
+    for i in range(n_tracks):
+        name = specs[i]['name']
+        for row, use_log in enumerate([False, True]):
+            ax = axes[row, i]
+            for ss, color, lbl in zip(_STEP_SIZES_MM, _STEP_COLORS, _STEP_LABELS):
+                dedx = all_dedx[(i, ss)]
+                if len(dedx) == 0:
+                    continue
+                ax.hist(dedx, bins=bin_edges, histtype='step', color=color,
+                        label=lbl, density=True, linewidth=1.0)
+            if use_log:
+                ax.set_yscale('log')
+            ax.set_xlabel('dE/dx (MeV/cm)', fontsize=7)
+            if i == 0:
+                ax.set_ylabel('density' + (' (log)' if use_log else ''), fontsize=8)
+            ax.tick_params(axis='both', labelsize=5)
+            if row == 0:
+                short_name = name if len(name) <= 18 else name[:16] + '…'
+                ax.set_title(short_name, fontsize=6)
+            if i == 0 and row == 0:
+                ax.legend(fontsize=5)
+
+    path = os.path.join(output_dir, 'dedx_distributions.pdf')
+    fig.savefig(path, bbox_inches='tight')
+    plt.close(fig)
+    print(f'  Saved {path}')
+
+
+def write_coordinate_distributions_pdf(specs, step_tracks, output_dir):
+    """Histograms of track geometry and raw energy deposits.
+
+    Layout: 2 rows × 7 columns (linear top, log bottom).
+      Cols 0–2  avg x / avg y / avg z — one value per track (15 points),
+                3 step sizes overlaid, counts (not density).
+      Cols 3–6  x / y / z / dE — all segment deposits pooled over all tracks,
+                3 step sizes overlaid, density-normalised.
+    ``step_tracks`` is the dict returned by ``_build_step_size_tracks``.
+    """
+    n_tracks = max(i for i, _ in step_tracks) + 1
+
+    # Per-track mean positions: shape (n_tracks,) per step size.
+    avg_pos = {ss: {c: np.full(n_tracks, np.nan) for c in 'xyz'}
+               for ss in _STEP_SIZES_MM}
+    for ss in _STEP_SIZES_MM:
+        for i in range(n_tracks):
+            pos = np.asarray(step_tracks[(i, ss)]['position'])
+            if len(pos) > 0:
+                for ci, c in enumerate('xyz'):
+                    avg_pos[ss][c][i] = float(np.mean(pos[:, ci]))
+
+    # Pooled segment coords and dE over all tracks.
+    pooled = {ss: {k: [] for k in ('x', 'y', 'z', 'de')} for ss in _STEP_SIZES_MM}
+    for ss in _STEP_SIZES_MM:
+        for i in range(n_tracks):
+            track = step_tracks[(i, ss)]
+            pos   = np.asarray(track['position'])
+            de    = np.asarray(track['de'])
+            if len(pos) > 0:
+                pooled[ss]['x'].append(pos[:, 0])
+                pooled[ss]['y'].append(pos[:, 1])
+                pooled[ss]['z'].append(pos[:, 2])
+                pooled[ss]['de'].append(de)
+        for k in ('x', 'y', 'z', 'de'):
+            arrs = pooled[ss][k]
+            pooled[ss][k] = np.concatenate(arrs) if arrs else np.array([])
+
+    # Shared bins per quantity.
+    avg_bins = {
+        c: _shared_bins([avg_pos[ss][c] for ss in _STEP_SIZES_MM], n_bins=8)
+        for c in 'xyz'
+    }
+    pool_bins = {
+        k: _shared_bins([pooled[ss][k] for ss in _STEP_SIZES_MM], n_bins=60)
+        for k in ('x', 'y', 'z', 'de')
+    }
+
+    col_specs = [
+        ('avg',    'x',  'avg x (mm)',  False),
+        ('avg',    'y',  'avg y (mm)',  False),
+        ('avg',    'z',  'avg z (mm)',  False),
+        ('pooled', 'x',  'x (mm)',      True),
+        ('pooled', 'y',  'y (mm)',      True),
+        ('pooled', 'z',  'z (mm)',      True),
+        ('pooled', 'de', 'dE (MeV)',    True),
+    ]
+
+    fig, axes = plt.subplots(2, 7, figsize=(26, 5.5), constrained_layout=True)
+    axes = np.asarray(axes)
+
+    fig.suptitle(
+        'Track geometry & energy deposit distributions — step sizes 0.1 / 0.5 / 1 mm  |  '
+        'Cols 0–2: per-track mean position (15 pts each)   Cols 3–6: all segments pooled over 15 tracks',
+        fontsize=9,
+    )
+
+    for col_idx, (kind, key, xlabel, use_density) in enumerate(col_specs):
+        if kind == 'avg':
+            bins_arr = avg_bins[key]
+            data_fn  = lambda ss, k=key: avg_pos[ss][k][np.isfinite(avg_pos[ss][k])]
+        else:
+            bins_arr = pool_bins[key]
+            data_fn  = lambda ss, k=key: pooled[ss][k]
+
+        for row, use_log in enumerate([False, True]):
+            ax = axes[row, col_idx]
+            for ss, color, lbl in zip(_STEP_SIZES_MM, _STEP_COLORS, _STEP_LABELS):
+                vals = data_fn(ss)
+                if len(vals) == 0:
+                    continue
+                ax.hist(vals, bins=bins_arr, histtype='step', color=color,
+                        label=lbl, density=use_density, linewidth=1.0)
+            if use_log:
+                ax.set_yscale('log')
+            ax.set_xlabel(xlabel, fontsize=8)
+            if col_idx == 0:
+                ylabel = ('count' if not use_density else 'density')
+                ax.set_ylabel(ylabel + (' (log)' if use_log else ''), fontsize=8)
+            elif col_idx == 3:
+                ax.set_ylabel('density' + (' (log)' if use_log else ''), fontsize=8)
+            ax.tick_params(axis='both', labelsize=6)
+            if row == 0:
+                ax.set_title(xlabel, fontsize=9)
+            if col_idx == 0 and row == 0:
+                ax.legend(fontsize=6)
+
+    path = os.path.join(output_dir, 'coordinate_distributions.pdf')
+    fig.savefig(path, bbox_inches='tight')
+    plt.close(fig)
+    print(f'  Saved {path}')
+
+
 def write_track_catalog_pdf(specs, path, stats=None):
     """Single-page PDF: index, name, kinetic energy, unit direction components, optional stats."""
     n = len(specs)
@@ -448,6 +649,7 @@ def main():
     all_planes = []
     tracks_raw = []
     track_stats = []
+    start_positions_used = []
     for spec in specs:
         if args.start_position_mm is not None:
             start_mm = tuple(args.start_position_mm)
@@ -455,6 +657,7 @@ def main():
             start_mm = tuple(spec['start_position_mm'])
         else:
             start_mm = start_mm_for_track(spec, east_mm, west_mm)
+        start_positions_used.append(start_mm)
         print(
             f"  Forward: {spec['name']}  start={start_mm}  "
             f"dir={spec['direction']}  T={spec['momentum_mev']:.0f} MeV"
@@ -473,6 +676,12 @@ def main():
         all_planes.append(planes)
 
     write_track_catalog_pdf(specs, catalog_path, stats=track_stats)
+
+    print('Building step-size track variants (1 mm, 0.5 mm) for distribution plots...')
+    step_tracks = _build_step_size_tracks(
+        specs, tracks_raw, start_positions_used, cfg)
+    write_dedx_distributions_pdf(specs, step_tracks, args.output_dir)
+    write_coordinate_distributions_pdf(specs, step_tracks, args.output_dir)
 
     de_all = np.concatenate(all_de) if all_de else np.array([0.0])
     de_min, de_max = float(np.min(de_all)), float(np.max(de_all))

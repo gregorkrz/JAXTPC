@@ -14,7 +14,7 @@ Outputs (in --output-dir/sweep_trajectories_varying_step_sizes):
   sweep_trajectories_noise_and_nonoise_step_sizes.pdf     — same, noise=light / no-noise=dark
 """
 
-import sys, os
+import sys, os, math
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
 from dotenv import load_dotenv
 load_dotenv()
@@ -23,6 +23,7 @@ import argparse, glob, pickle
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
+from matplotlib.backends.backend_pdf import PdfPages
 
 _RESULTS_DIR = os.environ.get('RESULTS_DIR', 'results')
 _PLOTS_DIR   = os.environ.get('PLOTS_DIR',   'plots')
@@ -140,6 +141,69 @@ def _plot_group(run_color_pairs, param_name, ax_val, ax_err, gt_line_color, colo
             gt_drawn = True
 
 
+def _plot_slide_group(run_color_pairs, param_name, ax, gt_line_color, color_labels=None):
+    """Plot parameter value trajectories onto a single axis (slide version, values only)."""
+    gt_drawn, seen = False, set()
+    for r, color in run_color_pairs:
+        if param_name not in r['param_names']:
+            continue
+        pi      = r['param_names'].index(param_name)
+        scale   = r['scales'][pi]
+        gt_phys = r['param_gts'][pi]
+        is_log  = np.isclose(np.exp(r['p_n_gts'][pi]) * scale, gt_phys, rtol=1e-3)
+        adam_n  = r.get('_adam_steps')
+        for trial in r['trials']:
+            arr   = np.array([s[pi] for s in trial['param_trajectory']])
+            phys  = np.exp(arr) * scale if is_log else arr * scale
+            steps = np.arange(len(phys))
+            lbl   = (color_labels or {}).get(color) if color not in seen else '_nolegend_'
+            kw    = dict(color=color, alpha=0.65, lw=1.5)
+            if adam_n is not None:
+                ax.plot(steps[:adam_n], phys[:adam_n], **kw, label=lbl or '_nolegend_')
+                ax.plot(steps[adam_n-1:], phys[adam_n-1:], **kw, ls=NEWTON_LS)
+            else:
+                ax.plot(steps, phys, **kw, label=lbl or '_nolegend_')
+            seen.add(color)
+        if not gt_drawn:
+            ax.axhline(gt_phys, color=gt_line_color, ls='--', lw=1.8, zorder=6)
+            gt_drawn = True
+
+
+def _make_slide_figure(groups, param_names, color_labels, title_suffix, adam_transition_step):
+    """3×3 slide-friendly figure: parameter values for all groups combined.
+
+    groups: list of (run_color_pairs, gt_line_color) — one entry per group.
+    """
+    n     = len(param_names)
+    ncols = 3
+    nrows = math.ceil(n / ncols)
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(6 * ncols, 5 * nrows), squeeze=False)
+    for idx, param_name in enumerate(param_names):
+        row, col = divmod(idx, ncols)
+        ax = axes[row, col]
+        plabel = PARAM_LABELS.get(param_name, param_name)
+        for pairs, gt_color in groups:
+            _plot_slide_group(pairs, param_name, ax, gt_color, color_labels)
+        ax.set_ylabel(plabel, fontsize=13)
+        ax.set_xlabel('iteration', fontsize=12)
+        ax.tick_params(labelsize=11)
+        ax.grid(True, alpha=0.25)
+        if adam_transition_step is not None:
+            ax.axvline(adam_transition_step, color='gray', ls=':', lw=1.0, alpha=0.7, zorder=5)
+        handles, _ = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(fontsize=10, handlelength=1.5, loc='best')
+    for idx in range(n, nrows * ncols):
+        row, col = divmod(idx, ncols)
+        axes[row, col].set_visible(False)
+    fig.suptitle(
+        f'Parameter trajectories  [{title_suffix}]',
+        fontsize=15, y=1.01)
+    fig.tight_layout()
+    return fig
+
+
 def make_figure(a_pairs, b_pairs, output_path, title_suffix='',
                 color_labels=None, group_labels=('A', 'B', 'A + B'),
                 adam_transition_step=None, c_pairs=None):
@@ -204,7 +268,7 @@ def make_figure(a_pairs, b_pairs, output_path, title_suffix='',
             ax.grid(True, alpha=0.2)
             ax.set_ylabel(plabel, fontsize=8)
         for ax in axes[row]:
-            ax.set_xlabel('step', fontsize=8)
+            ax.set_xlabel('iteration', fontsize=8)
             ax.tick_params(labelsize=7)
             if adam_transition_step is not None:
                 ax.axvline(adam_transition_step, color='gray', ls=':', lw=0.8, alpha=0.7, zorder=5)
@@ -215,10 +279,21 @@ def make_figure(a_pairs, b_pairs, output_path, title_suffix='',
     fig.suptitle(
         f'Parameter trajectories  [{title_suffix}]\n(each curve = one seed run)',
         fontsize=11, y=1.01)
-    os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
     fig.tight_layout()
-    fig.savefig(output_path, bbox_inches='tight')
+
+    # Build groups list for the slide figure (same data as the combined column).
+    slide_groups = [(a_pairs, a_color), (b_pairs, b_color)]
+    if c_pairs is not None:
+        slide_groups.append((c_pairs, c_pairs[0][1]))
+    slide_fig = _make_slide_figure(
+        slide_groups, param_names, color_labels, title_suffix, adam_transition_step)
+
+    os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+    with PdfPages(output_path) as pdf:
+        pdf.savefig(fig,       bbox_inches='tight')
+        pdf.savefig(slide_fig, bbox_inches='tight')
     plt.close(fig)
+    plt.close(slide_fig)
     print(f'Saved → {output_path}')
 
 
