@@ -2729,7 +2729,7 @@ def profile_15Trk_Adam_NoiseSeedSweep_3k_0p1mm_step_GT_and_sim(
 ):
     """Like Adam_NoiseSeedSweep_3k but both GT and sim use 0.1mm step / 50k deposits; bs=1, eff_bs=15.
 
-    4 jobs total: 2 seeds (43, 44) × 2 noise conditions. No dependency chain; all parallel.
+    10 jobs total: 5 seeds (43–47) × 2 noise conditions. No dependency chain; all parallel.
     """
     params = ",".join(PARAM_LIST)
     shared = dict(
@@ -2760,7 +2760,7 @@ def profile_15Trk_Adam_NoiseSeedSweep_3k_0p1mm_step_GT_and_sim(
     results_base = "$RESULTS_DIR/opt/Adam_NoiseSeedSweep_3k_0p1mm_step_GT_and_sim"
     for noise_scale in [1.0, 0.0]:
         noise_tag = "noise" if noise_scale > 0.0 else "nonoise"
-        for seed in [43, 44]:
+        for seed in [43, 44, 45, 46, 47]:
             if verbose or skip_complete:
                 is_done = _seed_is_complete(results_base, noise_tag, seed, verbose=verbose)
                 if is_done and skip_complete:
@@ -2781,6 +2781,131 @@ def profile_15Trk_Adam_NoiseSeedSweep_3k_0p1mm_step_GT_and_sim(
             s3df_submit(
                 command,
                 time="04:05:00",
+                submit=submit,
+                mem_gb=64,
+                print_sbatch_command=print_sbatch_only,
+            )
+
+
+def _load_sweep_pkls(base_dir: str) -> list:
+    """Return list of dicts with keys: path, wandb_run_id, seed, noise_scale.
+
+    Scans base_dir/**/result_*.pkl recursively and reads each pickle.
+    Skips files that are missing a wandb_run_id.
+    """
+    resolved = base_dir.replace("$RESULTS_DIR", _RESULTS_DIR)
+    pattern  = os.path.join(resolved, "**", "result_*.pkl")
+    entries  = []
+    for pkl_path in sorted(glob.glob(pattern, recursive=True)):
+        try:
+            with open(pkl_path, "rb") as f:
+                data = pickle.load(f)
+        except Exception as exc:
+            print(f"  [warn] could not read {pkl_path}: {exc}")
+            continue
+        run_id = data.get("wandb_run_id")
+        if not run_id:
+            print(f"  [warn] no wandb_run_id in {pkl_path}, skipping")
+            continue
+        entries.append(dict(
+            path         = pkl_path,
+            wandb_run_id = run_id,
+            seed         = data.get("seed"),
+            noise_scale  = data.get("noise_scale", 0.0),
+        ))
+    return entries
+
+
+def profile_Adam_NoiseSeedSweep_3k_Cont_Newton(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+    skip_complete=False,
+    verbose=False,
+):
+    """Newton continuation from every Adam_NoiseSeedSweep_3k and GT2 run on disk.
+
+    Scans results/opt/Adam_NoiseSeedSweep_3k and Adam_NoiseSeedSweep_3k_GT2 for
+    completed pkl files, reads their wandb_run_id, and submits one Newton job per
+    run that initialises from the last logged step (step 3000).
+
+    Settings:
+      optimizer   = newton, damping = 0.01, lr = 1.0
+      max_steps   = 100, log_interval = 5
+      batch_size  = 1, effective_batch_size = 15
+      time limit  = 20 min
+    """
+    params = ",".join(PARAM_LIST)
+
+    shared = dict(
+        params              = params,
+        tracks              = TRACKS_15_BOUNDARY,
+        optimizer           = "newton",
+        loss                = "sobolev_loss_geomean_log1p",
+        lr                  = 1.0,
+        lr_schedule         = "cosine",
+        max_steps           = 100,
+        tol                 = 1e-9,
+        patience            = 200,
+        N                   = 1,
+        range_lo            = 0.9,
+        range_hi            = 1.1,
+        grad_clip           = -1,
+        warmup_steps        = 0,
+        num_buckets         = 1000,
+        step_size           = 1.0,
+        max_num_deposits    = 5000,
+        batch_size          = 1,
+        effective_batch_size= 15,
+        gt_step_size        = 1.0,
+        gt_max_deposits     = 5000,
+        newton_damping      = 0.01,
+        log_interval        = 5,
+    )
+
+    for gt_label, base_dir, gt_multiplier, wandb_tag in [
+        ("GT1", "$RESULTS_DIR/opt/Adam_NoiseSeedSweep_3k",      None, "Adam_GT1_Cont_Newton_from3k"),
+        ("GT2", "$RESULTS_DIR/opt/Adam_NoiseSeedSweep_3k_GT2",  1.2,  "Adam_GT2_Cont_Newton_from3k"),
+    ]:
+        runs = _load_sweep_pkls(base_dir)
+        print(f"  {gt_label}: found {len(runs)} pkl(s) under {base_dir.replace('$RESULTS_DIR', _RESULTS_DIR)}")
+        for run in runs:
+            noise_tag    = "noise" if run["noise_scale"] > 0.0 else "nonoise"
+            results_base = (
+                f"$RESULTS_DIR/opt/Adam_NoiseSeedSweep_3k{'_GT2' if gt_multiplier else ''}"
+                f"_Newton_cont/{noise_tag}"
+            )
+
+            if skip_complete:
+                resolved = results_base.replace("$RESULTS_DIR", _RESULTS_DIR)
+                pattern  = os.path.join(resolved, "**", f"result_{run['seed']}.pkl")
+                existing = glob.glob(pattern, recursive=True)
+                if existing:
+                    if verbose:
+                        print(f"  SKIP complete: {gt_label} {noise_tag} seed={run['seed']}")
+                    continue
+                elif verbose:
+                    print(f"  → will submit: {gt_label} {noise_tag} seed={run['seed']} run={run['wandb_run_id']}")
+
+            extra = {}
+            if gt_multiplier is not None:
+                extra["gt_param_multiplier"] = gt_multiplier
+
+            command = make_opt_command(
+                seed                = run["seed"],
+                noise_scale         = run["noise_scale"],
+                results_base        = results_base,
+                init_from_wandb_run = run["wandb_run_id"],
+                wandb_tags          = (wandb_tags or []) + [wandb_tag, noise_tag],
+                **shared,
+                **extra,
+            )
+            if not print_sbatch_only:
+                print(command)
+            s3df_submit(
+                command,
+                time="00:20:00",
                 submit=submit,
                 mem_gb=64,
                 print_sbatch_command=print_sbatch_only,
@@ -2843,6 +2968,7 @@ PROFILES = {
     "Adam_NoiseSeedSweep_3k_GT2": profile_15Trk_Adam_NoiseSeedSweep_3k_GT2,
     "Adam_NoiseSeedSweep_3k_0p1mm_step_GT": profile_15Trk_Adam_NoiseSeedSweep_3k_0p1mm_step_GT,
     "Adam_NoiseSeedSweep_3k_0p1mm_step_GT_and_sim": profile_15Trk_Adam_NoiseSeedSweep_3k_0p1mm_step_GT_and_sim,
+    "Adam_NoiseSeedSweep_3k_Cont_Newton": profile_Adam_NoiseSeedSweep_3k_Cont_Newton,
 }
 
 

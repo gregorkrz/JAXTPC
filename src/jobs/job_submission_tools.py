@@ -18,6 +18,11 @@ APPTAINER_CACHEDIR = "/sdf/scratch/atlas/gregork/apptainer_cache"
 APPTAINER_TMPDIR   = "/sdf/scratch/atlas/gregork/apptainer_tmp"
 JAX_CACHE_DIR      = "/sdf/scratch/atlas/gregork/jax_cache"
 
+# Nodes to exclude from all job submissions (SLURM --exclude).
+BLACKLISTED_NODES: List[str] = [
+    "sdfampere021",  # acting weird
+]
+
 APPTAINER_IMAGE = "docker://gkrz/jaxtpc:v2"
 BIND_MOUNTS = [
     "/sdf/home/g/gregork/jaxtpc",
@@ -77,6 +82,10 @@ def s3df_submit(command: str, *, time: str = "02:00:00", gpus: int = 1,
     binds = " ".join(f"--bind {m}" for m in BIND_MOUNTS)
     wrapped = f"apptainer exec --nv {binds} {APPTAINER_IMAGE} bash -c {shlex.quote(command)}"
 
+    exclude_line = (
+        [f"#SBATCH --exclude={','.join(BLACKLISTED_NODES)}"]
+        if BLACKLISTED_NODES else []
+    )
     script = "\n".join([
         "#!/bin/bash",
         f"#SBATCH --job-name={name}",
@@ -89,6 +98,7 @@ def s3df_submit(command: str, *, time: str = "02:00:00", gpus: int = 1,
         f"#SBATCH --mem={mem_gb}G",
         f"#SBATCH --output={stdout_log}",
         f"#SBATCH --error={stderr_log}",
+        *exclude_line,
         "",
         "set -euo pipefail",
         f"mkdir -p {LOGS_DIR}",

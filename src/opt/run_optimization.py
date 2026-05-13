@@ -912,12 +912,15 @@ def _write_wandb_sidecar(output_dir, seed, run_id):
         f.write(run_id)
 
 
-def optimization_run_complete(data):
+def optimization_run_complete(data, min_steps=2000):
     """Return True when all N trials are present (nothing left to optimize).
 
     ``run_complete`` is only written on clean shutdown and is **not** required here:
     treating ``run_complete=False`` after SIGTERM even though ``trials`` is full
     used to queue redundant Slurm jobs (duplicate W&B runs).
+
+    Also returns True when a live_checkpoint exists with more than ``min_steps``
+    steps, treating SIGTERM'd mid-trial runs as effectively complete.
     """
     trials = data.get("trials")
     if trials is None:
@@ -925,9 +928,12 @@ def optimization_run_complete(data):
     n_expected = data.get("N")
     if not isinstance(n_expected, int) or n_expected < 0:
         return False
+    live_ckpt = data.get("live_checkpoint")
+    if live_ckpt and live_ckpt.get("step", 0) > min_steps:
+        return True
     if len(trials) < n_expected:
         return False
-    if data.get("live_checkpoint"):
+    if live_ckpt:
         return False
     return True
 
