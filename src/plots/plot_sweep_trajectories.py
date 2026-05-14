@@ -3,8 +3,8 @@
 Plot parameter trajectories from Adam_NoiseSeedSweep_3k sweeps.
 
 Outputs (in --output-dir):
-  sweep_trajectories_{noise,nonoise}.pdf             — GT1 vs GT2
-  sweep_trajectories_noise_and_nonoise.pdf            — GT1 vs GT2, noise=light / no-noise=dark
+  sweep_trajectories_{noise,nonoise}.pdf             — GT1 vs GT2 vs GT3
+  sweep_trajectories_noise_and_nonoise.pdf            — GT1 vs GT2 vs GT3, noise=light / no-noise=dark
   sweep_trajectories_{noise,nonoise}_GT_step_size.pdf — GT1 1mm vs 0.1mm GT step
   sweep_trajectories_cont_{noise,nonoise}.pdf         — stitched Adam→Newton, GT1 vs GT2
   sweep_trajectories_cont_noise_and_nonoise.pdf       — stitched Adam→Newton, noise+no-noise
@@ -30,13 +30,19 @@ _PLOTS_DIR   = os.environ.get('PLOTS_DIR',   'plots')
 
 GT1_BASE              = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3k')
 GT2_BASE              = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3k_GT2')
+GT3_BASE              = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3k_GT3')
+GT1_NODIFF_BASE       = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3k_NoDiff')
+GT2_NODIFF_BASE       = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3k_GT2_NoDiff')
 GT1_01MM_BASE         = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3k_0p1mm_step_GT')
 GT1_01MM_SIM_BASE     = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3k_0p1mm_step_GT_and_sim')
 GT1_NEWTON_BASE       = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3k_Newton_cont')
 GT2_NEWTON_BASE       = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3k_GT2_Newton_cont')
 
-GT1_DARK,    GT1_LIGHT    = '#2ca02c', '#98df8a'  # green
-GT2_DARK,    GT2_LIGHT    = '#1f77b4', '#aec7e8'  # blue
+GT1_DARK,       GT1_LIGHT       = '#2ca02c', '#98df8a'  # green
+GT2_DARK,       GT2_LIGHT       = '#1f77b4', '#aec7e8'  # blue
+GT3_DARK,       GT3_LIGHT       = '#d62728', '#ff9896'  # red
+GT1_NODIFF_DARK, GT1_NODIFF_LIGHT = '#17becf', '#9edae5'  # cyan
+GT2_NODIFF_DARK, GT2_NODIFF_LIGHT = '#e377c2', '#f7b6d2'  # pink
 STEP01_DARK, STEP01_LIGHT = '#ff7f0e', '#ffbb78'  # orange
 BOTH01_DARK, BOTH01_LIGHT = '#9467bd', '#c5b0d5'  # purple
 GT_LINE_GRAY = '#888888'
@@ -206,13 +212,14 @@ def _make_slide_figure(groups, param_names, color_labels, title_suffix, adam_tra
 
 def make_figure(a_pairs, b_pairs, output_path, title_suffix='',
                 color_labels=None, group_labels=('A', 'B', 'A + B'),
-                adam_transition_step=None, c_pairs=None):
+                adam_transition_step=None, c_pairs=None, d_pairs=None):
     """color_labels: dict mapping color hex → legend label shown on each subplot.
 
-    When c_pairs is provided the figure has 8 columns: A, B, C, A+B+C.
-    group_labels should then be a 4-tuple: (A label, B label, C label, combined label).
+    c_pairs adds a 3rd group: layout becomes A | B | C | A+B+C (8 cols).
+    d_pairs adds a 4th group: layout becomes A | B | C | D | all (10 cols).
+    group_labels length should match the number of panels (including combined).
     """
-    all_pairs = a_pairs + b_pairs + (c_pairs or [])
+    all_pairs = a_pairs + b_pairs + (c_pairs or []) + (d_pairs or [])
     ref = [r for r, _ in all_pairs]
     if not ref:
         print('No runs loaded; nothing to plot.')
@@ -221,8 +228,13 @@ def make_figure(a_pairs, b_pairs, output_path, title_suffix='',
     a_color = a_pairs[0][1] if a_pairs else GT1_DARK
     b_color = b_pairs[0][1] if b_pairs else GT2_DARK
 
-    n_groups = 4 if c_pairs is not None else 3
-    n_cols   = n_groups * 2
+    if d_pairs is not None:
+        n_groups = 5  # A | B | C | D | all
+    elif c_pairs is not None:
+        n_groups = 4  # A | B | C | A+B+C
+    else:
+        n_groups = 3  # A | B | A+B
+    n_cols = n_groups * 2
     fig, axes = plt.subplots(len(param_names), n_cols,
                              figsize=(4.5 * n_cols, 3.5 * len(param_names)), squeeze=False)
 
@@ -241,7 +253,22 @@ def make_figure(a_pairs, b_pairs, output_path, title_suffix='',
         _plot_group(a_pairs, param_name, av, ae, GT_LINE_GRAY, color_labels)
         _plot_group(b_pairs, param_name, bv, be, GT_LINE_GRAY, color_labels)
 
-        if c_pairs is not None:
+        if d_pairs is not None:
+            # 5-group layout: A | B | C | D | all combined
+            c_color = c_pairs[0][1]
+            d_color = d_pairs[0][1]
+            cv, ce = axes[row, 4], axes[row, 5]
+            dv, de = axes[row, 6], axes[row, 7]
+            ev, ee = axes[row, 8], axes[row, 9]
+            _plot_group(c_pairs, param_name, cv, ce, GT_LINE_GRAY, color_labels)
+            _plot_group(d_pairs, param_name, dv, de, GT_LINE_GRAY, color_labels)
+            _plot_group(a_pairs, param_name, ev, ee, a_color,      color_labels)
+            _plot_group(b_pairs, param_name, ev, ee, b_color,      color_labels)
+            _plot_group(c_pairs, param_name, ev, ee, c_color,      color_labels)
+            _plot_group(d_pairs, param_name, ev, ee, d_color,      color_labels)
+            err_axes = [ae, be, ce, de, ee]
+            val_axes = [av, bv, cv, dv, ev]
+        elif c_pairs is not None:
             # 4-group layout: A | B | C | A+B+C
             c_color = c_pairs[0][1]
             cv, ce = axes[row, 4], axes[row, 5]
@@ -285,6 +312,8 @@ def make_figure(a_pairs, b_pairs, output_path, title_suffix='',
     slide_groups = [(a_pairs, a_color), (b_pairs, b_color)]
     if c_pairs is not None:
         slide_groups.append((c_pairs, c_pairs[0][1]))
+    if d_pairs is not None:
+        slide_groups.append((d_pairs, d_pairs[0][1]))
     slide_fig = _make_slide_figure(
         slide_groups, param_names, color_labels, title_suffix, adam_transition_step)
 
@@ -301,11 +330,15 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--gt1-dir',    default=GT1_BASE)
     p.add_argument('--gt2-dir',    default=GT2_BASE)
+    p.add_argument('--gt3-dir',    default=GT3_BASE)
     p.add_argument('--output-dir', default=os.path.join(_PLOTS_DIR, 'opt'))
     args = p.parse_args()
 
     gt1_runs           = load_runs(args.gt1_dir)
     gt2_runs           = load_runs(args.gt2_dir)
+    gt3_runs           = load_runs(args.gt3_dir)
+    gt1_nodiff_runs    = load_runs(GT1_NODIFF_BASE)
+    gt2_nodiff_runs    = load_runs(GT2_NODIFF_BASE)
     gt1_01mm_runs      = load_runs(GT1_01MM_BASE)
     gt1_01mm_sim_runs  = load_runs(GT1_01MM_SIM_BASE)
 
@@ -319,28 +352,50 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     out = lambda name: os.path.join(args.output_dir, name)
 
-    # GT1 vs GT2, split by noise condition
+    # GT1 vs GT2 vs GT3, split by noise condition
     for with_noise, tag, label in [(True, 'noise', 'with noise'), (False, 'nonoise', 'no noise')]:
-        g1, g2 = _filter(gt1_runs, with_noise), _filter(gt2_runs, with_noise)
-        if not g1 and not g2:
+        g1, g2, g3 = (_filter(gt1_runs, with_noise), _filter(gt2_runs, with_noise),
+                      _filter(gt3_runs, with_noise))
+        if not g1 and not g2 and not g3:
             continue
         make_figure(
             [(r, GT1_DARK) for r in g1], [(r, GT2_DARK) for r in g2],
             out(f'sweep_trajectories_{tag}.pdf'), title_suffix=label,
-            color_labels={GT1_DARK: 'GT1', GT2_DARK: 'GT2'},
-            group_labels=('GT1', 'GT2', 'GT1 + GT2'),
+            color_labels={GT1_DARK: 'GT1', GT2_DARK: 'GT2', GT3_DARK: 'GT3'},
+            group_labels=('GT1', 'GT2', 'GT3', 'GT1 + GT2 + GT3'),
+            c_pairs=[(r, GT3_DARK) for r in g3],
         )
 
-    # GT1 vs GT2, noise + no-noise combined (light = noise, dark = no-noise)
+    # GT1 vs GT2 vs GT3, noise + no-noise combined (light = noise, dark = no-noise)
     make_figure(
         _pairs(gt1_runs, GT1_DARK, GT1_LIGHT),
         _pairs(gt2_runs, GT2_DARK, GT2_LIGHT),
         out('sweep_trajectories_noise_and_nonoise.pdf'),
         title_suffix='noise + no noise',
         color_labels={GT1_DARK:  'GT1',       GT1_LIGHT: 'GT1 noise',
-                      GT2_DARK:  'GT2',        GT2_LIGHT: 'GT2 noise'},
-        group_labels=('GT1', 'GT2', 'GT1 + GT2'),
+                      GT2_DARK:  'GT2',        GT2_LIGHT: 'GT2 noise',
+                      GT3_DARK:  'GT3',        GT3_LIGHT: 'GT3 noise'},
+        group_labels=('GT1', 'GT2', 'GT3', 'GT1 + GT2 + GT3'),
+        c_pairs=_pairs(gt3_runs, GT3_DARK, GT3_LIGHT),
     )
+
+    # GT1 vs GT2 vs GT1_NoDiff vs GT2_NoDiff, noise only
+    g1n    = _filter(gt1_runs,        with_noise=True)
+    g2n    = _filter(gt2_runs,        with_noise=True)
+    g1nd   = _filter(gt1_nodiff_runs, with_noise=True)
+    g2nd   = _filter(gt2_nodiff_runs, with_noise=True)
+    if g1n or g2n or g1nd or g2nd:
+        make_figure(
+            [(r, GT1_DARK)       for r in g1n],
+            [(r, GT2_DARK)       for r in g2n],
+            out('sweep_trajectories_noise_nodiff.pdf'),
+            title_suffix='with noise: full vs no-diffusion',
+            color_labels={GT1_DARK:        'GT1',         GT2_DARK:        'GT2',
+                          GT1_NODIFF_DARK: 'GT1 NoDiff',  GT2_NODIFF_DARK: 'GT2 NoDiff'},
+            group_labels=('GT1', 'GT2', 'GT1 NoDiff', 'GT2 NoDiff', 'all combined'),
+            c_pairs=[(r, GT1_NODIFF_DARK) for r in g1nd],
+            d_pairs=[(r, GT2_NODIFF_DARK) for r in g2nd],
+        )
 
     # Stitched Adam→Newton: GT1 vs GT2, noise+no-noise combined
     make_figure(

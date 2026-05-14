@@ -176,6 +176,9 @@ TRACKS_50_MIXED_RANDOM = _tracks_mixed_xyz_plus_random()
 PARAM_LIST = [p.strip() for p in ALL_PARAMS.split(",") if p.strip()]
 PARAM_LIST_NO_DIFF = [p for p in PARAM_LIST
                       if p not in ("diffusion_trans_cm2_us", "diffusion_long_cm2_us")]
+PARAM_LIST_NO_DIFF_LIFETIME = [p for p in PARAM_LIST
+                                if p not in ("diffusion_trans_cm2_us", "diffusion_long_cm2_us",
+                                             "lifetime_us")]
 
 # Joint fits with longitudinal diffusion + growing nuisance set (transverse diffusion last).
 _LONG_DIFF_GROW_EXTRAS = (
