@@ -33,16 +33,18 @@ GT2_BASE              = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3
 GT3_BASE              = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3k_GT3')
 GT1_NODIFF_BASE       = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3k_NoDiff')
 GT2_NODIFF_BASE       = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3k_GT2_NoDiff')
+GT3_NODIFF_BASE       = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3k_GT3_NoDiff')
 GT1_01MM_BASE         = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3k_0p1mm_step_GT')
 GT1_01MM_SIM_BASE     = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3k_0p1mm_step_GT_and_sim')
 GT1_NEWTON_BASE       = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3k_Newton_cont')
 GT2_NEWTON_BASE       = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3k_GT2_Newton_cont')
 
-GT1_DARK,       GT1_LIGHT       = '#2ca02c', '#98df8a'  # green
-GT2_DARK,       GT2_LIGHT       = '#1f77b4', '#aec7e8'  # blue
-GT3_DARK,       GT3_LIGHT       = '#d62728', '#ff9896'  # red
-GT1_NODIFF_DARK, GT1_NODIFF_LIGHT = '#17becf', '#9edae5'  # cyan
-GT2_NODIFF_DARK, GT2_NODIFF_LIGHT = '#e377c2', '#f7b6d2'  # pink
+GT1_DARK,        GT1_LIGHT        = '#2ca02c', '#98df8a'  # forest green / light green
+GT2_DARK,        GT2_LIGHT        = '#1f77b4', '#aec7e8'  # steel blue / light blue
+GT3_DARK,        GT3_LIGHT        = '#d62728', '#ff9896'  # red / light red
+GT1_NODIFF_DARK, GT1_NODIFF_LIGHT = '#8fbc00', '#c8e670'  # chartreuse / light lime (green family)
+GT2_NODIFF_DARK, GT2_NODIFF_LIGHT = '#6495ed', '#b0c8f8'  # cornflower blue / light periwinkle (blue family)
+GT3_NODIFF_DARK, GT3_NODIFF_LIGHT = '#c05020', '#e89a70'  # russet / light brick (red-orange family)
 STEP01_DARK, STEP01_LIGHT = '#ff7f0e', '#ffbb78'  # orange
 BOTH01_DARK, BOTH01_LIGHT = '#9467bd', '#c5b0d5'  # purple
 GT_LINE_GRAY = '#888888'
@@ -339,6 +341,7 @@ def main():
     gt3_runs           = load_runs(args.gt3_dir)
     gt1_nodiff_runs    = load_runs(GT1_NODIFF_BASE)
     gt2_nodiff_runs    = load_runs(GT2_NODIFF_BASE)
+    gt3_nodiff_runs    = load_runs(GT3_NODIFF_BASE)
     gt1_01mm_runs      = load_runs(GT1_01MM_BASE)
     gt1_01mm_sim_runs  = load_runs(GT1_01MM_SIM_BASE)
 
@@ -379,22 +382,26 @@ def main():
         c_pairs=_pairs(gt3_runs, GT3_DARK, GT3_LIGHT),
     )
 
-    # GT1 vs GT2 vs GT1_NoDiff vs GT2_NoDiff, noise only
+    # Full vs NoDiff per GT group, noise only.
+    # Each group pairs full-param runs with same-family NoDiff runs so the hue
+    # relationship is immediately visible; a 4th combined panel shows all together.
     g1n    = _filter(gt1_runs,        with_noise=True)
     g2n    = _filter(gt2_runs,        with_noise=True)
+    g3n    = _filter(gt3_runs,        with_noise=True)
     g1nd   = _filter(gt1_nodiff_runs, with_noise=True)
     g2nd   = _filter(gt2_nodiff_runs, with_noise=True)
-    if g1n or g2n or g1nd or g2nd:
+    g3nd   = _filter(gt3_nodiff_runs, with_noise=True)
+    if g1n or g2n or g3n or g1nd or g2nd or g3nd:
         make_figure(
-            [(r, GT1_DARK)       for r in g1n],
-            [(r, GT2_DARK)       for r in g2n],
+            [(r, GT1_DARK) for r in g1n] + [(r, GT1_NODIFF_DARK) for r in g1nd],
+            [(r, GT2_DARK) for r in g2n] + [(r, GT2_NODIFF_DARK) for r in g2nd],
             out('sweep_trajectories_noise_nodiff.pdf'),
             title_suffix='with noise: full vs no-diffusion',
-            color_labels={GT1_DARK:        'GT1',         GT2_DARK:        'GT2',
-                          GT1_NODIFF_DARK: 'GT1 NoDiff',  GT2_NODIFF_DARK: 'GT2 NoDiff'},
-            group_labels=('GT1', 'GT2', 'GT1 NoDiff', 'GT2 NoDiff', 'all combined'),
-            c_pairs=[(r, GT1_NODIFF_DARK) for r in g1nd],
-            d_pairs=[(r, GT2_NODIFF_DARK) for r in g2nd],
+            color_labels={GT1_DARK: 'GT1',         GT1_NODIFF_DARK: 'GT1 NoDiff',
+                          GT2_DARK: 'GT2',         GT2_NODIFF_DARK: 'GT2 NoDiff',
+                          GT3_DARK: 'GT3',         GT3_NODIFF_DARK: 'GT3 NoDiff'},
+            group_labels=('GT1 family', 'GT2 family', 'GT3 family', 'all combined'),
+            c_pairs=[(r, GT3_DARK) for r in g3n] + [(r, GT3_NODIFF_DARK) for r in g3nd],
         )
 
     # Stitched Adam→Newton: GT1 vs GT2, noise+no-noise combined
