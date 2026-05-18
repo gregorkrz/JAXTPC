@@ -546,11 +546,11 @@ def write_track_catalog_pdf(specs, path, stats=None):
     n = len(specs)
     fig_h = min(22.0, max(4.0, 0.55 * n + 1.5))
     has_stats = stats is not None and len(stats) == len(specs)
-    fig, ax = plt.subplots(figsize=(14 if has_stats else 11, fig_h))
+    fig, ax = plt.subplots(figsize=(18 if has_stats else 11, fig_h))
     ax.axis('off')
     headers = ['#', 'name', 'T (MeV)', '(dx, dy, dz)']
     if has_stats:
-        headers += ['N deposits', 'mean dE (MeV)', 'total dE (MeV)']
+        headers += ['N deposits', 'mean dE (MeV)', 'total dE (MeV)', 'n_time', 'n_wires (U1,V1,Y1,U2,V2,Y2)']
     rows = []
     for i, s in enumerate(specs, start=1):
         d = s['direction']
@@ -558,9 +558,12 @@ def write_track_catalog_pdf(specs, path, stats=None):
         row = [str(i), s['name'], f'{s["momentum_mev"]:.6g}', dir_str]
         if has_stats:
             st = stats[i - 1]
+            n_wires_str = ','.join(str(w) for w in st.get('n_wires', []))
             row += [f'{st["n_deposits"]:,}',
                     f'{st["mean_de"]:.4g}',
-                    f'{st["total_de"]:.4g}']
+                    f'{st["total_de"]:.4g}',
+                    str(st.get('n_time', '')),
+                    n_wires_str]
         rows.append(row)
     tbl = ax.table(
         cellText=rows,
@@ -575,7 +578,7 @@ def write_track_catalog_pdf(specs, path, stats=None):
         tbl[(0, j)].set_facecolor('#e0e0e0')
         tbl[(0, j)].set_text_props(weight='bold')
     ax.set_title('Tracks — name, kinetic energy, direction' +
-                 (' + deposit stats' if has_stats else ''), fontsize=12, pad=6)
+                 (' + deposit stats + readout shape' if has_stats else ''), fontsize=12, pad=6)
     fig.savefig(path, bbox_inches='tight')
     plt.close(fig)
     print(f'  Saved {path}')
@@ -670,8 +673,12 @@ def main():
         n_dep = len(de)
         mean_de = float(np.mean(de)) if n_dep > 0 else 0.0
         total_de = float(np.sum(de)) if n_dep > 0 else 0.0
-        print(f'    N_deposits={n_dep:,}  mean_dE={mean_de:.4g} MeV  total_dE={total_de:.4g} MeV')
-        track_stats.append(dict(n_deposits=n_dep, mean_de=mean_de, total_de=total_de))
+        n_time = planes[0].shape[1] if planes else 0
+        n_wires_list = [p.shape[0] for p in planes]
+        print(f'    N_deposits={n_dep:,}  mean_dE={mean_de:.4g} MeV  total_dE={total_de:.4g} MeV'
+              f'  n_time={n_time}  n_wires={n_wires_list}')
+        track_stats.append(dict(n_deposits=n_dep, mean_de=mean_de, total_de=total_de,
+                                n_time=n_time, n_wires=n_wires_list))
         all_de.append(de)
         all_planes.append(planes)
 

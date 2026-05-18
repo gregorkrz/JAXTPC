@@ -400,7 +400,7 @@ def main():
     plane_names_all = []
     for v in range(cfg.n_volumes):
         for p in range(cfg.volumes[v].n_planes):
-            plane_names_all.append(cfg.plane_names[v][p])
+            plane_names_all.append(f'{cfg.plane_names[v][p]}{v + 1}')
 
     # ── Pre-collect GT arrays for all-plane storage ───────────────────────────
     if args.store_arrays:
