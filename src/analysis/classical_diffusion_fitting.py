@@ -16,6 +16,10 @@ Outputs by default:
       $RESULTS_DIR/classical_diffusion_fitting_20260518/
   - pdf files to:
       $PLOTS_DIR/classical_diffusion_fitting_20260518/
+
+Plot-only mode:
+  - pass --plots-only to regenerate PDFs from an existing fit summary pickle
+    without rerunning simulation/fitting.
 """
 from __future__ import annotations
 
@@ -116,6 +120,12 @@ def parse_args():
     p.add_argument('--n-segments', type=int, default=1,
                    help='Simulator n_segments in differentiable mode. '
                         'Use 1 for isolated single-step responses (default: 1)')
+    p.add_argument('--plots-only', action='store_true',
+                   help='Skip simulation/fitting and regenerate PDFs from a saved '
+                        'fit summary pickle')
+    p.add_argument('--summary-pkl', default=None,
+                   help='Path to fit_summary.pkl for --plots-only mode '
+                        '(default: <results-dir>/fit_summary.pkl)')
     return p.parse_args()
 
 
@@ -335,6 +345,30 @@ def main():
     print(f'JAX devices: {jax.devices()}')
     print(f'Results dir: {results_dir}')
     print(f'Plots dir  : {plots_dir}')
+
+    if args.plots_only:
+        summary_pkl = Path(args.summary_pkl) if args.summary_pkl else (results_dir / 'fit_summary.pkl')
+        if not summary_pkl.exists():
+            raise FileNotFoundError(
+                f'--plots-only requested but summary pickle not found: {summary_pkl}')
+        with open(summary_pkl, 'rb') as f:
+            fit_summary = pickle.load(f)
+
+        trans_fit = fit_summary.get('global_transverse_fit')
+        long_fit = fit_summary.get('global_longitudinal_fit')
+        per_track_fits = fit_summary.get('per_track_fits', {})
+        if trans_fit is None or long_fit is None:
+            raise ValueError(
+                f'Summary pickle {summary_pkl} is missing global fit entries.')
+
+        global_pdf = plots_dir / 'global_sigma2_vs_drift_fit.pdf'
+        per_track_pdf = plots_dir / 'per_track_diffusion_estimates.pdf'
+        _plot_global_fit(trans_fit, long_fit, global_pdf)
+        _plot_per_track(per_track_fits, per_track_pdf)
+        print(f'Plots-only mode complete from: {summary_pkl}')
+        print(f'Saved: {global_pdf}')
+        print(f'Saved: {per_track_pdf}')
+        return
 
     detector_config = generate_detector(CONFIG_PATH)
     sim = DetectorSimulator(
