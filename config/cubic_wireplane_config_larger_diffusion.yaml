@@ -1,0 +1,93 @@
+---
+# JAXTPC Detector Configuration, Almost SBND size
+
+volumes:
+  - id: 0
+    description: "TPC East (x < 0)"
+    geometry:
+      ranges: [[-216.0, 0.0], [-216.0, 216.0], [-216.0, 216.0]]  # cm [x, y, z]
+      drift_direction: -1   # electrons drift toward -x anode
+    planes:
+      - plane_id: 0
+        type: first_induction
+        angle: 60.0  # degrees
+        wire_spacing: 0.3  # cm
+        distance_from_anode: 0.6  # cm (furthest from detector edge)
+        bias_voltage: -200.0  # V
+      - plane_id: 1
+        type: second_induction
+        angle: -60.0  # degrees
+        wire_spacing: 0.3  # cm
+        distance_from_anode: 0.3  # cm (middle plane)
+        bias_voltage: 0.0  # V
+      - plane_id: 2
+        type: collection
+        angle: 0.0  # degrees
+        wire_spacing: 0.3  # cm
+        distance_from_anode: 0.0  # cm (closest to detector edge)
+        bias_voltage: 500.0  # V
+
+  - id: 1
+    description: "TPC West (x > 0)"
+    geometry:
+      ranges: [[0.0, 216.0], [-216.0, 216.0], [-216.0, 216.0]]  # cm [x, y, z]
+      drift_direction: 1    # electrons drift toward +x anode
+    planes:
+      - plane_id: 3
+        type: first_induction
+        angle: 60.0  # degrees
+        wire_spacing: 0.3  # cm
+        distance_from_anode: 0.6  # cm (furthest from detector edge)
+        bias_voltage: -200.0  # V
+      - plane_id: 4
+        type: second_induction
+        angle: -60.0  # degrees
+        wire_spacing: 0.3  # cm
+        distance_from_anode: 0.3  # cm (middle plane)
+        bias_voltage: 0.0  # V
+      - plane_id: 5
+        type: collection
+        angle: 0.0  # degrees
+        wire_spacing: 0.3  # cm
+        distance_from_anode: 0.0  # cm (closest to detector edge)
+        bias_voltage: 500.0  # V
+
+readout:
+  sampling_rate: 2.0  # MHz
+  electrons_per_adc: 182  # electrons per ADC count (from MicroBooNE electronics)
+  pre_window_fraction: 0.0   # fraction of max drift time before t=0
+  post_window_fraction: 0.0  # fraction of max drift time after max drift
+  digitization:
+    n_bits: 12                  # ADC resolution
+    pedestal_collection: 410    # Baseline ADC for Y (collection) planes
+    pedestal_induction: 1843    # Baseline ADC for U/V (induction) planes
+    gain_scale: 1.0             # Gain rescale factor (1.0 = MicroBooNE/SBND calibration)
+
+simulation:
+  drift:
+    velocity: 1.6               # mm/μs
+    longitudinal_diffusion: 72  # cm²/s
+    transverse_diffusion: 120   # cm²/s
+    electron_lifetime: 10.0     # ms
+  charge_recombination:
+    model: emb  # Options: 'modified_box' (ArgoNeuT), 'emb' (ICARUS)
+    recomb_parameters:
+      # Standard Modified Box (ArgoNeuT 2013, JINST 8 P08005)
+      alpha: 0.93   # dimensionless
+      beta: 0.212   # (kV/cm)(g/cm²)/MeV
+      # Ellipsoid Modified Box (ICARUS 2024, arXiv:2407.12969)
+      alpha_emb: 0.904      # dimensionless
+      beta_90: 0.204        # (kV/cm)(g/cm²)/MeV (at phi=90 deg)
+      R_anisotropy: 1.25    # ellipsoid anisotropy parameter
+
+medium:
+  type: liquid_argon
+  properties:
+    density: 1.396  # g/cm³
+    ionization_energy: 23.6  # eV per ion pair (W_ion)
+    excitation_ratio: 0.21  # N_ex / N_i (alpha), universal LAr constant
+  temperature: 87.0  # K
+  pressure: 1.0  # atm
+
+electric_field:
+  field_strength: 500.0  # V/cm
