@@ -68,16 +68,15 @@ def _pick_main(sig, axis):
 def _signal_bbox(gt_p):
     """Return (wl, wh, tl, th) bounding box of signal, padded and capped.
 
-    Uses the GT array to find which wires and time bins carry signal above
-    BBOX_THRESHOLD * peak, adds BBOX_PAD_WIRE / BBOX_PAD_TIME margin on each
-    side, then clips to MAX_WIRE × MAX_TIME centred on the signal centroid.
-    Falls back to a centred region if the array is all zeros.
+    For clean arrays uses the 2%-of-peak threshold to find the signal extent.
+    For noisy arrays the threshold activates most wires (noise RMS ≈ threshold),
+    so when >50% of wires fire we fall back to centering on the array peak,
+    which is still at the track location when signal >> noise.
     """
     nw, nt = gt_p.shape
     peak = float(np.abs(gt_p).max())
 
     if peak == 0.0:
-        # No signal: return a small centred region
         wl = max(0, nw // 2 - MAX_WIRE // 2)
         tl = max(0, nt // 2 - MAX_TIME // 2)
         return wl, min(nw, wl + MAX_WIRE), tl, min(nt, tl + MAX_TIME)
@@ -86,19 +85,29 @@ def _signal_bbox(gt_p):
     wire_idx = np.where(mask.any(axis=1))[0]
     time_idx = np.where(mask.any(axis=0))[0]
 
+    # Noise inflation check: if more than half the wires are "active" the
+    # threshold-based centroid is unreliable — centre on the peak instead.
+    if len(wire_idx) > nw * 0.5 or len(time_idx) > nt * 0.5:
+        pw, pt = np.unravel_index(np.abs(gt_p).argmax(), gt_p.shape)
+        wl = max(0, pw - MAX_WIRE // 2)
+        wh = min(nw, wl + MAX_WIRE)
+        wl = max(0, wh - MAX_WIRE)
+        tl = max(0, pt - MAX_TIME // 2)
+        th = min(nt, tl + MAX_TIME)
+        tl = max(0, th - MAX_TIME)
+        return wl, wh, tl, th
+
     wl = max(0,  wire_idx[0]  - BBOX_PAD_WIRE)
     wh = min(nw, wire_idx[-1] + BBOX_PAD_WIRE + 1)
     tl = max(0,  time_idx[0]  - BBOX_PAD_TIME)
     th = min(nt, time_idx[-1] + BBOX_PAD_TIME + 1)
 
-    # Cap width — centre on signal centroid
     if wh - wl > MAX_WIRE:
         cw = int((wire_idx[0] + wire_idx[-1]) // 2)
         wl = max(0, cw - MAX_WIRE // 2)
         wh = min(nw, wl + MAX_WIRE)
-        wl = max(0, wh - MAX_WIRE)   # shift left if we hit the right edge
+        wl = max(0, wh - MAX_WIRE)
 
-    # Cap height — centre on signal centroid
     if th - tl > MAX_TIME:
         ct = int((time_idx[0] + time_idx[-1]) // 2)
         tl = max(0, ct - MAX_TIME // 2)
@@ -112,7 +121,14 @@ def _b64z(arr):
     return base64.b64encode(zlib.compress(np.asarray(arr, dtype=np.float32).tobytes(), 6)).decode()
 
 
-def build_data(pkl):
+def build_data(pkl, bbox_override=None):
+    """Build viewer data dict from a pkl.
+
+    bbox_override : dict {(track, plane): (wl, wh, tl, th)}, optional
+        When provided, the given bbox is used instead of computing one from the
+        GT array.  Used for noisy pkls so they share the clean GT bbox (noise
+        inflates the threshold-based bbox to the full detector, hiding the track).
+    """
     plane_names = pkl.get('plane_names', [])
     # Old pkls stored bare names without volume index (e.g. ['U','V','Y','U','V','Y']).
     # Detect duplicates and add a volume suffix so button IDs stay unique.
@@ -143,6 +159,7 @@ def build_data(pkl):
 
     arrays = {}
     refs   = {}
+    bboxes = {}
     for track in track_names:
         arrays[track] = {}
         refs[track]   = {}
@@ -155,7 +172,11 @@ def build_data(pkl):
             wire_ref = _pick_main(gt_p, 'wire')
             time_ref = _pick_main(gt_p, 'time')
 
-            wl, wh, tl, th = _signal_bbox(gt_p)
+            if bbox_override and (track, plane) in bbox_override:
+                wl, wh, tl, th = bbox_override[(track, plane)]
+            else:
+                wl, wh, tl, th = _signal_bbox(gt_p)
+            bboxes[(track, plane)] = (wl, wh, tl, th)
             nw, nt = wh - wl, th - tl
 
             # Stack: index 0 = GT, indices 1..n_sweep = sweep pts
@@ -207,6 +228,7 @@ def build_data(pkl):
         'track_names':   track_names,
         'arrays':        arrays,
         'refs':          refs,
+        'bboxes':        bboxes,
         'loss_total':    pkl['loss_values'],
         'grad_total':    pkl['grad_values'],
         'loss_per_track': pkl['per_track_loss_values'],
@@ -324,6 +346,11 @@ tr.sel:hover td{background:#BBDEFB}
       <span class="lbl">Param:</span>
       <div id="tr-param-btns" style="display:flex;gap:4px"></div>
     </div>
+    <div class="row" id="tr-noise-row">
+      <label style="font-size:13px;cursor:pointer">
+        <input type="checkbox" id="tr-noise-cb"> Noise
+      </label>
+    </div>
     <div class="row" style="margin-top:8px">
       <button class="btn-add" id="btn-add">Add Trace</button>
       <button class="btn-upd" id="btn-upd" style="display:none">Update Selected</button>
@@ -344,6 +371,16 @@ tr.sel:hover td{background:#BBDEFB}
       </tr></thead>
       <tbody id="tbl-body"></tbody>
     </table>
+  </div>
+
+  <!-- ── ADC Distribution ──────────────────────────────────────────── -->
+  <div class="card" id="hist-card" style="display:none">
+    <h3 style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+      ADC Distribution
+      <span style="font-weight:400;font-size:13px;color:#555">Plane:</span>
+      <div id="hist-plane-btns" style="display:flex;gap:4px"></div>
+    </h3>
+    <div id="hist-plot" style="height:320px"></div>
   </div>
 
   <!-- ── 1-D Trace Plots (one row per wireplane) ───────────────────── -->
@@ -379,14 +416,13 @@ function _dims(pi, track, plane) {
   return (PARAMS[pi].arrays_clean || PARAMS[pi].arrays_noisy)[track][plane];
 }
 
-// pt=0 (GT): use noisy buf when _noiseOn is set; all other pts always use clean
-function _ptBuf(pi, track, plane, pt) {
-  return _getBuf(pi, track, plane, pt === 0 && _noiseOn);
+function _ptBuf(pi, track, plane, pt, noisy) {
+  return _getBuf(pi, track, plane, pt === 0 && noisy);
 }
 
-function _getZ(pi, track, plane, pt) {
+function _getZ(pi, track, plane, pt, noisy=false) {
   const a = _dims(pi, track, plane);
-  const buf = _ptBuf(pi, track, plane, pt);
+  const buf = _ptBuf(pi, track, plane, pt, noisy);
   const off = pt * a.n_wire * a.n_time;
   const z = [];
   for (let w = 0; w < a.n_wire; w++) {
@@ -397,10 +433,10 @@ function _getZ(pi, track, plane, pt) {
   return z;
 }
 
-function _getZDiff(pi, track, plane, pt) {
+function _getZDiff(pi, track, plane, pt, noisy=false) {
   const a    = _dims(pi, track, plane);
-  const bufS = _getBuf(pi, track, plane, false);           // sim: always clean
-  const bufG = _ptBuf(pi, track, plane, 0);               // GT: respect noise flag
+  const bufS = _getBuf(pi, track, plane, false);
+  const bufG = _ptBuf(pi, track, plane, 0, noisy);
   const offS = pt * a.n_wire * a.n_time, offG = 0;
   const z = [];
   for (let w = 0; w < a.n_wire; w++) {
@@ -412,21 +448,21 @@ function _getZDiff(pi, track, plane, pt) {
   return z;
 }
 
-function _getTimeTrace(pi, track, plane, pt, wireAbs) {
+function _getTimeTrace(pi, track, plane, pt, wireAbs, noisy=false) {
   const a = _dims(pi, track, plane);
   const w = wireAbs - a.wire_lo;
   if (w < 0 || w >= a.n_wire) return null;
-  const buf = _ptBuf(pi, track, plane, pt);
+  const buf = _ptBuf(pi, track, plane, pt, noisy);
   const off = pt * a.n_wire * a.n_time + w * a.n_time;
   return {x: Array.from({length:a.n_time}, (_,i) => a.time_lo+i),
           y: Array.from(buf.slice(off, off+a.n_time))};
 }
 
-function _getWireTrace(pi, track, plane, pt, timeAbs) {
+function _getWireTrace(pi, track, plane, pt, timeAbs, noisy=false) {
   const a = _dims(pi, track, plane);
   const t = timeAbs - a.time_lo;
   if (t < 0 || t >= a.n_time) return null;
-  const buf = _ptBuf(pi, track, plane, pt);
+  const buf = _ptBuf(pi, track, plane, pt, noisy);
   const off = pt * a.n_wire * a.n_time;
   const y = [];
   for (let w = 0; w < a.n_wire; w++) y.push(buf[off + w * a.n_time + t]);
@@ -453,7 +489,8 @@ let _evdPreviewInited = false;
 function _nextColor() { return _PALETTE[_pIdx++ % _PALETTE.length]; }
 function _ptLabel(pi, pt) { return PARAMS[pi].pt_labels[pt]; }
 function _makeLabel(e) {
-  return e.track + ' | ' + PARAMS[e.pi].param_label + ' | ' + _ptLabel(e.pi, e.pt);
+  return e.track + ' | ' + PARAMS[e.pi].param_label + ' | ' + _ptLabel(e.pi, e.pt) +
+    (e.noisy ? ' [noisy]' : '');
 }
 
 /* ── event display ── */
@@ -466,13 +503,13 @@ function _drawEvd() {
 
   let z, titleSuffix;
   if (_evdMode === 'gt') {
-    z = _getZ(pi, _evdTrack, _evdPlane, 0);
+    z = _getZ(pi, _evdTrack, _evdPlane, 0, _noiseOn);
     titleSuffix = _noiseOn ? 'GT (noisy)' : 'GT';
   } else if (_evdMode === 'sim') {
-    z = _getZ(pi, _evdTrack, _evdPlane, pt);
+    z = _getZ(pi, _evdTrack, _evdPlane, pt, false);
     titleSuffix = _ptLabel(pi, pt);
   } else {
-    z = _getZDiff(pi, _evdTrack, _evdPlane, pt);
+    z = _getZDiff(pi, _evdTrack, _evdPlane, pt, _noiseOn);
     titleSuffix = 'Sim−GT @ ' + _ptLabel(pi, pt);
   }
 
@@ -530,15 +567,16 @@ function _drawEvdPreview() {
   const pt = Math.max(1, _sweepPt[pi]);
   const {wire: wireAbs, time: timeAbs} = _evdRef();
 
-  const sim_t = _getTimeTrace(pi, _evdTrack, _evdPlane, pt,  wireAbs);
-  const gt_t  = _getTimeTrace(pi, _evdTrack, _evdPlane, 0,   wireAbs);
-  const sim_w = _getWireTrace(pi, _evdTrack, _evdPlane, pt,  timeAbs);
-  const gt_w  = _getWireTrace(pi, _evdTrack, _evdPlane, 0,   timeAbs);
+  const sim_t = _getTimeTrace(pi, _evdTrack, _evdPlane, pt,  wireAbs, false);
+  const gt_t  = _getTimeTrace(pi, _evdTrack, _evdPlane, 0,   wireAbs, _noiseOn);
+  const sim_w = _getWireTrace(pi, _evdTrack, _evdPlane, pt,  timeAbs, false);
+  const gt_w  = _getWireTrace(pi, _evdTrack, _evdPlane, 0,   timeAbs, _noiseOn);
 
   const vtT = [], vwT = [];
-  if (gt_t)  vtT.push({x:gt_t.x,  y:gt_t.y,  name:'GT',  type:'scatter', mode:'lines', line:{color:'#aaa', width:1.5, dash:'dot'}});
+  const _evdGtLabel = (_noiseOn && PARAMS[pi].has_noise) ? 'GT (noisy)' : 'GT';
+  if (gt_t)  vtT.push({x:gt_t.x,  y:gt_t.y,  name:_evdGtLabel, type:'scatter', mode:'lines', line:{color:'#aaa', width:1.5, dash:'dot'}});
   if (sim_t) vtT.push({x:sim_t.x, y:sim_t.y, name:'Sim '+_ptLabel(pi,pt), type:'scatter', mode:'lines', line:{color:'#1f77b4', width:2}});
-  if (gt_w)  vwT.push({x:gt_w.x,  y:gt_w.y,  name:'GT',  type:'scatter', mode:'lines', line:{color:'#aaa', width:1.5, dash:'dot'}});
+  if (gt_w)  vwT.push({x:gt_w.x,  y:gt_w.y,  name:_evdGtLabel, type:'scatter', mode:'lines', line:{color:'#aaa', width:1.5, dash:'dot'}});
   if (sim_w) vwT.push({x:sim_w.x, y:sim_w.y, name:'Sim '+_ptLabel(pi,pt), type:'scatter', mode:'lines', line:{color:'#1f77b4', width:2}});
 
   const lyBase = {margin:{t:30,b:40,l:55,r:10}, legend:{orientation:'h',font:{size:10},y:1.12},
@@ -600,6 +638,18 @@ function _drawTraces() {
     const vwId = 'plot-vw-' + plane;
     const vtT = [], vwT = [];
 
+    // GT — clean or noisy depending on noise checkbox
+    {
+      const pi = _trParamIdx;
+      const prRef = _refs[_trTrack + '/' + plane] || {wire:0, time:0};
+      const gt_t = _getTimeTrace(pi, _trTrack, plane, 0, prRef.wire, _noiseOn);
+      const gt_w = _getWireTrace(pi, _trTrack, plane, 0, prRef.time, _noiseOn);
+      const gtLabel = (_noiseOn && PARAMS[pi].has_noise) ? 'GT (noisy)' : 'GT';
+      const gtLine = {color:'#444', width:1.5, dash:'dash'};
+      if (gt_t) vtT.push({x:gt_t.x, y:gt_t.y, name:gtLabel, type:'scatter', mode:'lines', line:gtLine});
+      if (gt_w) vwT.push({x:gt_w.x, y:gt_w.y, name:gtLabel, type:'scatter', mode:'lines', line:gtLine});
+    }
+
     // Preview (dashed grey) — shown in every plane using that plane's ref for _trTrack
     {
       const pi = _trParamIdx, pt = _sweepPt[pi];
@@ -615,8 +665,8 @@ function _drawTraces() {
     // All added entries — each extracted at this plane's ref for the entry's track
     _entries.forEach(e => {
       const er = _refs[e.track + '/' + plane] || {wire:0, time:0};
-      const tr_t = _getTimeTrace(e.pi, e.track, plane, e.pt, er.wire);
-      const tr_w = _getWireTrace(e.pi, e.track, plane, e.pt, er.time);
+      const tr_t = _getTimeTrace(e.pi, e.track, plane, e.pt, er.wire, e.noisy || false);
+      const tr_w = _getWireTrace(e.pi, e.track, plane, e.pt, er.time, e.noisy || false);
       if (tr_t) vtT.push({x:tr_t.x, y:tr_t.y, name:e.label, type:'scatter', mode:'lines',
         line:{color:e.color, width:2}});
       if (tr_w) vwT.push({x:tr_w.x, y:tr_w.y, name:e.label, type:'scatter', mode:'lines',
@@ -641,6 +691,63 @@ function _drawTraces() {
   });
 }
 
+/* ── ADC histogram ── */
+let _histPlane  = null;
+let _histInited = false;
+
+function _getFlatADC(e, plane) {
+  const a = _dims(e.pi, e.track, plane);
+  const buf = _ptBuf(e.pi, e.track, plane, e.pt, e.noisy || false);
+  const off = e.pt * a.n_wire * a.n_time;
+  const flat = new Array(a.n_wire * a.n_time);
+  for (let i = 0; i < flat.length; i++) flat[i] = buf[off + i];
+  return flat;
+}
+
+function _drawHist() {
+  const card = document.getElementById('hist-card');
+  if (!_entries.length) { card.style.display = 'none'; return; }
+  card.style.display = '';
+  const plane = _histPlane || PARAMS[0].plane_names[0];
+
+  const perEntry = _entries.map(e => _getFlatADC(e, plane));
+
+  let gMin = Infinity, gMax = -Infinity;
+  perEntry.forEach(vals => {
+    for (let i = 0; i < vals.length; i++) {
+      if (vals[i] < gMin) gMin = vals[i];
+      if (vals[i] > gMax) gMax = vals[i];
+    }
+  });
+  if (!isFinite(gMin)) return;
+  const binSize = Math.max((gMax - gMin) / 200, 1e-9);
+
+  const traces = _entries.map((e, i) => ({
+    x: perEntry[i],
+    name: e.label,
+    type: 'histogram',
+    opacity: 0.55,
+    marker: {color: e.color, line: {width: 0}},
+    xbins: {start: gMin, end: gMax + binSize, size: binSize},
+    autobinx: false,
+  }));
+
+  const layout = {
+    barmode: 'overlay',
+    xaxis: {title: 'Signal (ADC)'},
+    yaxis: {title: 'Count', type: 'log'},
+    margin: {t:10, b:50, l:60, r:20},
+    legend: {font: {size: 11}},
+  };
+
+  if (!_histInited) {
+    Plotly.newPlot('hist-plot', traces, layout, _cfg);
+    _histInited = true;
+  } else {
+    Plotly.react('hist-plot', traces, layout, _cfg);
+  }
+}
+
 /* ── table ── */
 function _renderTable() {
   const tbody = document.getElementById('tbl-body');
@@ -663,11 +770,17 @@ function _renderTable() {
     tr.addEventListener('click', ev => { if (ev.target.tagName==='BUTTON') return; _selectEntry(e.id); });
     tbody.appendChild(tr);
   });
+  _drawHist();
 }
 
 /* ── entry management ── */
 function _getTraceCtrl() {
-  return {track:_trTrack, pi:_trParamIdx, pt:_sweepPt[_trParamIdx]};
+  return {
+    track: _trTrack,
+    pi:    _trParamIdx,
+    pt:    _sweepPt[_trParamIdx],
+    noisy: document.getElementById('tr-noise-cb').checked,
+  };
 }
 
 function _addTrace() {
@@ -700,6 +813,7 @@ function _selectEntry(id) {
     _trTrack = e.track; _trParamIdx = e.pi;
     _sweepPt[e.pi] = e.pt;
     document.getElementById('tr-track').value = e.track;
+    document.getElementById('tr-noise-cb').checked = e.noisy || false;
     _updateTrParamBtn(e.pi);
     const sl = document.getElementById('evd-sl-'+e.pi);
     if (sl) { sl.value = String(e.pt); _updateSlLabel(e.pi); }
@@ -854,6 +968,25 @@ function _initUI() {
     trParamBtns.appendChild(b);
   });
 
+  // Histogram plane buttons
+  _histPlane = p0.plane_names[0];
+  const histPb = document.getElementById('hist-plane-btns');
+  histPb.innerHTML = '';
+  p0.plane_names.forEach(p => {
+    const b = document.createElement('button');
+    b.id = 'hist-pb-' + p; b.textContent = p;
+    b.className = 'plane-btn' + (p === _histPlane ? ' active' : '');
+    b.onclick = () => {
+      _histPlane = p;
+      p0.plane_names.forEach(n => {
+        const bb = document.getElementById('hist-pb-' + n);
+        if (bb) bb.className = 'plane-btn' + (n === p ? ' active' : '');
+      });
+      _drawHist();
+    };
+    histPb.appendChild(b);
+  });
+
   _syncRefInputs(); _renderTable(); _drawEvd(); _drawTraces();
 }
 
@@ -866,12 +999,14 @@ window.addEventListener('load', () => {
     });
   });
 
-  // Noise checkbox — hide if no param has paired noisy+clean data
+  // Noise checkboxes — hide if no param has paired noisy+clean data
   const anyNoise = PARAMS.some(p => p.has_noise);
-  document.getElementById('noise-label').style.display = anyNoise ? '' : 'none';
+  document.getElementById('noise-label').style.display   = anyNoise ? '' : 'none';
+  document.getElementById('tr-noise-row').style.display  = anyNoise ? '' : 'none';
   document.getElementById('noise-cb').addEventListener('change', e => {
     _noiseOn = e.target.checked; _drawEvd(); _drawTraces();
   });
+  document.getElementById('tr-noise-cb').addEventListener('change', _drawTraces);
 
   // Wire/time ref inputs
   document.getElementById('wire-ref').addEventListener('change', () => {
@@ -942,13 +1077,20 @@ def _load_pkl(pkl_path: Path):
         return None
     print(f'  Building data …')
     data = build_data(pkl)
+    data['_pkl_path'] = pkl_path
     print(f'  Tracks: {data["track_names"]},  Planes: {data["plane_names"]},  '
           f'N sweep={data["n_sweep"]},  noise={data["noise_scale"]}')
     return data
 
 
 def _group_by_param(all_data: list) -> list:
-    """Merge noisy/clean variants of the same param into one entry each."""
+    """Merge noisy/clean variants of the same param into one entry each.
+
+    When both variants exist, the noisy arrays are rebuilt using the clean GT
+    bbox.  Noise inflates the threshold-based bbox to the full detector (noise
+    RMS ≈ 2% threshold), so the default crop centres on the detector midpoint
+    and misses the track.  Using the clean bbox keeps both views aligned.
+    """
     by_param = defaultdict(dict)
     for d in all_data:
         key = 'noisy' if d['noise_scale'] > 0 else 'clean'
@@ -960,6 +1102,17 @@ def _group_by_param(all_data: list) -> list:
         clean = variants.get('clean')
         noisy = variants.get('noisy')
         base = clean if clean else noisy
+
+        # Rebuild noisy arrays with the clean bbox so the track stays visible.
+        if clean and noisy and '_pkl_path' in noisy:
+            print(f'  Rebuilding noisy arrays for {param_name} using clean bbox …')
+            with open(noisy['_pkl_path'], 'rb') as f:
+                noisy_pkl = pickle.load(f)
+            noisy_rebuilt = build_data(noisy_pkl, bbox_override=clean['bboxes'])
+            noisy_arrays = noisy_rebuilt['arrays']
+        else:
+            noisy_arrays = noisy['arrays'] if noisy else None
+
         entry = {
             'param_name':   param_name,
             'param_label':  base['param_label'],
@@ -975,7 +1128,7 @@ def _group_by_param(all_data: list) -> list:
             'has_noise':    (clean is not None and noisy is not None),
             'noise_scale':  float(noisy['noise_scale']) if noisy else 0.0,
             'arrays_clean': clean['arrays'] if clean else base['arrays'],
-            'arrays_noisy': noisy['arrays'] if noisy else None,
+            'arrays_noisy': noisy_arrays,
         }
         params_list.append(entry)
     return params_list

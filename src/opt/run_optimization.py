@@ -290,6 +290,9 @@ def parse_args():
     p.add_argument('--gt-lifetime-us', type=float, default=None,
                    help='Override the GT electron lifetime in μs (default: use GT_LIFETIME_US '
                         f'= {GT_LIFETIME_US:.0f} μs). E.g. 6000 for 6 ms.')
+    p.add_argument('--sobolev-loss-cutoff', type=float, default=0.0,
+                   help='ADC cutoff: zero out pixels where |gt| < cutoff before computing loss '
+                        '(default: 0.0, no cutoff). Applied to both sim and gt signals.')
     return p.parse_args()
 
 
@@ -447,24 +450,44 @@ def make_nparam_setter(param_names, gt_params, recomb_model):
 
 # ── Loss builder ───────────────────────────────────────────────────────────────
 
-def build_loss_fn(loss_name, fwd_fn, gt_arrays, weights):
+def _apply_adc_mask(pred_tuple, gt_tuple, cutoff):
+    """Zero both pred and gt where |gt| < cutoff. No-op when cutoff <= 0."""
+    if cutoff <= 0.0:
+        return pred_tuple, gt_tuple
+    masked_pred, masked_gt = [], []
+    for p, g in zip(pred_tuple, gt_tuple):
+        mask = jnp.abs(g) >= cutoff
+        masked_pred.append(jnp.where(mask, p, 0.0))
+        masked_gt.append(jnp.where(mask, g, 0.0))
+    return tuple(masked_pred), tuple(masked_gt)
+
+
+def build_loss_fn(loss_name, fwd_fn, gt_arrays, weights, adc_cutoff=0.0):
     """Return sJIT-compiled (loss, grad) function for a single track."""
     planes = tuple(range(len(gt_arrays)))
     if loss_name == 'sobolev_loss':
-        def fn(p_n_vec): return sobolev_loss(fwd_fn(p_n_vec), gt_arrays, weights, planes)
+        def fn(p_n_vec):
+            pred, gt = _apply_adc_mask(fwd_fn(p_n_vec), gt_arrays, adc_cutoff)
+            return sobolev_loss(pred, gt, weights, planes)
     elif loss_name == 'sobolev_loss_geomean_log1p':
-        def fn(p_n_vec): return sobolev_loss_geomean_log1p(fwd_fn(p_n_vec), gt_arrays, weights, planes)
+        def fn(p_n_vec):
+            pred, gt = _apply_adc_mask(fwd_fn(p_n_vec), gt_arrays, adc_cutoff)
+            return sobolev_loss_geomean_log1p(pred, gt, weights, planes)
     elif loss_name == 'mse_loss':
-        def fn(p_n_vec): return mse_loss(fwd_fn(p_n_vec), gt_arrays)
+        def fn(p_n_vec):
+            pred, gt = _apply_adc_mask(fwd_fn(p_n_vec), gt_arrays, adc_cutoff)
+            return mse_loss(pred, gt)
     elif loss_name == 'l1_loss':
-        def fn(p_n_vec): return l1_loss(fwd_fn(p_n_vec), gt_arrays)
+        def fn(p_n_vec):
+            pred, gt = _apply_adc_mask(fwd_fn(p_n_vec), gt_arrays, adc_cutoff)
+            return l1_loss(pred, gt)
     else:
         raise ValueError(f'Unknown loss {loss_name!r}')
     return jax.jit(jax.value_and_grad(fn))
 
 
 def build_phase_fns(loss_name, simulator, setter, batches, *, return_per_track_loss=False,
-                    return_hessian=False):
+                    return_hessian=False, adc_cutoff=0.0):
     """Return one callable per batch in a phase.
 
     Default ``fn(p) -> (loss, grad)``. When ``return_per_track_loss=True``,
@@ -527,6 +550,7 @@ def build_phase_fns(loss_name, simulator, setter, batches, *, return_per_track_l
                     )
                     gt_b  = tuple(jax.lax.stop_gradient(batch_gts[b][p]) for p in range(n_planes))
                     wts_b = tuple(jax.lax.stop_gradient(batch_wts[b][p]) for p in range(n_planes))
+                    pred, gt_b = _apply_adc_mask(pred, gt_b, adc_cutoff)
                     if loss_name == 'sobolev_loss':
                         total = total + sobolev_loss(pred, gt_b, wts_b, planes)
                     elif loss_name == 'sobolev_loss_geomean_log1p':
@@ -562,6 +586,7 @@ def build_phase_fns(loss_name, simulator, setter, batches, *, return_per_track_l
                     )
                     gt_b  = tuple(jax.lax.stop_gradient(batch_gts[b][p]) for p in range(n_planes))
                     wts_b = tuple(jax.lax.stop_gradient(batch_wts[b][p]) for p in range(n_planes))
+                    pred, gt_b = _apply_adc_mask(pred, gt_b, adc_cutoff)
                     if loss_name == 'sobolev_loss':
                         lb = sobolev_loss(pred, gt_b, wts_b, planes)
                     elif loss_name == 'sobolev_loss_geomean_log1p':
@@ -590,6 +615,7 @@ def build_phase_fns(loss_name, simulator, setter, batches, *, return_per_track_l
                     )
                     gt_b  = tuple(jax.lax.stop_gradient(batch_gts[b][p]) for p in range(n_planes))
                     wts_b = tuple(jax.lax.stop_gradient(batch_wts[b][p]) for p in range(n_planes))
+                    pred, gt_b = _apply_adc_mask(pred, gt_b, adc_cutoff)
                     if loss_name == 'sobolev_loss':
                         total = total + sobolev_loss(pred, gt_b, wts_b, planes)
                     elif loss_name == 'sobolev_loss_geomean_log1p':
@@ -1472,6 +1498,8 @@ def main():
     print(f'N            : {args.N}')
     print(f'Seed         : {effective_seed}')
     print(f'Noise scale  : {args.noise_scale}')
+    if args.sobolev_loss_cutoff > 0.0:
+        print(f'ADC cutoff   : {args.sobolev_loss_cutoff}')
     print(f'Num buckets  : {args.num_buckets:,}')
     print(f'Eff batch    : {args.effective_batch_size}')
     print(f'GT step size : {args.gt_step_size} mm  max deposits={args.gt_max_deposits:,}')
@@ -1727,7 +1755,8 @@ def main():
                     fns = build_phase_fns(
                         args.loss, sim_ph, setter, batches,
                         return_per_track_loss=log_track_losses_wandb,
-                        return_hessian=is_newton)
+                        return_hessian=is_newton,
+                        adc_cutoff=args.sobolev_loss_cutoff)
                     for fn in fns:
                         out = fn(p)
                         jax.block_until_ready(out)

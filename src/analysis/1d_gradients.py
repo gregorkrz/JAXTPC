@@ -145,6 +145,8 @@ def parse_args():
                    help='RNG seed for noise (default: 42)')
     p.add_argument('--sobolev-max-pad', type=int, default=128,
                    help='Max padding for Sobolev weight construction (default: 128)')
+    p.add_argument('--adc-cutoff', type=float, default=0.0,
+                   help='Zero out pixels where |GT| < cutoff before loss (default: 0 = off)')
     p.add_argument('--store-arrays', action='store_true',
                    help='Store full 2D signal arrays (all planes) at each sweep point per track')
     p.add_argument('--output', default=None,
@@ -256,19 +258,27 @@ def build_value_and_grad(loss_name, simulator, make_params, n_planes):
     def fwd(p_n, deposits):
         return simulator.forward(make_params(p_n), deposits)
 
+    def _mask(arrays, masks):
+        return tuple(jnp.where(m, a, 0.0) for a, m in zip(arrays, masks))
+
     if loss_name == 'sobolev_loss':
-        def fn(p_n, deposits, gt_arrays, weights):
-            return sobolev_loss(fwd(p_n, deposits), gt_arrays, weights, planes)
+        def fn(p_n, deposits, gt_arrays, weights, masks):
+            sim = _mask(fwd(p_n, deposits), masks)
+            gt  = _mask(gt_arrays, masks)
+            return sobolev_loss(sim, gt, weights, planes)
     elif loss_name == 'sobolev_loss_geomean_log1p':
-        def fn(p_n, deposits, gt_arrays, weights):
-            return sobolev_loss_geomean_log1p(fwd(p_n, deposits), gt_arrays, weights, planes)
+        def fn(p_n, deposits, gt_arrays, weights, masks):
+            sim = _mask(fwd(p_n, deposits), masks)
+            gt  = _mask(gt_arrays, masks)
+            return sobolev_loss_geomean_log1p(sim, gt, weights, planes)
     elif loss_name == 'mse_loss':
-        def fn(p_n, deposits, gt_arrays, weights):
-            pred  = fwd(p_n, deposits)
+        def fn(p_n, deposits, gt_arrays, weights, masks):
+            sim   = _mask(fwd(p_n, deposits), masks)
+            gt    = _mask(gt_arrays, masks)
             total = jnp.zeros(())
-            for pr, gt in zip(pred, gt_arrays):
-                norm  = jnp.sum(jnp.abs(gt)) + 1e-12
-                total = total + jnp.mean(((pr - gt) / norm) ** 2)
+            for pr, g in zip(sim, gt):
+                norm  = jnp.sum(jnp.abs(g)) + 1e-12
+                total = total + jnp.mean(((pr - g) / norm) ** 2)
             return total
     else:
         raise ValueError(f'Unknown loss {loss_name!r}')
@@ -281,11 +291,12 @@ def build_value_and_grad(loss_name, simulator, make_params, n_planes):
 def auto_output_path(args, loss_name, track_specs):
     tracks_tag = (f'{len(track_specs)}tracks' if len(track_specs) > 1
                   else track_specs[0]['name'])
-    noise_tag  = f'_noise{args.noise_scale:.3g}'.replace('.', 'p') if args.noise_scale > 0.0 else ''
-    fixed_tag  = f'_fixed_{args.fixed_param}{args.fixed_value}' if args.fixed_param else ''
+    noise_tag   = f'_noise{args.noise_scale:.3g}'.replace('.', 'p') if args.noise_scale > 0.0 else ''
+    cutoff_tag  = f'_cutoff{args.adc_cutoff:.3g}'.replace('.', 'p') if args.adc_cutoff > 0.0 else ''
+    fixed_tag   = f'_fixed_{args.fixed_param}{args.fixed_value}' if args.fixed_param else ''
     range_tag  = f'_range{args.range_frac:.3g}'.replace('.', 'p')
     name = (f'{loss_name}_N{args.N}{range_tag}_{args.param}'
-            f'_{tracks_tag}{noise_tag}{fixed_tag}.pkl')
+            f'_{tracks_tag}{noise_tag}{cutoff_tag}{fixed_tag}.pkl')
     return os.path.join(args.results_dir, name)
 
 
@@ -316,6 +327,7 @@ def main():
     print(f'Step size     : {args.step_size} mm  max deposits={args.max_deposits:,}')
     print(f'Noise scale   : {args.noise_scale}')
     print(f'Sobolev pad   : {args.sobolev_max_pad}')
+    print(f'ADC cutoff    : {args.adc_cutoff}')
     if args.fixed_param:
         print(f'Fixed param   : {args.fixed_param} = {args.fixed_value}')
     print(f'Output        : {output_path}')
@@ -393,7 +405,20 @@ def main():
             make_sobolev_weight(a.shape[0], a.shape[1], max_pad=args.sobolev_max_pad)
             for a in gt_arrays
         )
-        per_track_data.append((ts['name'], deposits, gt_arrays, weights))
+        masks = tuple(
+            jnp.ones(a.shape, dtype=bool) if args.adc_cutoff == 0.0
+            else (jnp.abs(a) >= args.adc_cutoff)
+            for a in gt_arrays
+        )
+        all_abs = jnp.concatenate([jnp.abs(a).ravel() for a in gt_arrays])
+        print(f'    Signal ADC: max={float(all_abs.max()):.3g}  '
+              f'mean={float(all_abs.mean()):.3g}')
+        if args.adc_cutoff > 0.0:
+            n_total_px  = sum(m.size for m in masks)
+            n_masked_px = sum(int(jnp.sum(~m)) for m in masks)
+            print(f'    ADC cutoff: {n_masked_px:,}/{n_total_px:,} pixels zeroed '
+                  f'({100*n_masked_px/n_total_px:.1f}%)')
+        per_track_data.append((ts['name'], deposits, gt_arrays, weights, masks))
 
     # ── Plane name list (U1, V1, Y1, U2, V2, Y2) ─────────────────────────────
     cfg = simulator.config
@@ -428,10 +453,10 @@ def main():
 
     print('\nCompiling value_and_grad (once for all tracks)...')
     t0 = time.time()
-    _, _dep0, _gt0, _wt0 = per_track_data[0]
-    _ = vag_fn(jnp.array(p_n_values[0]), _dep0, _gt0, _wt0)
+    _, _dep0, _gt0, _wt0, _msk0 = per_track_data[0]
+    _ = vag_fn(jnp.array(p_n_values[0]), _dep0, _gt0, _wt0, _msk0)
     jax.block_until_ready(_)
-    _ = vag_fn(jnp.array(p_n_values[0]), _dep0, _gt0, _wt0)
+    _ = vag_fn(jnp.array(p_n_values[0]), _dep0, _gt0, _wt0, _msk0)
     jax.block_until_ready(_)
     print(f'Done ({time.time() - t0:.1f} s)')
 
@@ -448,8 +473,8 @@ def main():
 
         total_loss = 0.0
         total_grad = 0.0
-        for tname, dep, gt_arrays, weights in per_track_data:
-            lv, gv = vag_fn(p_n_arr, dep, gt_arrays, weights)
+        for tname, dep, gt_arrays, weights, masks in per_track_data:
+            lv, gv = vag_fn(p_n_arr, dep, gt_arrays, weights, masks)
             jax.block_until_ready((lv, gv))
             lv, gv = float(lv), float(gv)
             per_track_loss[tname].append(lv)
@@ -493,6 +518,7 @@ def main():
         track_specs            = track_specs,
         noise_scale            = args.noise_scale,
         noise_seed             = args.noise_seed,
+        adc_cutoff             = args.adc_cutoff,
         sobolev_max_pad        = args.sobolev_max_pad,
         fixed_param            = args.fixed_param,
         fixed_value            = args.fixed_value,
