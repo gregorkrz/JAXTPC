@@ -366,6 +366,12 @@ class DetectorSimulator:
                         kernel.wire_spacing, kernel.num_wires)
                 return response_fn
 
+            # Map plane type → physical wire spacing (cm) for sigma unit conversion.
+            _plane_wire_spacings_cm = {
+                name: cfg.volumes[0].wire_spacings_cm[idx]
+                for idx, name in enumerate(cfg.plane_names[0])
+            }
+
             def _build_response_fn_diff(sim_params, plane_type):
                 """Diff response — recomputes DKernel from SimParams diffusion.
                 Conv filter sizes (ks_w, ks_t) are static from ResponseKernel."""
@@ -373,11 +379,14 @@ class DetectorSimulator:
                 max_drift_time = _global_max_drift / sim_params.velocity_cm_us
                 sigma_trans_max_cm = jnp.sqrt(
                     2.0 * sim_params.diffusion_trans_cm2_us * max_drift_time)
+                # generate_dkernel_table expects sigma in wire-pitch units (same as
+                # kernel_dx).  Divide by physical wire pitch to convert from cm.
+                sigma_trans_max_wp = sigma_trans_max_cm / _plane_wire_spacings_cm[plane_type]
                 sigma_long_max_us = jnp.sqrt(
                     2.0 * (sim_params.diffusion_long_cm2_us
                            / sim_params.velocity_cm_us**2) * max_drift_time)
                 dkernel = generate_dkernel_table(
-                    sigma_trans_max_cm, sigma_long_max_us,
+                    sigma_trans_max_wp, sigma_long_max_us,
                     kernel.base_kernel, kernel.kernel_dx, kernel.kernel_dy,
                     kernel.s_levels, ks_w=kernel.ks_w, ks_t=kernel.ks_t)
                 def response_fn(positions_cm, drift_distance_cm, wire_offsets, time_offsets):
