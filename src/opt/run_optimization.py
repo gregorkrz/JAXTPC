@@ -293,6 +293,9 @@ def parse_args():
     p.add_argument('--sobolev-loss-cutoff', type=float, default=0.0,
                    help='ADC cutoff: zero out pixels where |gt| < cutoff before computing loss '
                         '(default: 0.0, no cutoff). Applied to both sim and gt signals.')
+    p.add_argument('--start-position-mm', default='0,0,0',
+                   help='Track start position as "x,y,z" in mm, applied to all tracks '
+                        '(default: 0,0,0)')
     return p.parse_args()
 
 
@@ -1410,6 +1413,8 @@ def main():
     param_names = parse_params(args.params)
     track_specs = parse_tracks(args.tracks)
     range_lo, range_hi = getattr(args, 'range')
+    _spm = [float(v) for v in args.start_position_mm.split(',')]
+    track_start_mm = tuple(_spm)
     schedule    = parse_schedule(args)
 
     # ── Seeding ───────────────────────────────────────────────────────────────
@@ -1700,7 +1705,7 @@ def main():
 
         for ti, ts in enumerate(track_specs):
             track_ph = generate_muon_track(
-                start_position_mm=(0.0, 0.0, 0.0),
+                start_position_mm=track_start_mm,
                 direction=ts['direction'],
                 kinetic_energy_mev=ts['momentum_mev'],
                 step_size_mm=phase['step_size'],

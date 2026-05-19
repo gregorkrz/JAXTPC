@@ -53,6 +53,13 @@ Each pickle contains a dict with keys:
     track_specs, noise_scale, noise_seed,
     sobolev_max_pad,
     fixed_param, fixed_value
+
+With --store-arrays:
+    per_track_gt_arrays, per_track_sim_arrays
+
+With --store-per-pixel-loss-and-grad:
+    per_track_pixel_loss  -- (sim-gt)^2 arrays per sweep point, per track, per plane
+    per_track_pixel_grad  -- ∂loss/∂sim[w,t] arrays; same shape as sim arrays
 """
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -149,6 +156,9 @@ def parse_args():
                    help='Zero out pixels where |GT| < cutoff before loss (default: 0 = off)')
     p.add_argument('--store-arrays', action='store_true',
                    help='Store full 2D signal arrays (all planes) at each sweep point per track')
+    p.add_argument('--store-per-pixel-loss-and-grad', action='store_true',
+                   help='Store per-pixel (sim-gt)^2 loss and ∂loss/∂sim[w,t] sensitivity maps '
+                        'at each sweep point')
     p.add_argument('--output', default=None,
                    help='Explicit output pkl path (overrides auto-generated name)')
     p.add_argument('--results-dir', default=os.path.join(_RESULTS_DIR, '1d_gradients'),
@@ -284,6 +294,40 @@ def build_value_and_grad(loss_name, simulator, make_params, n_planes):
         raise ValueError(f'Unknown loss {loss_name!r}')
 
     return jax.jit(jax.value_and_grad(fn))
+
+
+def build_pixel_grad_fn(loss_name, n_planes):
+    """Return a JIT-compiled fn(sim_arrays, gt_arrays, weights, masks) -> grad_arrays.
+
+    Computes ∂loss/∂sim[w,t] for every pixel — how much the loss changes if that
+    simulated pixel is perturbed.  For MSE this is 2*(sim-gt)/norm; for Sobolev it
+    is the frequency-weighted residual back-transformed to pixel space.
+    Returns a tuple of arrays with the same shapes as sim_arrays.
+    """
+    planes = tuple(range(n_planes))
+
+    def _mask(arrays, masks):
+        return tuple(jnp.where(m, a, 0.0) for a, m in zip(arrays, masks))
+
+    if loss_name == 'sobolev_loss':
+        def fn(sim_arrays, gt_arrays, weights, masks):
+            return sobolev_loss(_mask(sim_arrays, masks), _mask(gt_arrays, masks), weights, planes)
+    elif loss_name == 'sobolev_loss_geomean_log1p':
+        def fn(sim_arrays, gt_arrays, weights, masks):
+            return sobolev_loss_geomean_log1p(_mask(sim_arrays, masks), _mask(gt_arrays, masks), weights, planes)
+    elif loss_name == 'mse_loss':
+        def fn(sim_arrays, gt_arrays, weights, masks):
+            sim = _mask(sim_arrays, masks)
+            gt  = _mask(gt_arrays, masks)
+            total = jnp.zeros(())
+            for pr, g in zip(sim, gt):
+                norm  = jnp.sum(jnp.abs(g)) + 1e-12
+                total = total + jnp.mean(((pr - g) / norm) ** 2)
+            return total
+    else:
+        raise ValueError(f'Unknown loss {loss_name!r}')
+
+    return jax.jit(jax.grad(fn))  # grad w.r.t. first arg (sim_arrays tuple)
 
 
 # ── Output path ────────────────────────────────────────────────────────────────
@@ -431,9 +475,13 @@ def main():
     if args.store_arrays:
         per_track_gt_arrays = {
             name: [np.array(a, dtype=np.float32) for a in gt_arrs]
-            for name, _, gt_arrs, _ in per_track_data
+            for name, _, gt_arrs, _, _m in per_track_data
         }
         per_track_sim_arrays = {name: [] for name, *_ in per_track_data}
+
+    if args.store_per_pixel_loss_and_grad:
+        per_track_pixel_loss = {name: [] for name, *_ in per_track_data}
+        per_track_pixel_grad = {name: [] for name, *_ in per_track_data}
 
     # ── Parameter grid ────────────────────────────────────────────────────────
     left_factors  = np.linspace(1.0 - args.range_frac, 1.0, args.N + 1)[:-1]
@@ -460,6 +508,17 @@ def main():
     jax.block_until_ready(_)
     print(f'Done ({time.time() - t0:.1f} s)')
 
+    if args.store_per_pixel_loss_and_grad:
+        pixel_grad_fn = build_pixel_grad_fn(loss_name, n_planes)
+        print('\nCompiling pixel_grad_fn...')
+        t0 = time.time()
+        _fwd0 = simulator.forward(_make_params(jnp.array(p_n_values[0])), _dep0)
+        _ = pixel_grad_fn(_fwd0, _gt0, _wt0, _msk0)
+        jax.block_until_ready(_)
+        _ = pixel_grad_fn(_fwd0, _gt0, _wt0, _msk0)
+        jax.block_until_ready(_)
+        print(f'Done ({time.time() - t0:.1f} s)')
+
     # ── Evaluate ──────────────────────────────────────────────────────────────
     per_track_loss  = {name: [] for name, *_ in per_track_data}
     per_track_grad  = {name: [] for name, *_ in per_track_data}
@@ -481,12 +540,24 @@ def main():
             per_track_grad[tname].append(gv)
             total_loss += lv
             total_grad += gv
-            if args.store_arrays:
+            need_fwd = args.store_arrays or args.store_per_pixel_loss_and_grad
+            if need_fwd:
                 fwd_out = simulator.forward(_make_params(p_n_arr), dep)
                 jax.block_until_ready(fwd_out)
-                per_track_sim_arrays[tname].append(
-                    [np.array(a, dtype=np.float32) for a in fwd_out]
-                )
+                if args.store_arrays:
+                    per_track_sim_arrays[tname].append(
+                        [np.array(a, dtype=np.float32) for a in fwd_out]
+                    )
+                if args.store_per_pixel_loss_and_grad:
+                    pg = pixel_grad_fn(fwd_out, gt_arrays, weights, masks)
+                    jax.block_until_ready(pg)
+                    per_track_pixel_grad[tname].append(
+                        [np.array(a, dtype=np.float32) for a in pg]
+                    )
+                    per_track_pixel_loss[tname].append(
+                        [np.array((np.array(s, dtype=np.float32) - np.array(g, dtype=np.float32))**2)
+                         for s, g in zip(fwd_out, gt_arrays)]
+                    )
 
         elapsed = time.time() - t0
         total_loss_vals.append(total_loss)
@@ -527,6 +598,10 @@ def main():
     if args.store_arrays:
         result['per_track_gt_arrays']  = per_track_gt_arrays
         result['per_track_sim_arrays'] = per_track_sim_arrays
+
+    if args.store_per_pixel_loss_and_grad:
+        result['per_track_pixel_loss'] = per_track_pixel_loss
+        result['per_track_pixel_grad'] = per_track_pixel_grad
 
     with open(output_path, 'wb') as f:
         pickle.dump(result, f)

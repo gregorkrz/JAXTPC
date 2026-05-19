@@ -19,5 +19,6 @@ aws s3 sync "$PLOTS_DIR/" "$BUCKET/plots/"
 echo "Syncing $RESULTS_DIR/ ..."
 aws s3 sync "$RESULTS_DIR/" "$BUCKET/results/"
 
-echo "Done. Files available at:"
-echo "  https://s3.console.aws.amazon.com/s3/buckets/gregor-research?prefix=JAXTPC/"
+echo "Syncing done"
+
+aws cloudfront create-invalidation --distribution-id E3SPQV5ITLTD1U --paths "/*"

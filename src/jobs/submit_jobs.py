@@ -359,6 +359,7 @@ def make_opt_command(
     init_from_wandb_run=None,
     init_from_wandb_step=None,
     sobolev_loss_cutoff=None,
+    start_position_mm=None,
 ):
     """Return a run_optimization.py command string with the given settings."""
     parts = [
@@ -433,6 +434,8 @@ def make_opt_command(
         parts.append(f"--init-from-wandb-step {init_from_wandb_step}")
     if sobolev_loss_cutoff is not None and sobolev_loss_cutoff > 0.0:
         parts.append(f"--sobolev-loss-cutoff {sobolev_loss_cutoff}")
+    if start_position_mm is not None:
+        parts.append(f"--start-position-mm {start_position_mm}")
     return " ".join(parts)
 
 
@@ -3420,10 +3423,10 @@ def profile_15Trk_Adam_NoiseCutoffDiffusion_3k(
 ):
     """Diffusion calibration with noisy GT and ADC cutoffs.
 
-    3 seeds × 3 param sets × 4 cutoffs = 36 jobs total.
+    Noisy GT (noise_scale=1.0): 3 seeds × 3 param sets × 4 cutoffs = 36 jobs.
+    Clean GT (noise_scale=0.0): 3 seeds × 3 param sets × 2 cutoffs (5, 20) = 18 jobs.
     Param sets: trans-diff only, long-diff only, both diffs.
-    Cutoffs: 5, 10, 15, 20 (ADC). Noise scale: 1.0.
-    Seeds are chained within each (param_set, cutoff) group.
+    Seeds are chained within each (param_set, cutoff, noise) group.
     """
     shared = dict(
         tracks=TRACKS_15_BOUNDARY,
@@ -3491,6 +3494,124 @@ def profile_15Trk_Adam_NoiseCutoffDiffusion_3k(
                     dependency=prev_job,
                 )
 
+    # Clean GT (no noise) — cutoffs 5 and 20 only
+    for cutoff in [5.0, 20.0]:
+        cutoff_tag = f"cutoff{int(cutoff)}"
+        for param_label, params in param_sets:
+            profile_tag = f"Adam_NoiseCutoffDiffusion_3k_{param_label}_{cutoff_tag}"
+            results_base = f"$RESULTS_DIR/opt/{profile_tag}"
+            prev_job = None
+            for seed in [43, 44, 45]:
+                if verbose or skip_complete:
+                    is_done = _seed_is_complete(results_base, "nonoise", seed, verbose=verbose)
+                    if is_done and skip_complete:
+                        print(f"  SKIP complete: {profile_tag}/nonoise seed={seed}")
+                        continue
+                    elif not is_done and verbose:
+                        print(f"  → will submit: {profile_tag}/nonoise seed={seed}")
+
+                command = make_opt_command(
+                    params=params,
+                    seed=seed,
+                    noise_scale=0.0,
+                    sobolev_loss_cutoff=cutoff,
+                    results_base=f"{results_base}/nonoise",
+                    wandb_tags=(wandb_tags or []) + [cutoff_tag, param_label, "nonoise"],
+                    **shared,
+                )
+                if not print_sbatch_only:
+                    print(command)
+                prev_job = s3df_submit(
+                    command,
+                    time="01:05:00",
+                    submit=submit,
+                    mem_gb=64,
+                    print_sbatch_command=print_sbatch_only,
+                    dependency=prev_job,
+                )
+
+
+def profile_15Trk_Adam_NoiseCutoffDiffusion_3k_LargeSpread(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+    skip_complete=False,
+    verbose=False,
+):
+    """Transverse diffusion calibration with ±75% initial spread, cutoff=20, diagonal track only.
+
+    Single diagonal track from (2000,2000,2000) along (-1,-1,-1)/√3 at 1000 MeV.
+    Noisy GT (noise_scale=1.0) only: 4 seeds × 1 cutoff = 4 jobs.
+    Only trans_only param set; seeds 100/101/102/103.
+    Seeds are chained.
+    """
+    _DIAG_TRACK = "Muon_diagBody_1000MeV:-0.577350269,-0.577350269,-0.577350269:1000"
+
+    shared = dict(
+        tracks=_DIAG_TRACK,
+        start_position_mm="2000,2000,2000",
+        optimizer="adam",
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.001,
+        lr_schedule="cosine",
+        max_steps=3000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.25,
+        range_hi=1.75,
+        grad_clip=0.0,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=1.0,
+        max_num_deposits=5000,
+        batch_size=1,
+        effective_batch_size=1,
+        gt_step_size=1.0,
+        gt_max_deposits=5000,
+        adam_beta2=0.9,
+        log_interval=50,
+    )
+
+    param_label = "trans_only"
+    params      = "diffusion_trans_cm2_us"
+    cutoff      = 20.0
+    cutoff_tag  = f"cutoff{int(cutoff)}"
+    profile_tag  = f"Adam_NoiseCutoffDiffusion_3k_LargeSpread_{param_label}_{cutoff_tag}"
+    results_base = f"$RESULTS_DIR/opt/{profile_tag}"
+
+    # Noisy GT — cutoff 20 only
+    prev_job = None
+    for seed in [100, 101, 102, 103]:
+        if verbose or skip_complete:
+            is_done = _seed_is_complete(results_base, "noise", seed, verbose=verbose)
+            if is_done and skip_complete:
+                print(f"  SKIP complete: {profile_tag} seed={seed}")
+                continue
+            elif not is_done and verbose:
+                print(f"  → will submit: {profile_tag} seed={seed}")
+
+        command = make_opt_command(
+            params=params,
+            seed=seed,
+            noise_scale=1.0,
+            sobolev_loss_cutoff=cutoff,
+            results_base=f"{results_base}/noise",
+            wandb_tags=(wandb_tags or []) + [cutoff_tag, param_label, "noise", "large_spread"],
+            **shared,
+        )
+        if not print_sbatch_only:
+            print(command)
+        prev_job = s3df_submit(
+            command,
+            time="01:05:00",
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+            dependency=prev_job,
+        )
+
 
 PROFILES = {
     "3_part_schedule": profile_3_part_schedule,
@@ -3551,6 +3672,7 @@ PROFILES = {
     "Adam_NoiseSeedSweep_3k_GT2_NoDiff": profile_15Trk_Adam_NoiseSeedSweep_3k_GT2_NoDiff,
     "Adam_NoiseSeedSweep_3k_NoDiffLifetime": profile_15Trk_Adam_NoiseSeedSweep_3k_NoDiffLifetime,
     "Adam_NoiseCutoffDiffusion_3k": profile_15Trk_Adam_NoiseCutoffDiffusion_3k,
+    "Adam_NoiseCutoffDiffusion_3k_LargeSpread": profile_15Trk_Adam_NoiseCutoffDiffusion_3k_LargeSpread,
     "Adam_NoiseSeedSweep_3k_GT2_NoDiffLifetime": profile_15Trk_Adam_NoiseSeedSweep_3k_GT2_NoDiffLifetime,
     "Adam_NoiseSeedSweep_3k_GT3_NoDiff": profile_15Trk_Adam_NoiseSeedSweep_3k_GT3_NoDiff,
     "Adam_NoiseSeedSweep_3k_GT3_NoDiffLifetime": profile_15Trk_Adam_NoiseSeedSweep_3k_GT3_NoDiffLifetime,
