@@ -12,6 +12,7 @@ If you run the sync_results_to_remote.sh script, the plots/<...> folders will be
 Add important insights about the repo that you learn here.
 
 Track ensemble: ``tools/random_boundary_tracks.py`` — ``generate_random_boundary_tracks`` builds N random x-face muons plus **three** fixed 1000 MeV chords that span East+West: ``Muon_diagCross_1000MeV``, ``Muon_throughEw_skew02_1000MeV``, ``Muon_throughWe_skew03_1000MeV`` (see that file for start/toward mm). Random-track energies are now balanced as evenly as possible across ``(1000, 500, 100)``; default ``N=12`` gives exactly ``4`` tracks at each energy, so total default tracks remain ``15`` with the 3 fixed chords. ``launch_2d_landscape_pairs.py`` uses the same list and passes ``--start-position-mm`` into ``2d_loss_landscape.py``. In ``plot_mixed_tracks_edep_wireplanes.py``, out-of-volume steps are dropped before ``build_deposit_data``; Plotly ``Scatter3d`` uses ``marker.line.width=0`` to reduce white halos.
+`tests/test_optimization_run.py` uses stubbed `jax/optax/tools.*` modules to import `src/opt/run_optimization.py`; when optimizer/run-trial signatures evolve, keep the stubs and compatibility branches in sync (notably `optax.chain`, `jax.tree_util.tree_map`, and the `phase_schedule`-based `run_trial` path).
 
 
 ## Syncing results to S3

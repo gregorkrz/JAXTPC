@@ -5,6 +5,8 @@ This module defines all NamedTuple parameter bundles used throughout
 the simulation code for clean parameter passing and type hints.
 """
 
+from __future__ import annotations
+
 from typing import NamedTuple, Any
 from pathlib import Path
 import numpy as np

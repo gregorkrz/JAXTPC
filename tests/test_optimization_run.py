@@ -15,17 +15,33 @@ def _install_import_stubs() -> None:
 
     jax = types.ModuleType("jax")
     jax.config = types.SimpleNamespace(update=lambda *args, **kwargs: None)
-    jax.jit = lambda fn: fn
+    def _tree_map(fn, tree):
+        if isinstance(tree, dict):
+            return {k: _tree_map(fn, v) for k, v in tree.items()}
+        if isinstance(tree, list):
+            return [_tree_map(fn, v) for v in tree]
+        if isinstance(tree, tuple):
+            return tuple(_tree_map(fn, v) for v in tree)
+        return fn(tree)
+    jax.tree_util = types.SimpleNamespace(tree_map=_tree_map)
+    def _jit(fn=None, *args, **kwargs):
+        if fn is None:
+            return lambda wrapped: wrapped
+        return fn
+
+    jax.jit = _jit
     jax.block_until_ready = lambda value: value
     jax.devices = lambda: ["cpu-stub"]
 
     jax_numpy = types.ModuleType("jax.numpy")
     jax_numpy.array = lambda value, dtype=None: np.array(value, dtype=dtype)
+    jax_numpy.asarray = lambda value, dtype=None: np.asarray(value, dtype=dtype)
     jax_numpy.sum = lambda value: np.sum(value)
     jax_numpy.mean = lambda value: np.mean(value)
     jax_numpy.zeros = lambda shape=(), dtype=float: np.zeros(shape, dtype=dtype)
     jax_numpy.zeros_like = lambda value: np.zeros_like(value)
     jax_numpy.float32 = np.float32
+    jax_numpy.ndarray = np.ndarray
 
     class _SimpleOptState(dict):
         pass
@@ -64,6 +80,9 @@ def _install_import_stubs() -> None:
     optax.sgd = lambda lr, momentum=0.0: _SimpleOptimizer(lr, momentum=momentum)
     optax.adam = lambda lr: _SimpleOptimizer(lr, momentum=0.0)
     optax.cosine_decay_schedule = _cosine_decay_schedule
+    optax.constant_schedule = lambda value: (lambda _step: value)
+    optax.chain = lambda *transforms: transforms[-1]
+    optax.clip_by_global_norm = lambda _norm: _SimpleOptimizer(0.0)
     optax.apply_updates = lambda params, updates: np.array(params) + np.array(updates)
 
     geometry = types.ModuleType("tools.geometry")
@@ -71,6 +90,8 @@ def _install_import_stubs() -> None:
 
     loader = types.ModuleType("tools.loader")
     loader.build_deposit_data = lambda *args, **kwargs: None
+    loader.load_particle_step_data = lambda *args, **kwargs: None
+    loader.load_event = lambda *args, **kwargs: None
 
     losses = types.ModuleType("tools.losses")
     losses.make_sobolev_weight = lambda *args, **kwargs: None
@@ -81,12 +102,26 @@ def _install_import_stubs() -> None:
 
     particle_generator = types.ModuleType("tools.particle_generator")
     particle_generator.generate_muon_track = lambda *args, **kwargs: None
+    particle_generator.generate_muon_segments = lambda *args, **kwargs: None
+    particle_generator.generate_muon_segments_trig = lambda *args, **kwargs: None
+    particle_generator.load_dedx_table_jax = lambda *args, **kwargs: None
+    particle_generator.mask_outside_volume = lambda *args, **kwargs: None
 
     noise = types.ModuleType("tools.noise")
     noise.generate_noise = lambda *args, **kwargs: None
+    noise.add_noise = lambda *args, **kwargs: None
+    noise.generate_noise_bucketed = lambda *args, **kwargs: None
 
     simulation = types.ModuleType("tools.simulation")
     simulation.DetectorSimulator = object
+
+    recombination = types.ModuleType("tools.recombination")
+    recombination.RECOMB_MODELS = {}
+    recombination.compute_quanta = lambda *args, **kwargs: None
+    recombination.XI_FN = {}
+
+    wires = types.ModuleType("tools.wires")
+    wires.sparse_buckets_to_dense = lambda *args, **kwargs: None
 
     sys.modules["dotenv"] = dotenv
     sys.modules["jax"] = jax
@@ -98,6 +133,8 @@ def _install_import_stubs() -> None:
     sys.modules["tools.noise"] = noise
     sys.modules["tools.particle_generator"] = particle_generator
     sys.modules["tools.simulation"] = simulation
+    sys.modules["tools.recombination"] = recombination
+    sys.modules["tools.wires"] = wires
 
 
 def _resolve_opt_module_path() -> pathlib.Path:
@@ -139,6 +176,17 @@ def _parse_params_for_test(valid_input: str):
 
 
 class TestOptimizationHelpers(unittest.TestCase):
+    @staticmethod
+    def _optimizer_and_schedule(lr, max_steps):
+        built = OPT_MODULE.make_optax_optimizer("sgd", lr, "constant", max_steps)
+        if isinstance(built, tuple) and len(built) == 2:
+            return built
+        return built, None
+
+    @staticmethod
+    def _single_phase_schedule(max_steps, val_and_grad_fn):
+        return [(max_steps, lambda _p: [lambda p: val_and_grad_fn(p)])]
+
     def test_parse_params_valid(self):
         parsed = _parse_params_for_test(
             "velocity_cm_us+lifetime_us,recomb_alpha+recomb_beta_90"
@@ -189,9 +237,19 @@ class TestOptimizationHelpers(unittest.TestCase):
             grad = 2.0 * (p - 1.0)
             return loss, grad
 
-        optimizer = OPT_MODULE.make_optax_optimizer("sgd", 0.2, "constant", 30)
+        optimizer, schedule_fn = self._optimizer_and_schedule(0.2, 30)
         run_trial_params = inspect.signature(OPT_MODULE.run_trial).parameters
-        if "p0_pn_vec" in run_trial_params:
+        if "phase_schedule" in run_trial_params:
+            trial = OPT_MODULE.run_trial(
+                p0=[2.0, -1.0],
+                phase_schedule=self._single_phase_schedule(10, val_and_grad_fn),
+                optimizer=optimizer,
+                max_steps=10,
+                tol=1e-12,
+                patience=20,
+                schedule_fn=schedule_fn,
+            )
+        elif "p0_pn_vec" in run_trial_params:
             trial = OPT_MODULE.run_trial(
                 p0_pn_vec=[2.0, -1.0],
                 val_and_grad_fn=val_and_grad_fn,
@@ -219,9 +277,19 @@ class TestOptimizationHelpers(unittest.TestCase):
         def val_and_grad_fn(p):
             return 0.0, np.zeros_like(p)
 
-        optimizer = OPT_MODULE.make_optax_optimizer("sgd", 0.1, "constant", 30)
+        optimizer, schedule_fn = self._optimizer_and_schedule(0.1, 30)
         run_trial_params = inspect.signature(OPT_MODULE.run_trial).parameters
-        if "p0_pn_vec" in run_trial_params:
+        if "phase_schedule" in run_trial_params:
+            trial = OPT_MODULE.run_trial(
+                p0=[1.0, 1.0],
+                phase_schedule=self._single_phase_schedule(20, val_and_grad_fn),
+                optimizer=optimizer,
+                max_steps=20,
+                tol=1e-8,
+                patience=1,
+                schedule_fn=schedule_fn,
+            )
+        elif "p0_pn_vec" in run_trial_params:
             trial = OPT_MODULE.run_trial(
                 p0_pn_vec=[1.0, 1.0],
                 val_and_grad_fn=val_and_grad_fn,
