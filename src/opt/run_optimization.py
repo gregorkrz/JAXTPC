@@ -163,6 +163,13 @@ ADAM_BETA2 = 0.999
 ADAM_EPS   = 1e-8
 MOMENTUM   = 0.9
 
+# Plane name → global plane indices (0=U1, 1=V1, 2=Y1, 3=U2, 4=V2, 5=Y2)
+PLANE_NAME_MAP = {
+    'U1': (0,), 'V1': (1,), 'Y1': (2,),
+    'U2': (3,), 'V2': (4,), 'Y2': (5,),
+    'U':  (0, 3), 'V': (1, 4), 'Y': (2, 5),
+}
+
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 def parse_args():
@@ -296,6 +303,11 @@ def parse_args():
     p.add_argument('--start-position-mm', default='0,0,0',
                    help='Track start position as "x,y,z" in mm, applied to all tracks '
                         '(default: 0,0,0)')
+    p.add_argument('--planes', default=None,
+                   help='Comma-separated plane names or indices to include in the loss '
+                        '(default: all planes). Names: U1,V1,Y1 (vol 0) / U2,V2,Y2 (vol 1); '
+                        'U,V,Y selects both volumes. Integer indices 0-5 also accepted. '
+                        'Example: --planes V1,V2')
     return p.parse_args()
 
 
@@ -357,11 +369,41 @@ def parse_tracks(tracks_str):
     return specs
 
 
+def parse_planes(planes_str, n_planes=6):
+    """Parse comma-separated plane names/indices into a sorted tuple of global plane indices.
+
+    Names: U1,V1,Y1 (volume 0) / U2,V2,Y2 (volume 1); U,V,Y expand to both volumes.
+    Integer indices 0-5 are also accepted.  None/empty string → all planes.
+    """
+    if not planes_str:
+        return tuple(range(n_planes))
+    indices: set = set()
+    for tok in planes_str.split(','):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if tok in PLANE_NAME_MAP:
+            indices.update(PLANE_NAME_MAP[tok])
+        elif tok.lstrip('-').isdigit():
+            idx = int(tok)
+            if not (0 <= idx < n_planes):
+                raise ValueError(f'Plane index {idx} out of range (0-{n_planes - 1})')
+            indices.add(idx)
+        else:
+            raise ValueError(
+                f'Unknown plane {tok!r}. Known names: {sorted(PLANE_NAME_MAP)}, '
+                f'or use integer indices 0-{n_planes - 1}.')
+    if not indices:
+        raise ValueError('--planes produced no entries')
+    return tuple(sorted(indices))
+
+
 # ── Folder name ────────────────────────────────────────────────────────────────
 
 def make_folder_name(param_names, track_specs, loss_name, optimizer, lr,
                      lr_schedule, max_steps, N, range_lo, range_hi,
-                     noise_scale=0.0, step_size=0.1, max_num_deposits=50_000, n_phases=1):
+                     noise_scale=0.0, step_size=0.1, max_num_deposits=50_000, n_phases=1,
+                     active_planes=None):
     _is_all = (_BASE_PARAMS <= frozenset(param_names) and
                bool(frozenset(param_names) & _BETA_VARIANTS))
     params_tag = 'all_params' if _is_all else '+'.join(param_names)
@@ -373,9 +415,12 @@ def make_folder_name(param_names, track_specs, loss_name, optimizer, lr,
     ss_tag        = f'_ss{step_size:.3g}'.replace('.', 'p') if step_size != 0.1 else ''
     dep_tag       = f'_dep{max_num_deposits // 1000}k' if max_num_deposits != 50_000 else ''
     phase_tag     = f'_sched{n_phases}' if n_phases > 1 else ''
+    _all_planes   = tuple(range(6))
+    planes_tag    = (f'_planes{"".join(str(p) for p in active_planes)}'
+                     if active_planes is not None and tuple(active_planes) != _all_planes else '')
     return (f'{params_tag}__{tracks_tag}__{loss_name}__'
             f'{optimizer}_lr{lr}{sched_tag}_s{max_steps}_N{N}_{range_tag}'
-            f'{noise_tag}{ss_tag}{dep_tag}{phase_tag}')
+            f'{noise_tag}{ss_tag}{dep_tag}{phase_tag}{planes_tag}')
 
 
 def next_result_path(folder, seed=None):
@@ -465,9 +510,9 @@ def _apply_adc_mask(pred_tuple, gt_tuple, cutoff):
     return tuple(masked_pred), tuple(masked_gt)
 
 
-def build_loss_fn(loss_name, fwd_fn, gt_arrays, weights, adc_cutoff=0.0):
+def build_loss_fn(loss_name, fwd_fn, gt_arrays, weights, adc_cutoff=0.0, active_planes=None):
     """Return sJIT-compiled (loss, grad) function for a single track."""
-    planes = tuple(range(len(gt_arrays)))
+    planes = active_planes if active_planes is not None else tuple(range(len(gt_arrays)))
     if loss_name == 'sobolev_loss':
         def fn(p_n_vec):
             pred, gt = _apply_adc_mask(fwd_fn(p_n_vec), gt_arrays, adc_cutoff)
@@ -490,7 +535,7 @@ def build_loss_fn(loss_name, fwd_fn, gt_arrays, weights, adc_cutoff=0.0):
 
 
 def build_phase_fns(loss_name, simulator, setter, batches, *, return_per_track_loss=False,
-                    return_hessian=False, adc_cutoff=0.0):
+                    return_hessian=False, adc_cutoff=0.0, active_planes=None):
     """Return one callable per batch in a phase.
 
     Default ``fn(p) -> (loss, grad)``. When ``return_per_track_loss=True``,
@@ -504,6 +549,8 @@ def build_phase_fns(loss_name, simulator, setter, batches, *, return_per_track_l
     the deposit/gt/wt arrays differ between calls, so JAX compiles once per
     unique batch size rather than once per batch.
 
+    active_planes: tuple of global plane indices to include in the loss, or None for all.
+
     batches: list of (batch_deposits, batch_gts, batch_wts)
     """
     if return_hessian and return_per_track_loss:
@@ -512,7 +559,7 @@ def build_phase_fns(loss_name, simulator, setter, batches, *, return_per_track_l
     n_volumes = cfg.n_volumes
     n_planes_per_vol = cfg.volumes[0].n_planes
     n_planes = n_volumes * n_planes_per_vol
-    planes = tuple(range(n_planes))
+    planes = active_planes if active_planes is not None else tuple(range(n_planes))
     _batched_diff = jax.vmap(simulator._forward_diff, in_axes=(None, 0))
 
     # Pre-pad and stack deposits per batch as numpy arrays (host memory).
@@ -1417,7 +1464,8 @@ def main():
     range_lo, range_hi = getattr(args, 'range')
     _spm = [float(v) for v in args.start_position_mm.split(',')]
     track_start_mm = tuple(_spm)
-    schedule    = parse_schedule(args)
+    schedule     = parse_schedule(args)
+    active_planes = parse_planes(args.planes) if args.planes else None
 
     # ── Seeding ───────────────────────────────────────────────────────────────
     # SeedSequence(None) draws entropy from the OS; spawn gives independent
@@ -1435,6 +1483,7 @@ def main():
         step_size=schedule[-1]['step_size'],
         max_num_deposits=schedule[-1]['max_num_deposits'],
         n_phases=len(schedule),
+        active_planes=active_planes,
     )
     output_dir  = os.path.join(args.results_base, folder_name)
     output_path = next_result_path(output_dir, seed=effective_seed)
@@ -1507,6 +1556,8 @@ def main():
     print(f'Noise scale  : {args.noise_scale}')
     if args.sobolev_loss_cutoff > 0.0:
         print(f'ADC cutoff   : {args.sobolev_loss_cutoff}')
+    if active_planes is not None:
+        print(f'Active planes: {active_planes} (of 6 total)')
     print(f'Num buckets  : {args.num_buckets:,}')
     print(f'Eff batch    : {args.effective_batch_size}')
     print(f'GT step size : {args.gt_step_size} mm  max deposits={args.gt_max_deposits:,}')
@@ -1765,7 +1816,8 @@ def main():
                         args.loss, sim_ph, setter, batches,
                         return_per_track_loss=log_track_losses_wandb,
                         return_hessian=is_newton,
-                        adc_cutoff=args.sobolev_loss_cutoff)
+                        adc_cutoff=args.sobolev_loss_cutoff,
+                        active_planes=active_planes)
                     for fn in fns:
                         out = fn(p)
                         jax.block_until_ready(out)
@@ -1923,6 +1975,7 @@ def main():
         patience_per_param  = args.patience_per_param,
         N                   = args.N,
         loss_name           = args.loss,
+        active_planes       = active_planes,
         tracks              = track_specs,
         range_lo            = range_lo,
         range_hi            = range_hi,

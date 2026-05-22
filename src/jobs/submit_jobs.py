@@ -3810,7 +3810,7 @@ def profile_Adam_NoiseCutoff25_DebugTracks_3k(
     ]
 
     for param_label, params in param_sets:
-        profile_tag  = f"Adam_NoiseCutoff25_DebugTracks_{param_label}"
+        profile_tag  = f"Adam_NoiseCutoff25_DebugTracks_{param_label}_indepnoise"
         results_base = f"$RESULTS_DIR/opt/{profile_tag}"
 
         prev_job = None
