@@ -1322,7 +1322,7 @@ def _wandb_log_step(step, loss, gv, p, param_names, scales, p_n_gts,
 
 # ── Noise ─────────────────────────────────────────────────────────────────────
 
-def apply_noise_to_gt(gt_arrays, simulator, noise_scale, noise_seed):
+def apply_noise_to_gt(gt_arrays, simulator, noise_scale, noise_key):
     """Add calibrated detector noise to GT arrays once before optimization.
 
     Uses generate_noise() (MicroBooNE model: series + white components) and
@@ -1330,9 +1330,11 @@ def apply_noise_to_gt(gt_arrays, simulator, noise_scale, noise_seed):
     noise_scale=1.0 gives the realistic detector noise amplitude.
     The same draw is used for all trials so they all optimise against the
     same fixed noisy target.
+    noise_key : jax.Array  — PRNGKey (pass a per-track key so each track,
+    living in a separate event, gets an independent noise realisation).
     """
     cfg = simulator.config
-    noise_dict   = generate_noise(cfg, key=jax.random.PRNGKey(noise_seed))
+    noise_dict   = generate_noise(cfg, key=noise_key)
     n_readouts = cfg.volumes[0].n_planes if simulator._readout_type == 'wire' else 1
     noisy = []
     for v in range(cfg.n_volumes):
@@ -1635,7 +1637,8 @@ def main():
     sig_rms_acc = []
     noi_rms_acc = []
 
-    for ts in track_specs:
+    noise_base_key = jax.random.PRNGKey(noise_seed)
+    for track_idx, ts in enumerate(track_specs):
         print(f'  track {ts["name"]}  dir={ts["direction"]}  T={ts["momentum_mev"]} MeV')
         track_gt = generate_muon_track(
             start_position_mm=(0.0, 0.0, 0.0),
@@ -1656,7 +1659,8 @@ def main():
         jax.block_until_ready(gt)
 
         if args.noise_scale > 0.0:
-            gt_noisy = apply_noise_to_gt(gt, gt_sim, args.noise_scale, noise_seed)
+            track_noise_key = jax.random.fold_in(noise_base_key, track_idx)
+            gt_noisy = apply_noise_to_gt(gt, gt_sim, args.noise_scale, track_noise_key)
             sig_rms_acc.append(float(np.mean([float(jnp.std(a)) for a in gt])))
             noi_rms_acc.append(float(np.mean([float(jnp.std(n - c))
                                                for n, c in zip(gt_noisy, gt)])))

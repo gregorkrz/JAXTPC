@@ -1,0 +1,896 @@
+#!/usr/bin/env python
+"""
+Generate a self-contained interactive HTML viewer for 1d_gradients pkl files.
+
+Loads all pkl files from a directory (produced by 1d_gradients.py with or
+without --store-per-plane-loss), groups them by
+(param_name, noise_scale, noise_seed, adc_cutoff), then writes a single HTML
+file with Plotly.js that lets you:
+
+  • Filter by parameter, noise on/off, noise seed, ADC cutoff
+  • Select which tracks to include (losses summed across selected tracks)
+  • Select which wire planes to include (summed; only when per-plane loss
+    is present, i.e. --store-per-plane-loss was used)
+  • Add the current selection as a named curve
+  • Overlay any number of curves on one canvas
+  • Toggle between Loss / |Gradient| / Signed gradient
+  • Toggle Factor (p/GT) or Param value on the x-axis
+  • Toggle log / linear y-scale
+
+Works with both single-track-per-pkl files (older sweeps) and
+multi-track-per-pkl files (15trk sweep with +). In the single-track case,
+runs with the same (param, noise, seed, cutoff) are merged automatically.
+
+Usage
+-----
+    python src/plots/plot_gradient_landscape_viewer.py
+
+    python src/plots/plot_gradient_landscape_viewer.py \\
+        --results-dir results/1d_gradients/sobolev_cutoff_15trk_all_planes \\
+        --output plots/sobolev_cutoff_15trk_all_planes/landscape_viewer.html
+"""
+
+from dotenv import load_dotenv
+load_dotenv()
+
+import argparse
+import glob
+import json
+import os
+import pickle
+from collections import defaultdict
+
+import numpy as np
+
+# ── constants ──────────────────────────────────────────────────────────────────
+
+PARAM_LABELS = {
+    'diffusion_trans_cm2_us': 'D⊥ (cm²/μs)',
+    'diffusion_long_cm2_us':  'D∥ (cm²/μs)',
+    'velocity_cm_us':         'v (cm/μs)',
+    'lifetime_us':            'τ (μs)',
+    'recomb_alpha':           'α',
+    'recomb_beta_90':         'β₉₀',
+    'recomb_R':               'R',
+}
+
+_RESULTS_DIR = os.environ.get('RESULTS_DIR', 'results')
+_PLOTS_DIR   = os.environ.get('PLOTS_DIR',   'plots')
+
+DEFAULT_RESULTS = os.path.join(
+    _RESULTS_DIR, '1d_gradients', 'sobolev_cutoff_15trk_all_planes'
+)
+
+
+# ── data loading ──────────────────────────────────────────────────────────────
+
+class _NpEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):  return int(obj)
+        if isinstance(obj, np.floating): return float(obj)
+        if isinstance(obj, np.ndarray):  return obj.tolist()
+        return super().default(obj)
+
+
+def _round(vals, ndigits=6):
+    return [round(float(v), ndigits) for v in vals]
+
+
+def load_and_group(results_dir: str) -> dict:
+    """Load all pkls, merge tracks by (param, noise, seed, cutoff), return data dict."""
+    paths = sorted(glob.glob(os.path.join(results_dir, '*.pkl')))
+    if not paths:
+        raise FileNotFoundError(f'No .pkl files in {results_dir!r}')
+
+    # key → merged group dict
+    groups: dict = {}
+
+    for path in paths:
+        fname = os.path.basename(path)
+        with open(path, 'rb') as f:
+            r = pickle.load(f)
+
+        param_name  = r.get('param_name', 'unknown')
+        noise_scale = float(r.get('noise_scale', 0.0))
+        noise_seed  = int(r.get('noise_seed', 42))
+        adc_cutoff  = float(r.get('adc_cutoff', 0.0))
+        key         = (param_name, noise_scale, noise_seed, adc_cutoff)
+
+        track_specs  = r.get('track_specs', [])
+        track_names  = [ts['name'] for ts in track_specs]
+        plane_names  = r.get('plane_names', [])
+        per_tl       = r.get('per_track_loss_values', {})
+        per_tg       = r.get('per_track_grad_values', {})
+        per_pl       = r.get('per_plane_loss_values', None)
+
+        if key not in groups:
+            groups[key] = {
+                'param_name':   param_name,
+                'param_label':  PARAM_LABELS.get(param_name, param_name),
+                'param_gt':     float(r.get('param_gt', 0.0)),
+                'param_values': _round(r.get('param_values', [])),
+                'factors':      _round(r.get('factors', [])),
+                'noise_scale':  noise_scale,
+                'noise_seed':   noise_seed,
+                'adc_cutoff':   adc_cutoff,
+                'loss_name':    r.get('loss_name', ''),
+                'track_names':  [],
+                'per_track_loss': {},
+                'per_track_grad': {},
+                'per_plane_loss': {},
+                'plane_names':  plane_names,
+                '_has_plane':   False,
+            }
+
+        grp = groups[key]
+
+        for tname in track_names:
+            if tname not in grp['track_names']:
+                grp['track_names'].append(tname)
+            if tname in per_tl:
+                grp['per_track_loss'][tname] = _round(per_tl[tname])
+            if tname in per_tg:
+                grp['per_track_grad'][tname] = _round(per_tg[tname])
+            if per_pl and tname in per_pl:
+                grp['_has_plane'] = True
+                if tname not in grp['per_plane_loss']:
+                    grp['per_plane_loss'][tname] = {}
+                for pname, vals in per_pl[tname].items():
+                    grp['per_plane_loss'][tname][pname] = _round(vals)
+
+        print(f'  {fname}: param={param_name}  noise={noise_scale:.3g}'
+              f'  seed={noise_seed}  cutoff={adc_cutoff:.3g}'
+              f'  tracks={len(track_names)}  per_plane={per_pl is not None}')
+
+    print(f'Loaded {len(paths)} file(s) → {len(groups)} group(s)')
+
+    runs = []
+    for grp in groups.values():
+        has_plane = grp.pop('_has_plane')
+        if not has_plane:
+            grp['per_plane_loss'] = None
+        runs.append(grp)
+
+    runs.sort(key=lambda r: (r['param_name'], r['noise_scale'], r['noise_seed'], r['adc_cutoff']))
+
+    # Aggregate metadata for the JS side
+    all_tracks     = sorted({t for r in runs for t in r['track_names']})
+    all_planes     = sorted({p
+                             for r in runs if r['per_plane_loss']
+                             for tdata in r['per_plane_loss'].values()
+                             for p in tdata})
+    params         = sorted({r['param_name'] for r in runs})
+    noise_options  = sorted({r['noise_scale'] for r in runs})
+    seed_options   = sorted({r['noise_seed']  for r in runs if r['noise_scale'] > 0})
+    cutoff_options = sorted({r['adc_cutoff']  for r in runs})
+    has_per_plane  = bool(all_planes)
+
+    return {
+        'runs':           runs,
+        'params':         params,
+        'all_tracks':     all_tracks,
+        'all_planes':     all_planes,
+        'has_per_plane':  has_per_plane,
+        'noise_options':  noise_options,
+        'seed_options':   seed_options,
+        'cutoff_options': cutoff_options,
+    }
+
+
+# ── HTML template ──────────────────────────────────────────────────────────────
+
+_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Gradient Landscape Viewer</title>
+<script src="https://cdn.plot.ly/plotly-2.26.0.min.js" charset="utf-8"></script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f0f2f5;color:#222;font-size:13px}
+#app{display:flex;height:100vh;overflow:hidden}
+/* ── left panel ── */
+#left{width:310px;min-width:270px;background:#fff;border-right:1px solid #ddd;overflow-y:auto;display:flex;flex-direction:column;flex-shrink:0}
+.sec{padding:10px 12px;border-bottom:1px solid #eee}
+.sec h3{font-size:11px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px}
+select{width:100%;padding:5px 7px;border:1px solid #ccc;border-radius:4px;font-size:13px;background:#fff;margin-bottom:5px}
+.tab-bar{display:flex;gap:3px;margin-bottom:6px}
+.tab{flex:1;padding:5px 4px;border:1px solid #ccc;border-radius:4px;background:#f5f5f5;cursor:pointer;text-align:center;font-size:12px;font-weight:500;white-space:nowrap}
+.tab.active{background:#1565C0;color:#fff;border-color:#0d47a1}
+.tab:disabled{opacity:.4;cursor:default}
+
+label.ck{display:flex;align-items:center;gap:6px;padding:2px 0;cursor:pointer;user-select:none}
+label.ck:hover{color:#1565C0}
+label.ck input{cursor:pointer;accent-color:#1565C0}
+button{padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:13px;font-weight:500}
+.btn-add{background:#1565C0;color:#fff;width:100%;padding:9px;margin-top:2px;font-size:14px}
+.btn-add:hover{background:#0d47a1}
+.btn-sm{padding:3px 8px;font-size:11px;border:1px solid #ccc}
+.btn-del{background:#e53935;color:#fff;border:none}
+.btn-del:hover{background:#c62828}
+.btn-clear{background:#9e9e9e;color:#fff;border:none;padding:4px 10px;font-size:12px}
+.quick-btn{background:#e8f5e9;color:#2e7d32;border:1px solid #a5d6a7}
+.quick-btn:hover{background:#c8e6c9}
+.quick-btn.none{background:#fce4ec;color:#c62828;border:1px solid #f48fb1}
+.quick-btn.none:hover{background:#f8bbd0}
+.quick-row{display:flex;gap:4px;margin-bottom:5px}
+.scrollable{max-height:190px;overflow-y:auto;padding-right:2px}
+#series-list{flex:1;overflow-y:auto;min-height:60px}
+.s-item{display:flex;align-items:center;gap:7px;padding:5px 12px;border-bottom:1px solid #f5f5f5;font-size:12px}
+.s-item:hover{background:#f5f5f5}
+.swatch{width:13px;height:13px;border-radius:3px;flex-shrink:0}
+.s-lbl{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:default}
+.warn{color:#e65100;font-size:11px;margin-top:3px;padding:3px 6px;background:#fff3e0;border-radius:3px;display:none}
+#seed-row{display:none}
+/* ── right panel ── */
+#right{flex:1;display:flex;flex-direction:column;overflow:hidden}
+#right-tab-bar{display:flex;gap:0;background:#fff;border-bottom:1px solid #ddd;flex-shrink:0}
+.rtab{padding:8px 18px;border:none;border-bottom:3px solid transparent;background:none;cursor:pointer;font-size:13px;font-weight:500;color:#666;border-radius:0}
+.rtab:hover{color:#1565C0;background:#f5f8ff}
+.rtab.active{color:#1565C0;border-bottom-color:#1565C0;background:#fff}
+#plot-bar{display:flex;align-items:center;gap:10px;padding:7px 12px;background:#fafafa;border-bottom:1px solid #ddd;flex-wrap:wrap;flex-shrink:0}
+#plot-bar .bar-lbl{font-size:12px;color:#666;white-space:nowrap}
+#plot-bar .tab-bar{margin:0}
+#plots-row{flex:1;display:flex;min-height:0;gap:0}
+.plot-col{flex:1;display:flex;flex-direction:column;min-width:0;border-right:1px solid #e0e0e0}
+.plot-col:last-child{border-right:none}
+.col-header{padding:5px 12px;font-size:11px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:.5px;background:#fafafa;border-bottom:1px solid #eee;flex-shrink:0}
+.plot-div{flex:1;min-height:0}
+/* ── min-factor table ── */
+#table-view{background:#fff}
+.min-tbl{border-collapse:collapse;font-size:12px;white-space:nowrap}
+.min-tbl th{padding:7px 12px;background:#f5f5f5;border:1px solid #ddd;font-weight:600;text-align:center;position:sticky;top:0;z-index:1}
+.min-tbl th.trk-hdr{text-align:left}
+.min-tbl td{padding:6px 12px;border:1px solid #ddd;text-align:center;font-family:monospace;font-size:12px}
+.min-tbl td.trk-lbl{text-align:left;font-family:inherit;font-weight:500;background:#fafafa}
+</style>
+</head>
+<body>
+<div id="app">
+
+<!-- ══ Left panel ══════════════════════════════════════════════════════════ -->
+<div id="left">
+
+  <div class="sec">
+    <h3>Filters</h3>
+
+    <div style="font-size:11px;color:#888;margin-bottom:2px">Parameter</div>
+    <select id="sel-param"></select>
+
+    <div style="font-size:11px;color:#888;margin-bottom:2px">Noise</div>
+    <select id="sel-noise-seed"></select>
+
+    <div style="font-size:11px;color:#888;margin-bottom:2px">ADC cutoff</div>
+    <select id="sel-cutoff"></select>
+
+    <div id="no-run-warn" class="warn">⚠ No data matches this filter combination.</div>
+  </div>
+
+  <div class="sec">
+    <h3>Tracks</h3>
+    <div class="quick-row">
+      <button class="btn-sm quick-btn"      onclick="selAll('track')">All</button>
+      <button class="btn-sm quick-btn none" onclick="selNone('track')">None</button>
+    </div>
+    <div id="track-checks" class="scrollable"></div>
+  </div>
+
+  <div class="sec" id="plane-sec" style="display:none">
+    <h3>Wire planes <span style="font-weight:400;color:#aaa">(loss only)</span></h3>
+    <div class="quick-row">
+      <button class="btn-sm quick-btn"      onclick="selAll('plane')">All</button>
+      <button class="btn-sm quick-btn none" onclick="selNone('plane')">None</button>
+    </div>
+    <div id="plane-checks" class="scrollable"></div>
+  </div>
+
+  <div class="sec">
+    <button class="btn-add" onclick="addSeries()">＋ Add to plot</button>
+  </div>
+
+  <div class="sec" style="display:flex;justify-content:space-between;align-items:center;padding-bottom:6px">
+    <h3 style="margin:0">Series on canvas</h3>
+    <button class="btn-clear" onclick="clearAll()">Clear all</button>
+  </div>
+  <div id="series-list">
+    <p style="color:#bbb;font-size:12px;padding:8px 12px" id="s-empty">No series yet.</p>
+  </div>
+
+</div><!-- /#left -->
+
+<!-- ══ Right panel ══════════════════════════════════════════════════════════ -->
+<div id="right">
+  <div id="right-tab-bar">
+    <button class="rtab active" id="rtab-plots" onclick="setRightTab('plots')">Plots</button>
+    <button class="rtab"        id="rtab-table" onclick="setRightTab('table')">Min. factor table</button>
+  </div>
+  <div id="plot-bar">
+    <span class="bar-lbl">Quantity:</span>
+    <div class="tab-bar">
+      <button class="tab active" id="qty-loss"    onclick="setQty('loss')">Loss</button>
+      <button class="tab"        id="qty-absgrad"  onclick="setQty('absgrad')">|Gradient|</button>
+      <button class="tab"        id="qty-grad"     onclick="setQty('grad')">Signed grad</button>
+    </div>
+    <span class="bar-lbl" style="margin-left:6px">X axis:</span>
+    <div class="tab-bar">
+      <button class="tab active" id="xax-factor" onclick="setXax('factor')">Factor (p/GT)</button>
+      <button class="tab"        id="xax-param"  onclick="setXax('param')">Param value</button>
+    </div>
+    <span class="bar-lbl" style="margin-left:6px">Y scale:</span>
+    <div class="tab-bar">
+      <button class="tab active" id="ys-log" onclick="setYscale('log')">Log</button>
+      <button class="tab"        id="ys-lin" onclick="setYscale('lin')">Linear</button>
+    </div>
+    <span class="bar-lbl" style="margin-left:6px">Seed bands:</span>
+    <div class="tab-bar">
+      <button class="tab"        id="band-none"  onclick="setBandMode('none')">Off</button>
+      <button class="tab active" id="band-range" onclick="setBandMode('range')">Min–Max</button>
+    </div>
+  </div>
+  <div id="plots-row">
+    <div class="plot-col">
+      <div class="col-header">Live preview</div>
+      <div id="live-plot" class="plot-div"></div>
+    </div>
+    <div class="plot-col">
+      <div class="col-header">Canvas</div>
+      <div id="main-plot" class="plot-div"></div>
+    </div>
+  </div>
+  <div id="table-view" style="display:none;flex:1;overflow:auto;padding:16px"></div>
+</div>
+
+</div><!-- /#app -->
+
+<script>
+/* ─────────────────────────────── embedded data ─────────────────────────────── */
+const DATA = __DATA_JSON__;
+
+/* ─────────────────────────────── constants ─────────────────────────────── */
+const PALETTE = [
+  '#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd',
+  '#8c564b','#e377c2','#17becf','#bcbd22','#7f7f7f',
+  '#aec7e8','#ffbb78','#98df8a','#ff9896','#c5b0d5',
+  '#e8a0bf','#b5ead7','#ffdac1','#c7ceea','#ff9aa2',
+];
+
+/* ─────────────────────────────── state ─────────────────────────────── */
+let qty      = 'loss';
+let xax      = 'factor';
+let yscale   = 'log';
+let bandMode = 'range';
+
+let fParam   = DATA.params[0];
+let fNoise   = DATA.noise_options[0] || 0.0;
+let fSeed    = DATA.seed_options[0]  || 42;
+let fCutoff  = DATA.cutoff_options[0] || 0.0;
+
+let series   = [];
+let colorIdx = 0;
+let liveInited = false;
+let canvasInited = false;
+let rightTab = 'plots';
+
+function nextColor() { return PALETTE[colorIdx++ % PALETTE.length]; }
+
+/* ─────────────────────────────── helpers ─────────────────────────────── */
+function sid(raw) { return String(raw).replace(/[^a-zA-Z0-9]/g, '_'); }
+
+function getRun(param, noise, seed, cutoff) {
+  return DATA.runs.find(r =>
+    r.param_name === param &&
+    Math.abs(r.noise_scale - noise) < 1e-9 &&
+    (noise < 1e-9 || r.noise_seed === seed) &&
+    Math.abs(r.adc_cutoff - cutoff) < 1e-9
+  ) || null;
+}
+
+function getSelectedTracks() {
+  return DATA.all_tracks.filter(t => {
+    const el = document.getElementById('ck-t-' + sid(t));
+    return el && el.checked;
+  });
+}
+
+function getSelectedPlanes() {
+  return DATA.all_planes.filter(p => {
+    const el = document.getElementById('ck-p-' + sid(p));
+    return el && el.checked;
+  });
+}
+
+/* Compute loss / grad over selected tracks and planes for one run.
+   Loss uses geomean_log1p over selected planes (matching the actual loss):
+     expm1( mean_p( log1p(L_p) ) )   summed across selected tracks.
+   When no per-plane data is available, falls back to per_track_loss. */
+function computeVals(run, tracks, planes) {
+  const n    = run.factors.length;
+  const loss = new Array(n).fill(0);
+  const grad = new Array(n).fill(0);
+
+  for (const t of tracks) {
+    const tLoss = run.per_track_loss[t];
+    const tGrad = run.per_track_grad[t];
+    if (!tLoss) continue;
+
+    if (planes.length > 0 && run.per_plane_loss && run.per_plane_loss[t]) {
+      // geomean_log1p: expm1( mean_p( log1p(L_p) ) )
+      const plData = planes.map(p => run.per_plane_loss[t][p]).filter(Boolean);
+      const k = plData.length;
+      if (k > 0) {
+        for (let i = 0; i < n; i++) {
+          let logSum = 0;
+          for (const pl of plData) logSum += Math.log1p(pl[i]);
+          loss[i] += Math.expm1(logSum / k);
+        }
+      }
+    } else {
+      for (let i = 0; i < n; i++) loss[i] += tLoss[i];
+    }
+    if (tGrad) for (let i = 0; i < n; i++) grad[i] += tGrad[i];
+  }
+  return { factors: run.factors, param_values: run.param_values,
+           loss, absgrad: grad.map(Math.abs), grad };
+}
+
+function buildLabel(run, tracks, planes) {
+  const noise  = run.noise_scale > 0
+               ? `σ=${run.noise_scale} s${run.noise_seed}` : 'clean';
+  const cut    = `cut=${run.adc_cutoff}`;
+  const nT     = tracks.length;
+  const tStr   = nT === DATA.all_tracks.length ? 'all trk'
+               : nT === 1 ? tracks[0] : `${nT} trk`;
+  const pStr   = planes.length === 0 ? ''
+               : planes.length === DATA.all_planes.length ? ' [all planes]'
+               : ` [${planes.join('+')}]`;
+  return `${run.param_label} | ${noise} | ${cut} | ${tStr}${pStr}`;
+}
+
+/* ─────────────────────────────── filter UI ─────────────────────────────── */
+function buildFilters() {
+  /* param */
+  const sp = document.getElementById('sel-param');
+  sp.innerHTML = '';
+  DATA.params.forEach(p => {
+    const o = document.createElement('option');
+    o.value = p;
+    o.textContent = DATA.runs.find(r => r.param_name === p)?.param_label || p;
+    sp.appendChild(o);
+  });
+  sp.value = fParam;
+  sp.onchange = () => { fParam = sp.value; onFilt(); };
+
+  /* combined noise + seed dropdown */
+  const ns = document.getElementById('sel-noise-seed');
+  ns.innerHTML = '';
+  const _noiseSeedOptions = [];
+  if (DATA.noise_options.includes(0.0)) {
+    _noiseSeedOptions.push({ noise: 0.0, seed: null, label: 'No noise' });
+  }
+  DATA.noise_options.filter(n => n > 0).forEach(n => {
+    DATA.seed_options.forEach(s => {
+      _noiseSeedOptions.push({ noise: n, seed: s, label: `Noise seed ${s}` });
+    });
+  });
+  _noiseSeedOptions.forEach((opt, i) => {
+    const o = document.createElement('option'); o.value = i; o.textContent = opt.label; ns.appendChild(o);
+  });
+  const _initIdx = _noiseSeedOptions.findIndex(o =>
+    Math.abs(o.noise - fNoise) < 1e-9 && (o.seed === null || o.seed === fSeed));
+  ns.value = _initIdx >= 0 ? _initIdx : 0;
+  ns.onchange = () => {
+    const opt = _noiseSeedOptions[parseInt(ns.value)];
+    fNoise = opt.noise;
+    if (opt.seed !== null) fSeed = opt.seed;
+    onFilt();
+  };
+
+  /* cutoff */
+  const sc = document.getElementById('sel-cutoff');
+  sc.innerHTML = '';
+  DATA.cutoff_options.forEach(c => {
+    const o = document.createElement('option'); o.value = c;
+    o.textContent = c === 0 ? 'cutoff = 0 (none)' : `cutoff = ${c} ADC`;
+    sc.appendChild(o);
+  });
+  sc.value = fCutoff;
+  sc.onchange = () => { fCutoff = parseFloat(sc.value); onFilt(); };
+}
+
+function buildCheckboxes() {
+  /* tracks */
+  const td = document.getElementById('track-checks');
+  td.innerHTML = '';
+  DATA.all_tracks.forEach(t => {
+    const lbl = document.createElement('label'); lbl.className = 'ck';
+    const cb  = document.createElement('input'); cb.type = 'checkbox'; cb.id = 'ck-t-' + sid(t); cb.checked = true;
+    cb.onchange = renderLivePlot;
+    lbl.appendChild(cb); lbl.appendChild(document.createTextNode(' ' + t));
+    td.appendChild(lbl);
+  });
+
+  /* planes */
+  if (!DATA.has_per_plane || DATA.all_planes.length === 0) return;
+  document.getElementById('plane-sec').style.display = '';
+  const pd = document.getElementById('plane-checks');
+  pd.innerHTML = '';
+  DATA.all_planes.forEach(p => {
+    const lbl = document.createElement('label'); lbl.className = 'ck';
+    const cb  = document.createElement('input'); cb.type = 'checkbox'; cb.id = 'ck-p-' + sid(p); cb.checked = true;
+    cb.onchange = renderLivePlot;
+    lbl.appendChild(cb); lbl.appendChild(document.createTextNode(' ' + p));
+    pd.appendChild(lbl);
+  });
+}
+
+function selAll(kind) {
+  const items = kind === 'track' ? DATA.all_tracks : DATA.all_planes;
+  const prefix = kind === 'track' ? 'ck-t-' : 'ck-p-';
+  items.forEach(x => { const el = document.getElementById(prefix + sid(x)); if (el) el.checked = true; });
+  renderLivePlot();
+}
+function selNone(kind) {
+  const items = kind === 'track' ? DATA.all_tracks : DATA.all_planes;
+  const prefix = kind === 'track' ? 'ck-t-' : 'ck-p-';
+  items.forEach(x => { const el = document.getElementById(prefix + sid(x)); if (el) el.checked = false; });
+  renderLivePlot();
+}
+
+function onFilt() {
+  const run = getRun(fParam, fNoise, fSeed, fCutoff);
+  document.getElementById('no-run-warn').style.display = run ? 'none' : '';
+  if (rightTab === 'plots') renderLivePlot();
+  else renderMinTable();
+}
+
+/* ─────────────────────────────── right tab ─────────────────────────────── */
+function setRightTab(tab) {
+  rightTab = tab;
+  const isPlots = tab === 'plots';
+  document.getElementById('plots-row').style.display  = isPlots ? '' : 'none';
+  document.getElementById('plot-bar').style.display   = isPlots ? '' : 'none';
+  document.getElementById('table-view').style.display = isPlots ? 'none' : '';
+  ['plots','table'].forEach(k =>
+    document.getElementById('rtab-'+k).classList.toggle('active', k===tab));
+  if (!isPlots) renderMinTable();
+  else { renderLivePlot(); renderCanvas(); }
+}
+
+/* ─────────────────────────────── min-factor table ─────────────────────────────── */
+function _argmin(arr) {
+  let mi = 0;
+  for (let i = 1; i < arr.length; i++) if (arr[i] < arr[mi]) mi = i;
+  return mi;
+}
+
+function renderMinTable() {
+  const el  = document.getElementById('table-view');
+  const run = getRun(fParam, fNoise, fSeed, fCutoff);
+
+  if (!run) {
+    el.innerHTML = '<p style="padding:20px;color:#e65100">⚠ No data for current filter selection.</p>';
+    return;
+  }
+
+  const tracks  = run.track_names;
+  const factors = run.factors;
+  const hasPlanes = run.per_plane_loss !== null;
+  const planeCols = hasPlanes ? run.plane_names : [];
+
+  /* Collect min-factor per (track, col). col = plane name or 'All'. */
+  const cells = {};   // cells[track][col] = factor value
+  const allDevs = [];
+
+  tracks.forEach(t => {
+    cells[t] = {};
+
+    /* Per-plane columns */
+    if (hasPlanes && run.per_plane_loss[t]) {
+      planeCols.forEach(p => {
+        const pl = run.per_plane_loss[t][p];
+        if (pl) {
+          cells[t][p] = factors[_argmin(pl)];
+          allDevs.push(Math.abs(cells[t][p] - 1.0));
+        }
+      });
+    }
+
+    /* "All" column — use per_track_loss (real geomean_log1p over all planes) */
+    const tl = run.per_track_loss[t];
+    if (tl) {
+      cells[t]['All'] = factors[_argmin(tl)];
+      allDevs.push(Math.abs(cells[t]['All'] - 1.0));
+    }
+  });
+
+  const maxDev = allDevs.length ? Math.max(...allDevs, 1e-6) : 1;
+
+  function bgColor(factor) {
+    if (factor === undefined) return '#f5f5f5';
+    const t = Math.min(Math.abs(factor - 1.0) / maxDev, 1.0);
+    /* white → orange → red */
+    const r = 255;
+    const g = Math.round(255 * (1 - t * 0.85));
+    const b = Math.round(255 * (1 - t));
+    return `rgb(${r},${g},${b})`;
+  }
+
+  const cols = [...planeCols, 'All'];
+  const noiseLabel = run.noise_scale > 0 ? `Noise seed ${run.noise_seed}` : 'No noise';
+  const subtitle = `${run.param_label}  ·  ${noiseLabel}  ·  cutoff=${run.adc_cutoff}  ·  factor at minimum loss`;
+
+  let html = `<p style="font-size:12px;color:#888;margin-bottom:10px">${subtitle}</p>`;
+  html += '<table class="min-tbl"><thead><tr>';
+  html += '<th class="trk-hdr">Track</th>';
+  cols.forEach(c => { html += `<th>${c}</th>`; });
+  html += '</tr></thead><tbody>';
+
+  tracks.forEach(t => {
+    html += `<tr><td class="trk-lbl">${t}</td>`;
+    cols.forEach(c => {
+      const val = cells[t][c];
+      const bg  = bgColor(val);
+      const txt = val !== undefined ? val.toFixed(3) : '—';
+      const fg  = val !== undefined && Math.abs(val - 1.0) / maxDev > 0.6 ? '#fff' : '#222';
+      html += `<td style="background:${bg};color:${fg}">${txt}</td>`;
+    });
+    html += '</tr>';
+  });
+
+  html += '</tbody></table>';
+  el.innerHTML = html;
+}
+
+/* ─────────────────────────────── series ─────────────────────────────── */
+function addSeries() {
+  const run = getRun(fParam, fNoise, fSeed, fCutoff);
+  if (!run) { alert('No data matches the current filter combination.'); return; }
+
+  const tracks = getSelectedTracks();
+  if (tracks.length === 0) { alert('Select at least one track.'); return; }
+
+  const planes = getSelectedPlanes();
+  const vals   = computeVals(run, tracks, planes);
+  const label  = buildLabel(run, tracks, planes);
+  const color  = nextColor();
+
+  series.push({ id: colorIdx - 1, label, color, vals });
+  renderSeriesList();
+  renderCanvas();
+}
+
+function removeSeries(id) {
+  series = series.filter(s => s.id !== id);
+  renderSeriesList();
+  renderCanvas();
+}
+
+function clearAll() { series = []; colorIdx = 0; renderSeriesList(); renderCanvas(); }
+
+function renderSeriesList() {
+  const el    = document.getElementById('series-list');
+  const empty = document.getElementById('s-empty');
+  empty.style.display = series.length ? 'none' : '';
+  el.querySelectorAll('.s-item').forEach(x => x.remove());
+
+  series.forEach(s => {
+    const div = document.createElement('div'); div.className = 's-item';
+    div.innerHTML =
+      `<div class="swatch" style="background:${s.color}"></div>` +
+      `<span class="s-lbl" title="${s.label}">${s.label}</span>` +
+      `<button class="btn-sm btn-del" onclick="removeSeries(${s.id})">✕</button>`;
+    el.appendChild(div);
+  });
+}
+
+/* ─────────────────────────────── plot helpers ─────────────────────────────── */
+function getXY(s) {
+  const x = xax === 'factor' ? s.vals.factors : s.vals.param_values;
+  const y = qty === 'loss' ? s.vals.loss : qty === 'absgrad' ? s.vals.absgrad : s.vals.grad;
+  return { x, y };
+}
+
+function _baseLayout(yTitle, xTitle) {
+  const shapes = [];
+  if (xax === 'factor') {
+    shapes.push({ type:'line', x0:1, x1:1, y0:0, y1:1, xref:'x', yref:'paper',
+                  line:{ color:'#555', width:1.5, dash:'dot' } });
+  }
+  if (qty === 'grad') {
+    shapes.push({ type:'line', x0:0, x1:1, y0:0, y1:0, xref:'paper', yref:'y',
+                  line:{ color:'#aaa', width:1, dash:'dash' } });
+  }
+  return {
+    xaxis: { title: xTitle, gridcolor:'#eee', zeroline:false },
+    yaxis: { title: yTitle, type: (yscale==='log' && qty!=='grad') ? 'log' : 'linear',
+             gridcolor:'#eee', zeroline: qty==='grad' },
+    shapes,
+    legend: { font:{ size:11 }, bgcolor:'rgba(255,255,255,.85)', bordercolor:'#ddd', borderwidth:1 },
+    margin: { t:16, b:52, l:72, r:20 },
+    paper_bgcolor:'#fff', plot_bgcolor:'#fcfcfc',
+    hovermode:'x unified',
+  };
+}
+
+/* ── live preview (current filter + track + plane selection) ── */
+function renderLivePlot() {
+  const xTitle = xax === 'factor' ? 'Factor  (param / GT)' : 'Parameter value';
+  const yTitle = { loss: 'Loss', absgrad: '|∂L/∂p|', grad: '∂L/∂p' }[qty];
+  const layout = _baseLayout(yTitle, xTitle);
+  const cfg    = { responsive: true };
+
+  const run    = getRun(fParam, fNoise, fSeed, fCutoff);
+  const tracks = getSelectedTracks();
+  let traces   = [];
+
+  if (run && tracks.length > 0) {
+    const planes = getSelectedPlanes();
+    const vals   = computeVals(run, tracks, planes);
+    const { x, y } = { x: xax==='factor' ? vals.factors : vals.param_values,
+                        y: qty==='loss' ? vals.loss : qty==='absgrad' ? vals.absgrad : vals.grad };
+    traces = [{ x, y, name: buildLabel(run, tracks, planes),
+                type:'scatter', mode:'lines+markers',
+                line:{ color:'#1565C0', width:2.5 }, marker:{ color:'#1565C0', size:5 } }];
+  }
+
+  if (!liveInited) {
+    Plotly.newPlot('live-plot', traces, layout, cfg);
+    liveInited = true;
+  } else {
+    Plotly.react('live-plot', traces, layout, cfg);
+  }
+}
+
+/* ── canvas (accumulated series) ── */
+function _bandGroups() {
+  if (bandMode === 'none') return null;
+  const byKey = {};
+  series.forEach(s => {
+    const gk = s.label.replace(/\bs\d+\b/, 'SEED');
+    if (!byKey[gk]) byKey[gk] = [];
+    byKey[gk].push(s);
+  });
+  return byKey;
+}
+
+function renderCanvas() {
+  const xTitle = xax === 'factor' ? 'Factor  (param / GT)' : 'Parameter value';
+  const yTitle = { loss: 'Loss', absgrad: '|∂L/∂p|', grad: '∂L/∂p' }[qty];
+  const layout = _baseLayout(yTitle, xTitle);
+  const cfg    = { responsive: true };
+  const traces = [];
+  const byKey  = _bandGroups();
+
+  series.forEach(s => {
+    const { x, y } = getXY(s);
+    traces.push({ x, y, name: s.label, type:'scatter', mode:'lines+markers',
+                  line:{ color:s.color, width:2 }, marker:{ color:s.color, size:4 } });
+  });
+
+  if (byKey) {
+    Object.values(byKey).forEach(grp => {
+      if (grp.length < 2) return;
+      const refXY = getXY(grp[0]);
+      const n = refXY.x.length;
+      const yMin = new Array(n).fill(Infinity);
+      const yMax = new Array(n).fill(-Infinity);
+      grp.forEach(s => {
+        const { y } = getXY(s);
+        for (let i = 0; i < n; i++) {
+          if (y[i] < yMin[i]) yMin[i] = y[i];
+          if (y[i] > yMax[i]) yMax[i] = y[i];
+        }
+      });
+      const xFwd = refXY.x, xRev = [...refXY.x].reverse();
+      traces.push({ x:[...xFwd,...xRev], y:[...yMax,...yMin.slice().reverse()],
+                    fill:'toself', fillcolor:grp[0].color+'28',
+                    line:{ color:'transparent' }, showlegend:false,
+                    hoverinfo:'skip', type:'scatter' });
+    });
+  }
+
+  if (!canvasInited) {
+    Plotly.newPlot('main-plot', traces, layout, cfg);
+    canvasInited = true;
+  } else {
+    Plotly.react('main-plot', traces, layout, cfg);
+  }
+}
+
+/* ─────────────────────────────── toolbar toggles ─────────────────────────────── */
+function _renderBoth() { renderLivePlot(); renderCanvas(); }
+
+function setQty(q) {
+  qty = q;
+  ['loss','absgrad','grad'].forEach(k =>
+    document.getElementById('qty-'+k).classList.toggle('active', k===q));
+  const logBtn = document.getElementById('ys-log');
+  if (q === 'grad' && yscale === 'log') { yscale='lin'; _syncYscale(); }
+  logBtn.disabled = (q === 'grad');
+  _renderBoth();
+}
+
+function setXax(x) {
+  xax = x;
+  ['factor','param'].forEach(k =>
+    document.getElementById('xax-'+k).classList.toggle('active', k===x));
+  _renderBoth();
+}
+
+function setYscale(s) {
+  yscale = s;
+  _syncYscale();
+  _renderBoth();
+}
+function _syncYscale() {
+  ['log','lin'].forEach(k =>
+    document.getElementById('ys-'+k).classList.toggle('active', k===yscale));
+}
+
+function setBandMode(m) {
+  bandMode = m;
+  ['none','range'].forEach(k =>
+    document.getElementById('band-'+k).classList.toggle('active', k===m));
+  renderCanvas();
+}
+
+/* ─────────────────────────────── init ─────────────────────────────── */
+window.addEventListener('load', () => {
+  buildFilters();
+  buildCheckboxes();
+  onFilt();   // calls renderLivePlot internally
+  renderCanvas();
+});
+</script>
+</body>
+</html>
+"""
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('--results-dir', default=DEFAULT_RESULTS,
+                   help='Directory containing *.pkl files (default: %(default)s)')
+    p.add_argument('--output', default=None,
+                   help='Output HTML path (default: $PLOTS_DIR/<dirname>/landscape_viewer.html)')
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    if args.output is None:
+        dirname = os.path.basename(args.results_dir.rstrip('/\\'))
+        output  = os.path.join(_PLOTS_DIR, dirname, 'landscape_viewer.html')
+    else:
+        output = args.output
+
+    print(f'Results dir : {args.results_dir}')
+    print(f'Output      : {output}')
+
+    data = load_and_group(args.results_dir)
+    print(f'Params      : {data["params"]}')
+    print(f'Tracks      : {len(data["all_tracks"])}  {data["all_tracks"][:4]}...')
+    print(f'Planes      : {data["all_planes"]}')
+    print(f'Noise opts  : {data["noise_options"]}')
+    print(f'Seeds       : {data["seed_options"]}')
+    print(f'Cutoffs     : {data["cutoff_options"]}')
+    print(f'Runs total  : {len(data["runs"])}')
+
+    data_json = json.dumps(data, cls=_NpEncoder, separators=(',', ':'))
+    html = _HTML.replace('__DATA_JSON__', data_json)
+
+    os.makedirs(os.path.dirname(output) or '.', exist_ok=True)
+    with open(output, 'w', encoding='utf-8') as f:
+        f.write(html)
+
+    size_mb = os.path.getsize(output) / 1e6
+    print(f'Written     : {output}  ({size_mb:.1f} MB)')
+    print(f'Open        : file://{os.path.abspath(output)}')
+
+
+if __name__ == '__main__':
+    main()

@@ -33,6 +33,8 @@ GT2_BASE              = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3
 GT3_BASE              = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3k_GT3')
 GT1_NODIFF_BASE       = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3k_NoDiff')
 GT2_NODIFF_BASE       = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3k_GT2_NoDiff')
+GT1_NODIFFLIF_BASE    = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3k_NoDiffLifetime')
+GT2_NODIFFLIF_BASE    = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3k_GT2_NoDiffLifetime')
 GT3_NODIFF_BASE       = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3k_GT3_NoDiff')
 GT1_01MM_BASE         = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3k_0p1mm_step_GT')
 GT1_01MM_SIM_BASE     = os.path.join(_RESULTS_DIR, 'opt', 'Adam_NoiseSeedSweep_3k_0p1mm_step_GT_and_sim')
@@ -45,6 +47,14 @@ GT3_DARK,        GT3_LIGHT        = '#d62728', '#ff9896'  # red / light red
 GT1_NODIFF_DARK, GT1_NODIFF_LIGHT = '#8fbc00', '#c8e670'  # chartreuse / light lime (green family)
 GT2_NODIFF_DARK, GT2_NODIFF_LIGHT = '#6495ed', '#b0c8f8'  # cornflower blue / light periwinkle (blue family)
 GT3_NODIFF_DARK, GT3_NODIFF_LIGHT = '#c05020', '#e89a70'  # russet / light brick (red-orange family)
+
+# High-contrast palette for GT1/GT1_NoDiff/GT2/GT2_NoDiff (all maximally distinct)
+GT1_CONTRAST       = '#2ca02c'   # green
+GT1_NODIFF_CONTRAST= '#ff7f0e'   # orange
+GT2_CONTRAST       = '#1f77b4'   # blue
+GT2_NODIFF_CONTRAST= '#9467bd'   # purple
+GT1_NODIFFLIF_CONTRAST = '#e377c2'  # pink
+GT2_NODIFFLIF_CONTRAST = '#17becf'  # teal
 STEP01_DARK, STEP01_LIGHT = '#ff7f0e', '#ffbb78'  # orange
 BOTH01_DARK, BOTH01_LIGHT = '#9467bd', '#c5b0d5'  # purple
 GT_LINE_GRAY = '#888888'
@@ -342,6 +352,8 @@ def main():
     gt1_nodiff_runs    = load_runs(GT1_NODIFF_BASE)
     gt2_nodiff_runs    = load_runs(GT2_NODIFF_BASE)
     gt3_nodiff_runs    = load_runs(GT3_NODIFF_BASE)
+    gt1_nodifflif_runs = load_runs(GT1_NODIFFLIF_BASE)
+    gt2_nodifflif_runs = load_runs(GT2_NODIFFLIF_BASE)
     gt1_01mm_runs      = load_runs(GT1_01MM_BASE)
     gt1_01mm_sim_runs  = load_runs(GT1_01MM_SIM_BASE)
 
@@ -402,6 +414,40 @@ def main():
                           GT3_DARK: 'GT3',         GT3_NODIFF_DARK: 'GT3 NoDiff'},
             group_labels=('GT1 family', 'GT2 family', 'GT3 family', 'all combined'),
             c_pairs=[(r, GT3_DARK) for r in g3n] + [(r, GT3_NODIFF_DARK) for r in g3nd],
+        )
+
+    # GT1 / GT1-NoDiff / GT2 / GT2-NoDiff with maximally distinct colours (noise only)
+    if g1n or g1nd or g2n or g2nd:
+        make_figure(
+            [(r, GT1_CONTRAST)        for r in g1n] +
+            [(r, GT1_NODIFF_CONTRAST) for r in g1nd],
+            [(r, GT2_CONTRAST)        for r in g2n] +
+            [(r, GT2_NODIFF_CONTRAST) for r in g2nd],
+            out('sweep_trajectories_noise_nodiff_contrast.pdf'),
+            title_suffix='with noise: GT1 / GT1-NoDiff / GT2 / GT2-NoDiff (high contrast)',
+            color_labels={GT1_CONTRAST:        'GT1',
+                          GT1_NODIFF_CONTRAST: 'GT1 NoDiff',
+                          GT2_CONTRAST:        'GT2',
+                          GT2_NODIFF_CONTRAST: 'GT2 NoDiff'},
+            group_labels=('GT1 family', 'GT2 family', 'all combined', ''),
+        )
+
+    # GT1 / GT1-NoDiffLifetime / GT2 / GT2-NoDiffLifetime (noise only)
+    g1nl = _filter(gt1_nodifflif_runs, with_noise=True)
+    g2nl = _filter(gt2_nodifflif_runs, with_noise=True)
+    if g1n or g1nl or g2n or g2nl:
+        make_figure(
+            [(r, GT1_CONTRAST)          for r in g1n] +
+            [(r, GT1_NODIFFLIF_CONTRAST) for r in g1nl],
+            [(r, GT2_CONTRAST)          for r in g2n] +
+            [(r, GT2_NODIFFLIF_CONTRAST) for r in g2nl],
+            out('sweep_trajectories_noise_nodiff_lifetime.pdf'),
+            title_suffix='with noise: full vs fixed lifetime+diffusion (GT1 & GT2)',
+            color_labels={GT1_CONTRAST:           'GT1',
+                          GT1_NODIFFLIF_CONTRAST:  'GT1 NoDiffLifetime',
+                          GT2_CONTRAST:            'GT2',
+                          GT2_NODIFFLIF_CONTRAST:  'GT2 NoDiffLifetime'},
+            group_labels=('GT1 family', 'GT2 family', 'all combined', ''),
         )
 
     # Stitched Adam→Newton: GT1 vs GT2, noise+no-noise combined

@@ -143,3 +143,95 @@ def s3df_submit(command: str, *, time: str = "02:00:00", gpus: int = 1,
         print(f"wrote {path}")
 
     return None
+
+
+def s3df_submit_multi(
+    commands: List[str],
+    *,
+    job_label: str = "multi",
+    time: str = "04:00:00",
+    gpus: int = 1,
+    mem_gb: int = 32,
+    cpus_per_gpu: int = 1,
+    submit: bool = False,
+    print_sbatch_command: bool = False,
+    sbatch_commands_out: Optional[List[str]] = None,
+) -> Optional[str]:
+    """Submit one Slurm job that runs *commands* sequentially on a single GPU.
+
+    Each command runs in its own apptainer invocation; a failure is logged but
+    does NOT abort the remaining commands (no ``set -e``).
+    """
+    JOBS_DIR.mkdir(exist_ok=True)
+
+    ts   = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    name = f"{job_label}_{ts}"
+    stdout_log = f"{LOGS_DIR}/{name}_stdout.txt"
+    stderr_log = f"{LOGS_DIR}/{name}_stderr.txt"
+    path = JOBS_DIR / f"{name}.sh"
+
+    binds = " ".join(f"--bind {m}" for m in BIND_MOUNTS)
+
+    wrapped_lines = []
+    for cmd in commands:
+        esc = shlex.quote(cmd)
+        wrapped_lines.append(
+            f"apptainer exec --nv {binds} {APPTAINER_IMAGE} bash -c {esc}"
+            f" || echo 'FAILED (exit $?): {cmd[:120]}'"
+        )
+
+    exclude_line = (
+        [f"#SBATCH --exclude={','.join(BLACKLISTED_NODES)}"]
+        if BLACKLISTED_NODES else []
+    )
+    script = "\n".join([
+        "#!/bin/bash",
+        f"#SBATCH --job-name={name}",
+        f"#SBATCH --account={ACCOUNT}",
+        f"#SBATCH --partition={PARTITION}",
+        f"#SBATCH --qos={QOS}",
+        f"#SBATCH --time={time}",
+        f"#SBATCH --gpus={gpus}",
+        f"#SBATCH --cpus-per-gpu={cpus_per_gpu}",
+        f"#SBATCH --mem={mem_gb}G",
+        f"#SBATCH --output={stdout_log}",
+        f"#SBATCH --error={stderr_log}",
+        *exclude_line,
+        "",
+        "set -uo pipefail",
+        f"mkdir -p {LOGS_DIR}",
+        f"mkdir -p {JAX_CACHE_DIR}",
+        f"export APPTAINER_CACHEDIR={APPTAINER_CACHEDIR}",
+        f"export APPTAINER_TMPDIR={APPTAINER_TMPDIR}",
+        f"export TMPDIR={APPTAINER_TMPDIR}",
+        f"cd {REMOTE_DIR}",
+        "source .env",
+        f"export JAX_COMPILATION_CACHE_DIR={JAX_CACHE_DIR}",
+        "export XLA_PYTHON_CLIENT_PREALLOCATE=false",
+        "export TF_GPU_ALLOCATOR=cuda_malloc_async",
+        "export WANDB_DISABLE_SERVICE=true",
+        "",
+        "nvidia-smi",
+        "",
+        *wrapped_lines,
+    ]) + "\n"
+
+    path.write_text(script)
+
+    if submit:
+        result = subprocess.run(["sbatch", str(path)], universal_newlines=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out = result.stdout.strip() or result.stderr.strip()
+        print(out)
+        parts = out.split()
+        return parts[-1] if parts and parts[-1].isdigit() else None
+    elif print_sbatch_command:
+        line = f"sbatch {path.resolve()}"
+        if sbatch_commands_out is not None:
+            sbatch_commands_out.append(line)
+        else:
+            print(line)
+    else:
+        print(f"wrote {path}  ({len(commands)} commands)")
+
+    return None

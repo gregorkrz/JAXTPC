@@ -56,6 +56,11 @@ import numpy as np
 
 from tools.geometry import generate_detector
 from tools.loader import build_deposit_data
+from tools.losses import (
+    make_sobolev_weight,
+    sobolev_loss,
+    sobolev_loss_geomean_log1p,
+)
 from tools.noise import generate_noise
 from tools.particle_generator import generate_muon_track
 from tools.random_boundary_tracks import (
@@ -112,6 +117,8 @@ NOISE_SCALE = 1.0          # multiplier on the ADC-unit noise from generate_nois
 STORE_TRACES   = True      # store windowed 1-D trace at main wire (uses more disk)
 TRACE_HALF_WIN = 150       # half-window in time bins around reference peak
 WIRE_HALF_WIN  = 100       # half-window in wire channels around reference wire
+STORE_PER_PIXEL_LOSS_AND_GRAD = False  # store windowed (sim−GT)² loss and Sobolev ∂loss/∂sim in _grads.pkl
+SOBOLEV_MAX_PAD = 128                  # max padding for Sobolev weight construction
 
 # ── Simulator ─────────────────────────────────────────────────────────────────
 CONFIG_PATH        = 'config/cubic_wireplane_config.yaml'
@@ -225,6 +232,70 @@ def _extract(signals, plane_names, vol_indices, vol_idx, ref):
     return results
 
 
+def _build_pixel_grad_fn(loss_name, n_planes):
+    """JIT-compiled ∂loss/∂sim[w,t] for each pixel (mirrors 1d_gradients.build_pixel_grad_fn).
+
+    loss_name: 'sobolev_loss' or 'sobolev_loss_geomean_log1p'.
+    Returns fn(sim_arrays, gt_arrays, weights, masks) -> tuple of grad arrays.
+    """
+    planes = tuple(range(n_planes))
+
+    def _mask(arrays, masks):
+        return tuple(jnp.where(m, a, 0.0) for a, m in zip(arrays, masks))
+
+    if loss_name == 'sobolev_loss':
+        def fn(sim_arrays, gt_arrays, weights, masks):
+            return sobolev_loss(_mask(sim_arrays, masks), _mask(gt_arrays, masks), weights, planes)
+    else:  # sobolev_loss_geomean_log1p
+        def fn(sim_arrays, gt_arrays, weights, masks):
+            return sobolev_loss_geomean_log1p(_mask(sim_arrays, masks), _mask(gt_arrays, masks), weights, planes)
+
+    return jax.jit(jax.grad(fn))  # grad w.r.t. first arg (sim_arrays tuple)
+
+
+def _extract_pixel_windows(sigs, ref_sigs, plane_names, vol_indices, vol_idx, ref,
+                            pixel_grad_fn, sobolev_weights):
+    """Windowed per-pixel (sim−GT)² loss and Sobolev ∂loss/∂sim[w,t] maps.
+
+    pixel_grad is computed on the full planes via JAX autodiff, then windowed.
+    """
+    sigs_j  = tuple(jnp.array(s) for s in sigs)
+    ref_j   = tuple(jnp.array(g) for g in ref_sigs)
+    masks   = tuple(jnp.ones(s.shape, dtype=bool) for s in sigs_j)
+    grads   = pixel_grad_fn(sigs_j, ref_j, sobolev_weights, masks)
+    jax.block_until_ready(grads)
+
+    results = {}
+    for sig, ref_sig, grad, name, vi in zip(sigs, ref_sigs, grads, plane_names, vol_indices):
+        if vi != vol_idx:
+            continue
+        t_lo, t_hi = ref[name]['t_lo'], ref[name]['t_hi']
+        w_lo, w_hi = ref[name]['w_lo'], ref[name]['w_hi']
+        s    = np.array(sig,  dtype=np.float32)[w_lo:w_hi, t_lo:t_hi]
+        g    = np.array(ref_sig, dtype=np.float32)[w_lo:w_hi, t_lo:t_hi]
+        gmap = np.array(grad, dtype=np.float32)[w_lo:w_hi, t_lo:t_hi]
+        results[name] = {
+            'pixel_loss': (s - g) ** 2,
+            'pixel_grad': gmap,
+        }
+    return results
+
+
+def _extract_reference_windows(ref_sigs, plane_names, vol_indices, vol_idx, ref):
+    """Windowed GT (nominal-params) arrays keyed by plane name."""
+    results = {}
+    for sig, name, vi in zip(ref_sigs, plane_names, vol_indices):
+        if vi != vol_idx:
+            continue
+        t_lo, t_hi = ref[name]['t_lo'], ref[name]['t_hi']
+        w_lo, w_hi = ref[name]['w_lo'], ref[name]['w_hi']
+        results[name] = {
+            'gt_window': sig[w_lo:w_hi, t_lo:t_hi].astype(np.float32),
+            'w_lo': w_lo, 'w_hi': w_hi, 't_lo': t_lo, 't_hi': t_hi,
+        }
+    return results
+
+
 # ── Deposit construction ──────────────────────────────────────────────────────
 
 def generate_random_point_specs(seed, n, volumes):
@@ -291,9 +362,13 @@ def _build_point_deposit(spec, cfg):
 # ── Sweep ─────────────────────────────────────────────────────────────────────
 
 def _sweep_combos(deposit_data, combos, param_names, base_params,
-                  sim, plane_names, vol_indices, vol_idx, noise_dict, reference):
-    """Run a list of param combos for one deposit. Returns a sweep list."""
-    sweep = []
+                  sim, plane_names, vol_indices, vol_idx, noise_dict, reference,
+                  ref_sigs=None, store_per_pixel=False,
+                  pixel_grad_fn=None, sobolev_weights=None):
+    """Run a list of param combos for one deposit. Returns (sweep, grad_sweep)."""
+    noisy_ref_sigs = _add_noise(ref_sigs, noise_dict, sim.config) if store_per_pixel else None
+    sweep      = []
+    grad_sweep = [] if store_per_pixel else None
     for combo in combos:
         params = base_params
         for name, value in zip(param_names, combo):
@@ -304,13 +379,22 @@ def _sweep_combos(deposit_data, combos, param_names, base_params,
             'clean': _extract(sigs,       plane_names, vol_indices, vol_idx, reference),
             'noisy': _extract(noisy_sigs, plane_names, vol_indices, vol_idx, reference),
         })
-    return sweep
+        if store_per_pixel:
+            grad_sweep.append({
+                'clean': _extract_pixel_windows(sigs,       ref_sigs,       plane_names, vol_indices, vol_idx, reference, pixel_grad_fn, sobolev_weights),
+                'noisy': _extract_pixel_windows(noisy_sigs, noisy_ref_sigs, plane_names, vol_indices, vol_idx, reference, pixel_grad_fn, sobolev_weights),
+            })
+    return sweep, grad_sweep
 
 
 # ── Chunk I/O ─────────────────────────────────────────────────────────────────
 
 def _chunk_path(out_dir, sweep_tag, chunk_idx, n_chunks):
     return out_dir / f'sweep_{sweep_tag}_chunk{chunk_idx:03d}of{n_chunks:03d}.pkl'
+
+
+def _grad_chunk_path(out_dir, sweep_tag, chunk_idx, n_chunks):
+    return out_dir / f'sweep_{sweep_tag}_chunk{chunk_idx:03d}of{n_chunks:03d}_grads.pkl'
 
 
 def _chunk_is_valid(path, expected_n_combos, expected_deposit_names):
@@ -341,6 +425,11 @@ def parse_args():
                    help=f'Detector config YAML (default: {CONFIG_PATH})')
     p.add_argument('--vol-idx', type=int, default=0,
                    help='Detector volume to analyse (default: 0 = East TPC)')
+    p.add_argument('--store-per-pixel-loss-and-grad', action='store_true',
+                   help='Store windowed per-pixel (sim−GT)² loss and Sobolev ∂loss/∂sim maps '
+                        'in companion _grads.pkl files (one per chunk)')
+    p.add_argument('--sobolev-max-pad', type=int, default=SOBOLEV_MAX_PAD,
+                   help=f'Max padding for Sobolev weight construction (default: {SOBOLEV_MAX_PAD})')
     return p.parse_args()
 
 
@@ -426,14 +515,38 @@ def main():
 
     # ── Compute references once (nominal params, one pass per deposit) ────────
     print('Computing reference wire/time indices (nominal params)...')
-    references = {}
+    references  = {}
+    ref_signals = {}
     for name, dep, _, _ in deposit_registry:
-        ref_sigs        = _run(sim, base_params, dep)
+        ref_sigs         = _run(sim, base_params, dep)
         references[name] = _reference_indices(ref_sigs, plane_names, vol_indices, args.vol_idx)
+        if args.store_per_pixel_loss_and_grad:
+            ref_signals[name] = ref_sigs
         ref_str = '  '.join(f'{p}:w{references[name][p]["wire"]}/t{references[name][p]["time"]}'
                             for p in vol_plane_names)
         print(f'  {name:45s} [{ref_str}]')
     print()
+
+    # ── Pixel grad setup (Sobolev) ────────────────────────────────────────────
+    pixel_grad_fn   = None
+    sobolev_weights = None
+    if args.store_per_pixel_loss_and_grad:
+        first_ref       = next(iter(ref_signals.values()))
+        sobolev_weights = tuple(
+            make_sobolev_weight(np.array(s).shape[0], np.array(s).shape[1],
+                                max_pad=args.sobolev_max_pad)
+            for s in first_ref
+        )
+        pixel_grad_fn = _build_pixel_grad_fn('sobolev_loss_geomean_log1p', len(first_ref))
+        print('Warming up pixel_grad_fn (Sobolev)...')
+        t0      = time.time()
+        _fwd0   = tuple(jnp.array(s) for s in first_ref)
+        _masks0 = tuple(jnp.ones(s.shape, dtype=bool) for s in _fwd0)
+        _       = pixel_grad_fn(_fwd0, _fwd0, sobolev_weights, _masks0)
+        jax.block_until_ready(_)
+        _       = pixel_grad_fn(_fwd0, _fwd0, sobolev_weights, _masks0)
+        jax.block_until_ready(_)
+        print(f'Done ({time.time()-t0:.1f} s)\n')
 
     # ── Shared metadata written into every chunk file ─────────────────────────
     meta = {
@@ -448,9 +561,11 @@ def main():
         'track_seed':       TRACK_SEED,
         'n_point_deposits': N_POINT_DEPOSITS,
         'point_seed':       POINT_SEED,
-        'store_traces':     STORE_TRACES,
-        'trace_half_win':   TRACE_HALF_WIN,
-        'config_path':      args.config,
+        'store_traces':               STORE_TRACES,
+        'trace_half_win':             TRACE_HALF_WIN,
+        'store_per_pixel_loss_and_grad': args.store_per_pixel_loss_and_grad,
+        'sobolev_max_pad':            args.sobolev_max_pad,
+        'config_path':                args.config,
         'n_chunks':         n_chunks,
     }
 
@@ -459,9 +574,12 @@ def main():
     n_done  = 0
 
     for chunk_idx, combo_chunk in enumerate(combo_chunks):
-        path = _chunk_path(out_dir, sweep_tag, chunk_idx, n_chunks)
+        path      = _chunk_path(out_dir, sweep_tag, chunk_idx, n_chunks)
+        grad_path = _grad_chunk_path(out_dir, sweep_tag, chunk_idx, n_chunks)
 
-        if _chunk_is_valid(path, len(combo_chunk), deposit_names):
+        main_valid = _chunk_is_valid(path, len(combo_chunk), deposit_names)
+        grad_valid = (not args.store_per_pixel_loss_and_grad) or grad_path.exists()
+        if main_valid and grad_valid:
             print(f'[{chunk_idx+1:>{len(str(n_chunks))}}/{n_chunks}] '
                   f'SKIP  {path.name}  (already complete)')
             n_done += 1
@@ -472,11 +590,16 @@ def main():
               flush=True)
         t0 = time.time()
 
-        chunk_deposits = {}
+        chunk_deposits      = {}
+        grad_chunk_deposits = {}
         for name, dep, dep_type, source_meta in deposit_registry:
-            sweep = _sweep_combos(
+            sweep, grad_sweep = _sweep_combos(
                 dep, combo_chunk, param_names, base_params,
                 sim, plane_names, vol_indices, args.vol_idx, noise_dict, references[name],
+                ref_sigs=ref_signals.get(name),
+                store_per_pixel=args.store_per_pixel_loss_and_grad,
+                pixel_grad_fn=pixel_grad_fn,
+                sobolev_weights=sobolev_weights,
             )
             chunk_deposits[name] = {
                 'type':        dep_type,
@@ -484,19 +607,40 @@ def main():
                 'reference':   references[name],
                 'sweep':       sweep,
             }
+            if args.store_per_pixel_loss_and_grad:
+                grad_chunk_deposits[name] = {
+                    'reference_windows': _extract_reference_windows(
+                        ref_signals[name], plane_names, vol_indices, args.vol_idx, references[name]
+                    ),
+                    'sweep': grad_sweep,
+                }
 
-        global_start = chunk_idx * chunk_size
+        global_start   = chunk_idx * chunk_size
+        combos_payload = [{'params': dict(zip(param_names, [float(v) for v in c]))}
+                          for c in combo_chunk]
         payload = {
             'meta':          meta,
             'chunk_idx':     chunk_idx,
             'n_chunks':      n_chunks,
             'combo_indices': list(range(global_start, global_start + len(combo_chunk))),
-            'combos':        [{'params': dict(zip(param_names, [float(v) for v in c]))}
-                              for c in combo_chunk],
+            'combos':        combos_payload,
             'deposits':      chunk_deposits,
         }
         with open(path, 'wb') as f:
             pickle.dump(payload, f)
+
+        if args.store_per_pixel_loss_and_grad:
+            grad_payload = {
+                'meta':          meta,
+                'chunk_idx':     chunk_idx,
+                'n_chunks':      n_chunks,
+                'combo_indices': payload['combo_indices'],
+                'combos':        combos_payload,
+                'deposits':      grad_chunk_deposits,
+            }
+            with open(grad_path, 'wb') as f:
+                pickle.dump(grad_payload, f)
+            print(f'  → saved {grad_path.name}')
 
         elapsed = time.time() - t0
         n_done += 1

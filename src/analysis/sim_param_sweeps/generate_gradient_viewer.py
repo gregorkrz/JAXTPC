@@ -154,15 +154,20 @@ def build_data(pkl, bbox_override=None):
             'Re-run 1d_gradients.py with --store-arrays.'
         )
 
+    pixel_loss_all = pkl.get('per_track_pixel_loss')
+    pixel_grad_all = pkl.get('per_track_pixel_grad')
+
     n_sweep = len(pkl['param_values'])
     noise_scale = float(pkl.get('noise_scale', 0.0))
 
     arrays = {}
     refs   = {}
     bboxes = {}
+    pixel_arrays = {}
     for track in track_names:
         arrays[track] = {}
         refs[track]   = {}
+        pixel_arrays[track] = {}
         gt_all  = gt_arrays_all[track]   # list of n_planes arrays [n_wire, n_time]
         sim_all = sim_arrays_all[track]  # list[n_sweep] of list[n_planes] arrays
 
@@ -201,6 +206,23 @@ def build_data(pkl, bbox_override=None):
             }
             refs[track][plane] = {'wire': wire_ref, 'time': time_ref}
 
+            if pixel_loss_all and pixel_grad_all:
+                loss_sweeps = pixel_loss_all[track]
+                grad_sweeps = pixel_grad_all[track]
+                stacked_loss = np.stack([
+                    np.array(loss_sweeps[sw][pi], dtype=np.float32)[wl:wh, tl:th]
+                    for sw in range(n_sweep)
+                ], axis=0)
+                stacked_grad = np.stack([
+                    np.array(grad_sweeps[sw][pi], dtype=np.float32)[wl:wh, tl:th]
+                    for sw in range(n_sweep)
+                ], axis=0)
+                pixel_arrays[track][plane] = {
+                    'wire_lo': wl, 'time_lo': tl, 'n_wire': nw, 'n_time': nt,
+                    'data_loss': _b64z(stacked_loss),
+                    'data_grad': _b64z(stacked_grad),
+                }
+
     # Sweep point labels: index 0 = GT, indices 1..n_sweep = sweep points
     factors = pkl['factors']
     param_values = pkl['param_values']
@@ -213,6 +235,8 @@ def build_data(pkl, bbox_override=None):
 
     param_label = PARAM_PRETTY.get(pkl['param_name'], pkl['param_name'])
     noise_str   = f', noise={noise_scale:.2g}' if noise_scale > 0 else ', no noise'
+
+    print(f'  pixel maps: {"yes" if pixel_loss_all else "no"}')
 
     return {
         'param_name':    pkl['param_name'],
@@ -235,6 +259,7 @@ def build_data(pkl, bbox_override=None):
         'grad_per_track': pkl['per_track_grad_values'],
         'palette':       PALETTE,
         'ds_label':      param_label + noise_str,
+        'pixel_arrays':  pixel_arrays if (pixel_loss_all and pixel_grad_all) else None,
     }
 
 
@@ -285,7 +310,9 @@ tr.sel:hover td{background:#BBDEFB}
 #loading{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(255,255,255,.88);display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:16px;gap:10px;z-index:1000}
 .spinner{width:36px;height:36px;border:4px solid #e0e0e0;border-top-color:#2196F3;border-radius:50%;animation:spin .8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
-#evd-plot{height:360px;cursor:crosshair}
+#evd-plot{height:360px}
+#evd-pixel-loss{height:360px}
+#evd-pixel-grad{height:360px}
 .ref-row{display:flex;align-items:center;gap:12px;margin-top:10px;padding-top:10px;border-top:1px solid #eee}
 .ref-row label{font-size:13px;color:#555}
 .hint{font-size:11px;color:#aaa;margin-left:4px}
@@ -322,7 +349,17 @@ tr.sel:hover td{background:#BBDEFB}
 
     <div id="evd-param-rows"></div>
 
-    <div id="evd-plot"></div>
+    <div class="row">
+      <span class="lbl">Mask |GT|&lt;:</span>
+      <input type="number" id="pixel-mask-thresh" min="0" step="0.1" value="0">
+      <span class="hint">ADC &nbsp;(0 = show all pixels; masked pixels are black)</span>
+    </div>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;align-items:start">
+      <div id="evd-plot" style="cursor:crosshair"></div>
+      <div id="evd-pixel-loss"></div>
+      <div id="evd-pixel-grad"></div>
+    </div>
 
     <div class="ref-row">
       <label>Wire ref: <input type="number" id="wire-ref" min="0" value="0"></label>
@@ -398,6 +435,7 @@ const _PALETTE = ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd',
 
 /* ── inflate / data access ── */
 const _inflClean = {}, _inflNoisy = {};
+const _inflPixelLoss = {}, _inflPixelGrad = {};
 
 function _getBuf(pi, track, plane, useNoisy) {
   const cache = useNoisy ? _inflNoisy : _inflClean;
@@ -469,6 +507,47 @@ function _getWireTrace(pi, track, plane, pt, timeAbs, noisy=false) {
   return {x: Array.from({length:a.n_wire}, (_,i) => a.wire_lo+i), y};
 }
 
+function _pixelArrays(pi, useNoisy) {
+  const p = PARAMS[pi];
+  return (useNoisy && p.pixel_arrays_noisy) ? p.pixel_arrays_noisy
+       : (p.pixel_arrays_clean || null);
+}
+
+function _getPixelZ(pi, track, plane, pt, type, useNoisy) {
+  if (pt === 0) return null;
+  const pxa = _pixelArrays(pi, useNoisy);
+  if (!pxa || !pxa[track] || !pxa[track][plane]) return null;
+  const pa = pxa[track][plane];
+  const swIdx = pt - 1;
+  const nw = pa.n_wire, nt = pa.n_time;
+  const cacheKey = pi+'/'+track+'/'+plane+'/'+type+'/'+(useNoisy?'n':'c');
+  const cache = type === 'loss' ? _inflPixelLoss : _inflPixelGrad;
+  if (!cache[cacheKey]) {
+    const bin = Uint8Array.from(atob(pa['data_'+type]), c => c.charCodeAt(0));
+    cache[cacheKey] = new Float32Array(pako.inflate(bin).buffer);
+  }
+  const buf = cache[cacheKey];
+  const off = swIdx * nw * nt;
+  const thresh = parseFloat(document.getElementById('pixel-mask-thresh').value) || 0;
+  let gtBuf = null;
+  if (thresh > 0) gtBuf = _getBuf(pi, track, plane, useNoisy);
+  const z = [];
+  for (let w = 0; w < nw; w++) {
+    const row = [];
+    for (let t = 0; t < nt; t++) {
+      const val = buf[off + w * nt + t];
+      if (thresh > 0 && gtBuf) {
+        const a = _dims(pi, track, plane);
+        row.push(Math.abs(gtBuf[w * a.n_time + t]) < thresh ? null : val);
+      } else {
+        row.push(val);
+      }
+    }
+    z.push(row);
+  }
+  return z;
+}
+
 /* ── state ── */
 let _evdTrack    = PARAMS[0].track_names[0];
 let _evdPlane    = PARAMS[0].plane_names[0];
@@ -485,6 +564,7 @@ let _nextId           = 0;
 let _pIdx             = 0;
 let _evdInited        = false;
 let _evdPreviewInited = false;
+let _uiReady          = false;
 
 function _nextColor() { return _PALETTE[_pIdx++ % _PALETTE.length]; }
 function _ptLabel(pi, pt) { return PARAMS[pi].pt_labels[pt]; }
@@ -560,6 +640,8 @@ function _drawEvd() {
     Plotly.react('evd-plot', [trace], layout, cfg);
   }
   _drawEvdPreview();
+  _drawPixelMaps();
+  _saveState();
 }
 
 function _drawEvdPreview() {
@@ -596,11 +678,113 @@ function _drawEvdPreview() {
   }
 }
 
+let _pixelLossInited = false, _pixelGradInited = false;
+
+function _drawPixelMaps() {
+  const pi = _evdParamIdx;
+  const pt = Math.max(1, _sweepPt[pi]);
+  const pxa = _pixelArrays(pi, _noiseOn);
+  const lossEl = document.getElementById('evd-pixel-loss');
+  const gradEl = document.getElementById('evd-pixel-grad');
+  if (!pxa) {
+    const msg = '<div style="color:#aaa;padding:140px 10px;text-align:center;font-size:12px">No pixel data<br>(re-run with --store-per-pixel-loss-and-grad)</div>';
+    lossEl.innerHTML = msg; gradEl.innerHTML = msg;
+    _pixelLossInited = false; _pixelGradInited = false;
+    return;
+  }
+  const a = _dims(pi, _evdTrack, _evdPlane);
+  const xArr = Array.from({length:a.n_time}, (_,i) => a.time_lo+i);
+  const yArr = Array.from({length:a.n_wire}, (_,i) => a.wire_lo+i);
+  const zLoss = _getPixelZ(pi, _evdTrack, _evdPlane, pt, 'loss', _noiseOn) || [];
+  const zGrad = _getPixelZ(pi, _evdTrack, _evdPlane, pt, 'grad', _noiseOn) || [];
+  let gradMax = 1e-9;
+  zGrad.forEach(row => row.forEach(v => { if (v !== null && Math.abs(v) > gradMax) gradMax = Math.abs(v); }));
+  const ptLbl = _ptLabel(pi, pt);
+  const noiseTag = _noiseOn ? ' [noisy]' : '';
+  const cfg = {responsive:true};
+  const traceLoss = {type:'heatmap', x:xArr, y:yArr, z:zLoss,
+    colorscale:'Reds', zmin:0, connectgaps:false,
+    colorbar:{title:'Loss', thickness:14, len:0.9}};
+  const lyLoss = {
+    title:{text:_evdTrack+' — '+_evdPlane+' — Pixel Loss'+noiseTag+' @ '+ptLbl, font:{size:12}, x:0.04},
+    xaxis:{title:'Time bin'}, yaxis:{title:'Wire index'},
+    margin:{t:32,b:50,l:60,r:80}, paper_bgcolor:'#fff', plot_bgcolor:'#111'};
+  const traceGrad = {type:'heatmap', x:xArr, y:yArr, z:zGrad,
+    colorscale:'RdBu', reversescale:true, zmin:-gradMax, zmax:gradMax, connectgaps:false,
+    colorbar:{title:'∂L/∂sim', thickness:14, len:0.9}};
+  const lyGrad = {
+    title:{text:_evdTrack+' — '+_evdPlane+' — ∂L/∂sim'+noiseTag+' @ '+ptLbl, font:{size:12}, x:0.04},
+    xaxis:{title:'Time bin'}, yaxis:{title:'Wire index'},
+    margin:{t:32,b:50,l:60,r:80}, paper_bgcolor:'#fff', plot_bgcolor:'#111'};
+  if (!_pixelLossInited) { Plotly.newPlot('evd-pixel-loss',[traceLoss],lyLoss,cfg); _pixelLossInited=true; }
+  else { Plotly.react('evd-pixel-loss',[traceLoss],lyLoss,cfg); }
+  if (!_pixelGradInited) { Plotly.newPlot('evd-pixel-grad',[traceGrad],lyGrad,cfg); _pixelGradInited=true; }
+  else { Plotly.react('evd-pixel-grad',[traceGrad],lyGrad,cfg); }
+}
+
 function _evdRef() { return _refs[_evdTrack + '/' + _evdPlane]; }
 function _syncRefInputs() {
   const r = _evdRef();
   document.getElementById('wire-ref').value = r.wire;
   document.getElementById('time-ref').value = r.time;
+}
+
+function _saveState() {
+  if (!_uiReady || !history.replaceState) return;
+  const sp = new URLSearchParams();
+  sp.set('t',  _evdTrack);
+  sp.set('pl', _evdPlane);
+  sp.set('m',  _evdMode);
+  sp.set('pi', String(_evdParamIdx));
+  sp.set('sp', _sweepPt.join(','));
+  sp.set('n',  _noiseOn ? '1' : '0');
+  const maskEl = document.getElementById('pixel-mask-thresh');
+  if (maskEl && parseFloat(maskEl.value) > 0) sp.set('mask', maskEl.value);
+  history.replaceState(null, '', window.location.pathname + '?' + sp.toString());
+}
+
+function _restoreFromURL() {
+  const sp = new URLSearchParams(window.location.search);
+  if (!sp.has('t') && !sp.has('sp')) return;
+  const allTracks = PARAMS[0].track_names;
+  const allPlanes = PARAMS[0].plane_names;
+  const t = sp.get('t');
+  if (t && allTracks.includes(t)) {
+    _evdTrack = t;
+    const sel = document.getElementById('evd-track');
+    if (sel) sel.value = t;
+  }
+  const pl = sp.get('pl');
+  if (pl && allPlanes.includes(pl)) _updateEvdPlane(pl);
+  const m = sp.get('m');
+  if (m && ['sim','gt','diff'].includes(m)) {
+    _evdMode = m;
+    document.querySelectorAll('.mode-btn').forEach(b =>
+      b.classList.toggle('active', b.dataset.mode === m));
+  }
+  const pi = parseInt(sp.get('pi'));
+  if (!isNaN(pi) && pi >= 0 && pi < PARAMS.length) _updateEvdParamBtn(pi);
+  const spStr = sp.get('sp');
+  if (spStr) spStr.split(',').forEach((v, i) => {
+    const pt = parseInt(v);
+    if (i < _sweepPt.length && !isNaN(pt) && pt >= 0 && pt <= PARAMS[i].n_sweep) {
+      _sweepPt[i] = pt;
+      const sl = document.getElementById('evd-sl-' + i);
+      if (sl) { sl.value = String(pt); _updateSlLabel(i); }
+    }
+  });
+  const n = sp.get('n');
+  if (n !== null) {
+    _noiseOn = n === '1';
+    const cb = document.getElementById('noise-cb');
+    if (cb) cb.checked = _noiseOn;
+  }
+  const mask = sp.get('mask');
+  if (mask !== null) {
+    const el = document.getElementById('pixel-mask-thresh');
+    if (el) el.value = mask;
+  }
+  _syncRefInputs();
 }
 
 /* ── trace plots (one row per wireplane) ── */
@@ -987,7 +1171,10 @@ function _initUI() {
     histPb.appendChild(b);
   });
 
-  _syncRefInputs(); _renderTable(); _drawEvd(); _drawTraces();
+  _restoreFromURL();
+  _syncRefInputs();
+  _uiReady = true;
+  _renderTable(); _drawEvd(); _drawTraces();
 }
 
 window.addEventListener('load', () => {
@@ -1015,6 +1202,7 @@ window.addEventListener('load', () => {
   document.getElementById('time-ref').addEventListener('change', () => {
     _evdRef().time = +document.getElementById('time-ref').value; _drawEvd(); _drawTraces();
   });
+  document.getElementById('pixel-mask-thresh').addEventListener('input', () => { _drawPixelMaps(); _saveState(); });
 
   // Action buttons
   document.getElementById('btn-add').addEventListener('click', _addTrace);
@@ -1129,6 +1317,8 @@ def _group_by_param(all_data: list) -> list:
             'noise_scale':  float(noisy['noise_scale']) if noisy else 0.0,
             'arrays_clean': clean['arrays'] if clean else base['arrays'],
             'arrays_noisy': noisy_arrays,
+            'pixel_arrays_clean': clean['pixel_arrays'] if clean else None,
+            'pixel_arrays_noisy': (noisy_rebuilt['pixel_arrays'] if (clean and noisy and '_pkl_path' in noisy) else (noisy['pixel_arrays'] if noisy else None)),
         }
         params_list.append(entry)
     return params_list

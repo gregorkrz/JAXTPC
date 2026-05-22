@@ -81,7 +81,11 @@ from tools.losses import (
     make_sobolev_weight,
     sobolev_loss,
     sobolev_loss_geomean_log1p,
+    sobolev_loss_single,
 )
+
+# JIT-compiled per-plane loss; reuses one compiled kernel per distinct array shape.
+_plane_loss_jit = jax.jit(sobolev_loss_single)
 from tools.noise import generate_noise
 from tools.particle_generator import generate_muon_track
 from tools.simulation import DetectorSimulator
@@ -92,7 +96,7 @@ GT_VELOCITY_CM_US = 0.160
 
 CONFIG_PATH        = 'config/cubic_wireplane_config.yaml'
 MAX_ACTIVE_BUCKETS = 1000
-DETECTOR_BOUNDS_MM = ((-300, 300), (-300, 300), (-300, 300))
+DETECTOR_BOUNDS_MM = ()
 
 _JAX_CACHE_DIR = os.environ.get('JAX_COMPILATION_CACHE_DIR',
                                 os.path.expanduser('~/.cache/jax_compilation_cache'))
@@ -154,11 +158,17 @@ def parse_args():
                    help='Max padding for Sobolev weight construction (default: 128)')
     p.add_argument('--adc-cutoff', type=float, default=0.0,
                    help='Zero out pixels where |GT| < cutoff before loss (default: 0 = off)')
+    p.add_argument('--adc-cutoffs', default=None,
+                   help='Comma-separated list of ADC cutoffs to sweep in one invocation. '
+                        'Each cutoff writes its own output file. '
+                        'Overrides --adc-cutoff; cannot be combined with --output.')
     p.add_argument('--store-arrays', action='store_true',
                    help='Store full 2D signal arrays (all planes) at each sweep point per track')
     p.add_argument('--store-per-pixel-loss-and-grad', action='store_true',
                    help='Store per-pixel (sim-gt)^2 loss and ∂loss/∂sim[w,t] sensitivity maps '
                         'at each sweep point')
+    p.add_argument('--store-per-plane-loss', action='store_true',
+                   help='Store sobolev_loss_single for each wire plane at every sweep point')
     p.add_argument('--output', default=None,
                    help='Explicit output pkl path (overrides auto-generated name)')
     p.add_argument('--results-dir', default=os.path.join(_RESULTS_DIR, '1d_gradients'),
@@ -174,21 +184,44 @@ def parse_args():
 # ── Track parsing ──────────────────────────────────────────────────────────────
 
 def parse_tracks(tracks_str):
-    """Parse '+'-separated  name:dx,dy,dz:mom_mev  specs into list of dicts."""
+    """Parse '+'-separated track specs into list of dicts.
+
+    Each spec: name:dx,dy,dz:mom_mev  or  name:dx,dy,dz:mom_mev:sx,sy,sz
+               or  name:dx,dy,dz:mom_mev:sx,sy,sz:frac_start,frac_end
+    The optional 4th field sets start_position_mm (default: 0,0,0).
+    The optional 5th field sets deposit fraction [frac_start, frac_end] in [0,1]
+    (default: 0.0,1.0 = full track). Requires the 4th field to be present.
+    """
     specs = []
     for item in tracks_str.split('+'):
         item = item.strip()
         if not item:
             continue
         parts = item.split(':')
-        if len(parts) != 3:
-            raise ValueError(f'Track must be name:dx,dy,dz:mom_mev, got {item!r}')
+        if len(parts) not in (3, 4, 5):
+            raise ValueError(
+                f'Track must be name:dx,dy,dz:mom_mev[:sx,sy,sz[:frac_start,frac_end]], got {item!r}')
         name = parts[0].strip()
         direction = tuple(float(x) for x in parts[1].split(','))
         if len(direction) != 3:
             raise ValueError(f'Direction must have 3 components in {item!r}')
         momentum_mev = float(parts[2])
-        specs.append(dict(name=name, direction=direction, momentum_mev=momentum_mev))
+        if len(parts) >= 4:
+            start = tuple(float(x) for x in parts[3].split(','))
+            if len(start) != 3:
+                raise ValueError(f'Start position must have 3 components in {item!r}')
+        else:
+            start = (0.0, 0.0, 0.0)
+        if len(parts) == 5:
+            frac = tuple(float(x) for x in parts[4].split(','))
+            if len(frac) != 2 or not (0.0 <= frac[0] < frac[1] <= 1.0):
+                raise ValueError(
+                    f'Fraction must be frac_start,frac_end with 0<=start<end<=1, got {parts[4]!r}')
+            frac_start, frac_end = frac
+        else:
+            frac_start, frac_end = 0.0, 1.0
+        specs.append(dict(name=name, direction=direction, momentum_mev=momentum_mev,
+                          start_position_mm=start, frac_start=frac_start, frac_end=frac_end))
     if not specs:
         raise ValueError('--tracks produced no entries')
     return specs
@@ -239,9 +272,9 @@ def make_param_setter(param_name, gt_params, recomb_model):
 
 # ── Noise helper ───────────────────────────────────────────────────────────────
 
-def apply_noise(gt_arrays, simulator, noise_scale, noise_seed):
+def apply_noise(gt_arrays, simulator, noise_scale, noise_key):
     cfg        = simulator.config
-    noise_dict = generate_noise(cfg, key=jax.random.PRNGKey(noise_seed))
+    noise_dict = generate_noise(cfg, key=noise_key)
     n_readouts = cfg.volumes[0].n_planes if simulator._readout_type == 'wire' else 1
     noisy = []
     for v in range(cfg.n_volumes):
@@ -333,14 +366,19 @@ def build_pixel_grad_fn(loss_name, n_planes):
 # ── Output path ────────────────────────────────────────────────────────────────
 
 def auto_output_path(args, loss_name, track_specs):
-    tracks_tag = (f'{len(track_specs)}tracks' if len(track_specs) > 1
-                  else track_specs[0]['name'])
-    noise_tag   = f'_noise{args.noise_scale:.3g}'.replace('.', 'p') if args.noise_scale > 0.0 else ''
+    tracks_tag  = (f'{len(track_specs)}tracks' if len(track_specs) > 1
+                   else track_specs[0]['name'])
+    if args.noise_scale > 0.0:
+        seed_suffix = f'_seed{args.noise_seed}' if args.noise_seed != 42 else ''
+        noise_tag = f'_noise{args.noise_scale:.3g}'.replace('.', 'p') + seed_suffix
+    else:
+        noise_tag = ''
     cutoff_tag  = f'_cutoff{args.adc_cutoff:.3g}'.replace('.', 'p') if args.adc_cutoff > 0.0 else ''
     fixed_tag   = f'_fixed_{args.fixed_param}{args.fixed_value}' if args.fixed_param else ''
-    range_tag  = f'_range{args.range_frac:.3g}'.replace('.', 'p')
+    range_tag   = f'_range{args.range_frac:.3g}'.replace('.', 'p')
+    perplane_tag = '_perplane' if args.store_per_plane_loss else ''
     name = (f'{loss_name}_N{args.N}{range_tag}_{args.param}'
-            f'_{tracks_tag}{noise_tag}{cutoff_tag}{fixed_tag}.pkl')
+            f'_{tracks_tag}{noise_tag}{cutoff_tag}{perplane_tag}{fixed_tag}.pkl')
     return os.path.join(args.results_dir, name)
 
 
@@ -352,15 +390,16 @@ def main():
     if (args.fixed_param is None) != (args.fixed_value is None):
         raise ValueError('--fixed-param and --fixed-value must be given together')
 
-    loss_name = LOSS_ALIAS.get(args.loss, args.loss)
+    loss_name   = LOSS_ALIAS.get(args.loss, args.loss)
     track_specs = parse_tracks(args.tracks)
 
-    output_path = args.output or auto_output_path(args, loss_name, track_specs)
-    os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
-
-    if os.path.exists(output_path):
-        print(f'Output already exists, skipping: {output_path}')
-        return
+    # ── Resolve cutoff list ────────────────────────────────────────────────────
+    if args.adc_cutoffs is not None:
+        if args.output is not None:
+            raise ValueError('--output cannot be combined with --adc-cutoffs')
+        cutoffs_list = [float(x.strip()) for x in args.adc_cutoffs.split(',')]
+    else:
+        cutoffs_list = [args.adc_cutoff]
 
     print(f'JAX devices   : {jax.devices()}')
     print(f'Parameter     : {args.param}')
@@ -371,10 +410,33 @@ def main():
     print(f'Step size     : {args.step_size} mm  max deposits={args.max_deposits:,}')
     print(f'Noise scale   : {args.noise_scale}')
     print(f'Sobolev pad   : {args.sobolev_max_pad}')
-    print(f'ADC cutoff    : {args.adc_cutoff}')
+    print(f'ADC cutoffs   : {cutoffs_list}')
+    print(f'Per-plane loss: {args.store_per_plane_loss}')
     if args.fixed_param:
         print(f'Fixed param   : {args.fixed_param} = {args.fixed_value}')
-    print(f'Output        : {output_path}')
+
+    # ── Skip already-computed cutoffs ─────────────────────────────────────────
+    if args.output is not None:
+        # Single explicit output path; existence check done once.
+        if os.path.exists(args.output):
+            print(f'Output already exists, skipping: {args.output}')
+            return
+        pending_cutoffs = cutoffs_list
+    else:
+        pending_cutoffs = []
+        for cutoff in cutoffs_list:
+            args.adc_cutoff = cutoff
+            p = auto_output_path(args, loss_name, track_specs)
+            if os.path.exists(p):
+                print(f'  exists, skip cutoff={cutoff}: {p}')
+            else:
+                pending_cutoffs.append(cutoff)
+        if not pending_cutoffs:
+            print('All cutoffs already computed.')
+            return
+        if len(pending_cutoffs) < len(cutoffs_list):
+            print(f'  {len(pending_cutoffs)}/{len(cutoffs_list)} cutoffs pending.')
+    cutoffs_list = pending_cutoffs
 
     # ── Simulator ─────────────────────────────────────────────────────────────
     print('\nBuilding differentiable simulator...')
@@ -403,7 +465,6 @@ def main():
         velocity_cm_us = jnp.array(GT_VELOCITY_CM_US),
     )
 
-    # Optionally fix a second parameter to a non-GT value
     sweep_base_params = gt_params
     if args.fixed_param is not None:
         _fix_setter, _, _ = make_param_setter(args.fixed_param, gt_params, simulator.recomb_model)
@@ -417,20 +478,30 @@ def main():
     print(f'GT value      : {args.param} = {param_gt:.6g}  '
           f'(scale={scale:.6g},  p_n_gt={p_n_gt:.6g})')
 
-    # ── Build GT arrays for every track ──────────────────────────────────────
+    # ── Build GT arrays for every track (cutoff-independent) ──────────────────
     print('\nGenerating GT arrays for all tracks...')
-    per_track_data = []   # list of (name, deposits, gt_arrays, weights)
+    per_track_base = []   # (name, deposits, gt_arrays, weights)  — no masks
 
-    for ts in track_specs:
-        print(f'  track {ts["name"]}  dir={ts["direction"]}  T={ts["momentum_mev"]} MeV')
+    noise_base_key = jax.random.PRNGKey(args.noise_seed)
+    for track_idx, ts in enumerate(track_specs):
+        frac_start = ts.get('frac_start', 0.0)
+        frac_end   = ts.get('frac_end',   1.0)
+        print(f'  track {ts["name"]}  dir={ts["direction"]}  T={ts["momentum_mev"]} MeV'
+              + (f'  frac=[{frac_start:.2g},{frac_end:.2g}]' if (frac_start, frac_end) != (0.0, 1.0) else ''))
         track = generate_muon_track(
-            start_position_mm=(0.0, 0.0, 0.0),
+            start_position_mm=ts['start_position_mm'],
             direction=ts['direction'],
             kinetic_energy_mev=ts['momentum_mev'],
             step_size_mm=args.step_size,
             track_id=1,
             detector_bounds_mm=DETECTOR_BOUNDS_MM,
         )
+        if frac_start > 0.0 or frac_end < 1.0:
+            n = track['position'].shape[0]
+            i_start = int(n * frac_start)
+            i_end   = max(i_start + 1, int(n * frac_end))
+            print(f'    slicing deposits [{i_start}:{i_end}] of {n} total')
+            track = {k: v[i_start:i_end] for k, v in track.items()}
         deposits = build_deposit_data(
             track['position'], track['de'], track['dx'], simulator.config,
             theta=track['theta'], phi=track['phi'],
@@ -443,26 +514,17 @@ def main():
         jax.block_until_ready(gt_arrays)
 
         if args.noise_scale > 0.0:
-            gt_arrays = apply_noise(gt_arrays, simulator, args.noise_scale, args.noise_seed)
+            track_noise_key = jax.random.fold_in(noise_base_key, track_idx)
+            gt_arrays = apply_noise(gt_arrays, simulator, args.noise_scale, track_noise_key)
 
         weights = tuple(
             make_sobolev_weight(a.shape[0], a.shape[1], max_pad=args.sobolev_max_pad)
             for a in gt_arrays
         )
-        masks = tuple(
-            jnp.ones(a.shape, dtype=bool) if args.adc_cutoff == 0.0
-            else (jnp.abs(a) >= args.adc_cutoff)
-            for a in gt_arrays
-        )
         all_abs = jnp.concatenate([jnp.abs(a).ravel() for a in gt_arrays])
         print(f'    Signal ADC: max={float(all_abs.max()):.3g}  '
               f'mean={float(all_abs.mean()):.3g}')
-        if args.adc_cutoff > 0.0:
-            n_total_px  = sum(m.size for m in masks)
-            n_masked_px = sum(int(jnp.sum(~m)) for m in masks)
-            print(f'    ADC cutoff: {n_masked_px:,}/{n_total_px:,} pixels zeroed '
-                  f'({100*n_masked_px/n_total_px:.1f}%)')
-        per_track_data.append((ts['name'], deposits, gt_arrays, weights, masks))
+        per_track_base.append((ts['name'], deposits, gt_arrays, weights))
 
     # ── Plane name list (U1, V1, Y1, U2, V2, Y2) ─────────────────────────────
     cfg = simulator.config
@@ -471,17 +533,12 @@ def main():
         for p in range(cfg.volumes[v].n_planes):
             plane_names_all.append(f'{cfg.plane_names[v][p]}{v + 1}')
 
-    # ── Pre-collect GT arrays for all-plane storage ───────────────────────────
+    # GT arrays collected once for store_arrays (cutoff-independent)
     if args.store_arrays:
         per_track_gt_arrays = {
             name: [np.array(a, dtype=np.float32) for a in gt_arrs]
-            for name, _, gt_arrs, _, _m in per_track_data
+            for name, _, gt_arrs, _ in per_track_base
         }
-        per_track_sim_arrays = {name: [] for name, *_ in per_track_data}
-
-    if args.store_per_pixel_loss_and_grad:
-        per_track_pixel_loss = {name: [] for name, *_ in per_track_data}
-        per_track_pixel_grad = {name: [] for name, *_ in per_track_data}
 
     # ── Parameter grid ────────────────────────────────────────────────────────
     left_factors  = np.linspace(1.0 - args.range_frac, 1.0, args.N + 1)[:-1]
@@ -495,16 +552,17 @@ def main():
         marker = ' ← GT' if f == 1.0 else ''
         print(f'  factor={f:.6f}  p_n={pn:.6f}  {args.param}={v:.6g}{marker}')
 
-    # ── Compile a single value_and_grad used for all tracks ───────────────────
-    n_planes = len(per_track_data[0][2])
+    # ── Compile once (mask values are dynamic — no retrace per cutoff) ────────
+    n_planes = len(per_track_base[0][2])
     vag_fn   = build_value_and_grad(loss_name, simulator, _make_params, n_planes)
 
-    print('\nCompiling value_and_grad (once for all tracks)...')
+    print('\nCompiling value_and_grad (once for all tracks and cutoffs)...')
     t0 = time.time()
-    _, _dep0, _gt0, _wt0, _msk0 = per_track_data[0]
-    _ = vag_fn(jnp.array(p_n_values[0]), _dep0, _gt0, _wt0, _msk0)
+    _, _dep0, _gt0, _wt0 = per_track_base[0]
+    _allmask0 = tuple(jnp.ones(a.shape, dtype=bool) for a in _gt0)
+    _ = vag_fn(jnp.array(p_n_values[0]), _dep0, _gt0, _wt0, _allmask0)
     jax.block_until_ready(_)
-    _ = vag_fn(jnp.array(p_n_values[0]), _dep0, _gt0, _wt0, _msk0)
+    _ = vag_fn(jnp.array(p_n_values[0]), _dep0, _gt0, _wt0, _allmask0)
     jax.block_until_ready(_)
     print(f'Done ({time.time() - t0:.1f} s)')
 
@@ -513,100 +571,145 @@ def main():
         print('\nCompiling pixel_grad_fn...')
         t0 = time.time()
         _fwd0 = simulator.forward(_make_params(jnp.array(p_n_values[0])), _dep0)
-        _ = pixel_grad_fn(_fwd0, _gt0, _wt0, _msk0)
+        _ = pixel_grad_fn(_fwd0, _gt0, _wt0, _allmask0)
         jax.block_until_ready(_)
-        _ = pixel_grad_fn(_fwd0, _gt0, _wt0, _msk0)
+        _ = pixel_grad_fn(_fwd0, _gt0, _wt0, _allmask0)
         jax.block_until_ready(_)
         print(f'Done ({time.time() - t0:.1f} s)')
 
-    # ── Evaluate ──────────────────────────────────────────────────────────────
-    per_track_loss  = {name: [] for name, *_ in per_track_data}
-    per_track_grad  = {name: [] for name, *_ in per_track_data}
-    total_loss_vals = []
-    total_grad_vals = []
-    grad_times_s    = []
+    # ── Loop over cutoffs ─────────────────────────────────────────────────────
+    for cutoff in cutoffs_list:
+        print(f'\n{"─" * 60}')
+        print(f'ADC cutoff = {cutoff}  ({len(factors)} param points × {len(per_track_base)} tracks)')
 
-    for i, (factor, p_n, pval) in enumerate(zip(factors, p_n_values, param_values)):
-        p_n_arr = jnp.array(float(p_n))
-        t0      = time.time()
+        # Output path for this cutoff
+        args.adc_cutoff = cutoff
+        output_path = args.output or auto_output_path(args, loss_name, track_specs)
+        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
 
-        total_loss = 0.0
-        total_grad = 0.0
-        for tname, dep, gt_arrays, weights, masks in per_track_data:
-            lv, gv = vag_fn(p_n_arr, dep, gt_arrays, weights, masks)
-            jax.block_until_ready((lv, gv))
-            lv, gv = float(lv), float(gv)
-            per_track_loss[tname].append(lv)
-            per_track_grad[tname].append(gv)
-            total_loss += lv
-            total_grad += gv
-            need_fwd = args.store_arrays or args.store_per_pixel_loss_and_grad
-            if need_fwd:
-                fwd_out = simulator.forward(_make_params(p_n_arr), dep)
-                jax.block_until_ready(fwd_out)
-                if args.store_arrays:
-                    per_track_sim_arrays[tname].append(
-                        [np.array(a, dtype=np.float32) for a in fwd_out]
-                    )
-                if args.store_per_pixel_loss_and_grad:
-                    pg = pixel_grad_fn(fwd_out, gt_arrays, weights, masks)
-                    jax.block_until_ready(pg)
-                    per_track_pixel_grad[tname].append(
-                        [np.array(a, dtype=np.float32) for a in pg]
-                    )
-                    per_track_pixel_loss[tname].append(
-                        [np.array((np.array(s, dtype=np.float32) - np.array(g, dtype=np.float32))**2)
-                         for s, g in zip(fwd_out, gt_arrays)]
-                    )
+        # Build masks for this cutoff and attach to per_track_data
+        per_track_data = []
+        for name, deposits, gt_arrays, weights in per_track_base:
+            masks = tuple(
+                jnp.ones(a.shape, dtype=bool) if cutoff == 0.0
+                else (jnp.abs(a) >= cutoff)
+                for a in gt_arrays
+            )
+            if cutoff > 0.0:
+                n_total_px  = sum(m.size for m in masks)
+                n_masked_px = sum(int(jnp.sum(~m)) for m in masks)
+                print(f'  {name}: {n_masked_px:,}/{n_total_px:,} pixels zeroed '
+                      f'({100 * n_masked_px / n_total_px:.1f}%)')
+            per_track_data.append((name, deposits, gt_arrays, weights, masks))
 
-        elapsed = time.time() - t0
-        total_loss_vals.append(total_loss)
-        total_grad_vals.append(total_grad)
-        grad_times_s.append(elapsed)
+        # Per-cutoff accumulators
+        if args.store_arrays:
+            per_track_sim_arrays = {name: [] for name, *_ in per_track_data}
+        if args.store_per_pixel_loss_and_grad:
+            per_track_pixel_loss = {name: [] for name, *_ in per_track_data}
+            per_track_pixel_grad = {name: [] for name, *_ in per_track_data}
+        if args.store_per_plane_loss:
+            per_plane_loss_values = {
+                name: {pname: [] for pname in plane_names_all}
+                for name, *_ in per_track_data
+            }
 
-        marker = ' ← GT' if factor == 1.0 else ''
-        print(f'  [{i + 1:2d}/{len(factors)}] factor={factor:.6f}  '
-              f'p_n={p_n:.6f}  {args.param}={pval:.6g}  '
-              f'loss={total_loss:.4e}  grad={total_grad:+.4e}  '
-              f'({elapsed * 1e3:.0f} ms){marker}')
+        per_track_loss  = {name: [] for name, *_ in per_track_data}
+        per_track_grad  = {name: [] for name, *_ in per_track_data}
+        total_loss_vals = []
+        total_grad_vals = []
+        grad_times_s    = []
 
-    result = dict(
-        param_name             = args.param,
-        param_gt               = param_gt,
-        scale                  = scale,
-        p_n_gt                 = p_n_gt,
-        param_values           = list(param_values),
-        p_n_values             = list(p_n_values),
-        factors                = list(factors),
-        loss_values            = total_loss_vals,
-        grad_values            = total_grad_vals,
-        grad_times_s           = grad_times_s,
-        per_track_loss_values  = per_track_loss,
-        per_track_grad_values  = per_track_grad,
-        loss_name              = loss_name,
-        N                      = args.N,
-        range_frac             = args.range_frac,
-        track_specs            = track_specs,
-        noise_scale            = args.noise_scale,
-        noise_seed             = args.noise_seed,
-        adc_cutoff             = args.adc_cutoff,
-        sobolev_max_pad        = args.sobolev_max_pad,
-        fixed_param            = args.fixed_param,
-        fixed_value            = args.fixed_value,
-        plane_names            = plane_names_all,
-    )
-    if args.store_arrays:
-        result['per_track_gt_arrays']  = per_track_gt_arrays
-        result['per_track_sim_arrays'] = per_track_sim_arrays
+        for i, (factor, p_n, pval) in enumerate(zip(factors, p_n_values, param_values)):
+            p_n_arr = jnp.array(float(p_n))
+            t0      = time.time()
 
-    if args.store_per_pixel_loss_and_grad:
-        result['per_track_pixel_loss'] = per_track_pixel_loss
-        result['per_track_pixel_grad'] = per_track_pixel_grad
+            total_loss = 0.0
+            total_grad = 0.0
+            for tname, dep, gt_arrays, weights, masks in per_track_data:
+                lv, gv = vag_fn(p_n_arr, dep, gt_arrays, weights, masks)
+                jax.block_until_ready((lv, gv))
+                lv, gv = float(lv), float(gv)
+                per_track_loss[tname].append(lv)
+                per_track_grad[tname].append(gv)
+                total_loss += lv
+                total_grad += gv
+                need_fwd = args.store_arrays or args.store_per_pixel_loss_and_grad or args.store_per_plane_loss
+                if need_fwd:
+                    fwd_out = simulator.forward(_make_params(p_n_arr), dep)
+                    jax.block_until_ready(fwd_out)
+                    if args.store_arrays:
+                        per_track_sim_arrays[tname].append(
+                            [np.array(a, dtype=np.float32) for a in fwd_out]
+                        )
+                    if args.store_per_pixel_loss_and_grad:
+                        pg = pixel_grad_fn(fwd_out, gt_arrays, weights, masks)
+                        jax.block_until_ready(pg)
+                        per_track_pixel_grad[tname].append(
+                            [np.array(a, dtype=np.float32) for a in pg]
+                        )
+                        per_track_pixel_loss[tname].append(
+                            [np.array((np.array(s, dtype=np.float32) - np.array(g, dtype=np.float32))**2)
+                             for s, g in zip(fwd_out, gt_arrays)]
+                        )
+                    if args.store_per_plane_loss:
+                        for pi, pname in enumerate(plane_names_all):
+                            sim_m = jnp.where(masks[pi], fwd_out[pi], 0.0)
+                            gt_m  = jnp.where(masks[pi], gt_arrays[pi], 0.0)
+                            per_plane_loss_values[tname][pname].append(
+                                float(_plane_loss_jit(sim_m, gt_m, weights[pi]))
+                            )
 
-    with open(output_path, 'wb') as f:
-        pickle.dump(result, f)
-    print(f'\nSaved: {output_path}')
-    print('Done.')
+            elapsed = time.time() - t0
+            total_loss_vals.append(total_loss)
+            total_grad_vals.append(total_grad)
+            grad_times_s.append(elapsed)
+
+            marker = ' ← GT' if factor == 1.0 else ''
+            print(f'  [{i + 1:2d}/{len(factors)}] factor={factor:.6f}  '
+                  f'p_n={p_n:.6f}  {args.param}={pval:.6g}  '
+                  f'loss={total_loss:.4e}  grad={total_grad:+.4e}  '
+                  f'({elapsed * 1e3:.0f} ms){marker}')
+
+        result = dict(
+            param_name             = args.param,
+            param_gt               = param_gt,
+            scale                  = scale,
+            p_n_gt                 = p_n_gt,
+            param_values           = list(param_values),
+            p_n_values             = list(p_n_values),
+            factors                = list(factors),
+            loss_values            = total_loss_vals,
+            grad_values            = total_grad_vals,
+            grad_times_s           = grad_times_s,
+            per_track_loss_values  = per_track_loss,
+            per_track_grad_values  = per_track_grad,
+            loss_name              = loss_name,
+            N                      = args.N,
+            range_frac             = args.range_frac,
+            track_specs            = track_specs,
+            noise_scale            = args.noise_scale,
+            noise_seed             = args.noise_seed,
+            adc_cutoff             = cutoff,
+            sobolev_max_pad        = args.sobolev_max_pad,
+            fixed_param            = args.fixed_param,
+            fixed_value            = args.fixed_value,
+            plane_names            = plane_names_all,
+        )
+        if args.store_arrays:
+            result['per_track_gt_arrays']  = per_track_gt_arrays
+            result['per_track_sim_arrays'] = per_track_sim_arrays
+        if args.store_per_pixel_loss_and_grad:
+            result['per_track_pixel_loss'] = per_track_pixel_loss
+            result['per_track_pixel_grad'] = per_track_pixel_grad
+        if args.store_per_plane_loss:
+            result['per_plane_loss_values'] = per_plane_loss_values
+
+        with open(output_path, 'wb') as f:
+            pickle.dump(result, f)
+        print(f'Saved: {output_path}')
+
+    print('\nDone.')
 
 
 if __name__ == '__main__':

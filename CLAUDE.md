@@ -21,4 +21,3 @@ To invalidate the CloudFront cache, run 'aws cloudfront create-invalidation --di
 ## Syncing code to S3DF
 Run "bash slac_sync_code.sh" outside the sandbox
 
-
