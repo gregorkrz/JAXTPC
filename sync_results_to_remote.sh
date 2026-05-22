@@ -14,10 +14,12 @@ RESULTS_DIR="${RESULTS_DIR:-results}"
 PLOTS_DIR="${PLOTS_DIR:-plots}"
 
 echo "Syncing $PLOTS_DIR/ ..."
-aws s3 sync "$PLOTS_DIR/" "$BUCKET/plots/"
+aws s3 sync "$PLOTS_DIR/" "$BUCKET/plots/" \
+  --exclude "1d_gradients/diffusion_debug_*/viewer.html"
 
 echo "Syncing $RESULTS_DIR/ ..."
-aws s3 sync "$RESULTS_DIR/" "$BUCKET/results/"
+aws s3 sync "$RESULTS_DIR/" "$BUCKET/results/" \
+  --exclude "1d_gradients/diffusion_debug_*/*"
 
 echo "Syncing done"
 
