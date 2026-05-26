@@ -136,11 +136,13 @@ def _plot_row(axes, runs, cutoff_color, label_noise):
     ax_loss.legend(fontsize=7, ncol=2)
 
 
-def _make_per_param_figure(param_name, track_name, runs, output_dir, title_suffix=''):
+def _make_per_param_figure(param_name, track_name, runs, output_dir, title_suffix='', seed=None):
     """2-row (clean / noisy) × 3-column (loss, |grad|, grad) figure."""
     clean_runs = sorted([r for r in runs if r.get('noise_scale', 0.0) == 0.0],
                         key=lambda r: r.get('adc_cutoff', 0.0))
-    noisy_runs = sorted([r for r in runs if r.get('noise_scale', 0.0) > 0.0],
+    noisy_runs = sorted([r for r in runs
+                         if r.get('noise_scale', 0.0) > 0.0
+                         and (seed is None or r.get('noise_seed', 42) == seed)],
                         key=lambda r: r.get('adc_cutoff', 0.0))
 
     has_noise  = len(noisy_runs) > 0
@@ -166,16 +168,18 @@ def _make_per_param_figure(param_name, track_name, runs, output_dir, title_suffi
     range_frac = runs[0].get('range_frac', '?')
     loss_name  = runs[0].get('loss_name', '?')
     track_label = f'  |  track: {track_name}' if track_name else ''
+    seed_label  = f'  |  noise seed={seed}' if seed is not None else ''
     fig.suptitle(
-        f'{plabel}{track_label}{title_suffix}   |   {loss_name}   |   N={N}  ±{range_frac:.0%}\n'
+        f'{plabel}{track_label}{title_suffix}   |   {loss_name}   |   N={N}  ±{range_frac:.0%}{seed_label}\n'
         f'ADC cutoff comparison  ({len(cutoffs)} cutoffs: {cutoffs})',
         fontsize=12,
     )
     fig.tight_layout()
 
     os.makedirs(output_dir, exist_ok=True)
-    safe_track = track_name.replace('/', '_')
-    out = os.path.join(output_dir, f'sobolev_cutoff_{param_name}_{safe_track}.pdf')
+    safe_track  = track_name.replace('/', '_')
+    seed_suffix = f'_seed{seed}' if seed is not None else ''
+    out = os.path.join(output_dir, f'sobolev_cutoff_{param_name}_{safe_track}{seed_suffix}.pdf')
     fig.savefig(out, bbox_inches='tight')
     plt.close(fig)
     print(f'  → {out}')
@@ -212,13 +216,14 @@ def _aggregate_across_tracks(runs_per_track, param_name):
     return combined
 
 
-def _make_overlay_figure(by_param_track, all_track_names, output_dir):
+def _make_overlay_figure(by_param_track, all_track_names, output_dir, seed=None):
     """
     |Gradient| overlay figure.
 
     Rows: one per individual track + one 'combined' row.
     Columns: one per sweep parameter.
     solid = clean GT, dashed = noisy GT.
+    If seed is given, only noisy runs with that noise_seed are shown.
     """
     param_list  = sorted(by_param_track.keys())
     track_order = sorted(all_track_names)
@@ -252,6 +257,8 @@ def _make_overlay_figure(by_param_track, all_track_names, output_dir):
                                                         r.get('adc_cutoff', 0.0))):
                 cutoff      = run.get('adc_cutoff', 0.0)
                 noise_scale = run.get('noise_scale', 0.0)
+                if noise_scale > 0.0 and seed is not None and run.get('noise_seed', 42) != seed:
+                    continue
                 color       = cutoff_color[cutoff]
                 ls          = '--' if noise_scale > 0.0 else '-'
                 noise_tag   = f'  σ={noise_scale:.3g}' if noise_scale > 0.0 else ''
@@ -271,27 +278,32 @@ def _make_overlay_figure(by_param_track, all_track_names, output_dir):
                 ax.set_title(PARAM_LABELS.get(param_name, param_name), fontsize=11)
             ax.set_ylabel(f'{row_label}\n|∂L / ∂pₙ|', fontsize=8)
 
+    seed_label  = f'  |  noise seed={seed}' if seed is not None else ''
     fig.suptitle(
-        '|Gradient| vs. factor  —  ADC cutoff comparison\n'
-        'solid = clean GT   dashed = noisy GT',
+        f'|Gradient| vs. factor  —  ADC cutoff comparison\n'
+        f'solid = clean GT   dashed = noisy GT{seed_label}',
         fontsize=13,
     )
     fig.tight_layout()
 
     os.makedirs(output_dir, exist_ok=True)
-    out = os.path.join(output_dir, 'sobolev_cutoff_grad_overlay.pdf')
+    seed_suffix = f'_seed{seed}' if seed is not None else ''
+    out = os.path.join(output_dir, f'sobolev_cutoff_grad_overlay{seed_suffix}.pdf')
     fig.savefig(out, bbox_inches='tight')
     plt.close(fig)
     print(f'  → {out}')
 
 
-def _make_summary_noise_figure(by_param_track, all_track_names, output_dir):
+def _make_summary_noise_figure(by_param_track, all_track_names, output_dir, seed=None):
     """
     Summary: noisy-GT loss landscape for every track + combined.
 
     Rows: one per individual track (sorted) + 'combined'.
     Columns: D⊥ (trans) left, D∥ (long) right (or whatever two params exist).
     Each cell: loss vs. factor curves, one per ADC cutoff (viridis, log y).
+
+    If seed is given, only noisy runs with that noise_seed are included and the
+    output file is named sobolev_cutoff_summary_noise_seed{seed}.pdf.
     """
     # Put trans before long for the column order; fall back to sorted for other params.
     def _param_sort_key(p):
@@ -316,6 +328,13 @@ def _make_summary_noise_figure(by_param_track, all_track_names, output_dir):
                              figsize=(8 * n_cols, 3.5 * n_rows),
                              squeeze=False)
 
+    def _is_noisy_seed(r):
+        if r.get('noise_scale', 0.0) == 0.0:
+            return False
+        if seed is not None and r.get('noise_seed', 42) != seed:
+            return False
+        return True
+
     for col, param_name in enumerate(param_list):
         runs_per_track  = by_param_track[param_name]
         combined_runs   = _aggregate_across_tracks(runs_per_track, param_name)
@@ -324,7 +343,7 @@ def _make_summary_noise_figure(by_param_track, all_track_names, output_dir):
             ax = axes[row, col]
             src = (combined_runs if row_label == 'combined'
                    else runs_per_track.get(row_label, []))
-            noisy_runs = sorted([r for r in src if r.get('noise_scale', 0.0) > 0.0],
+            noisy_runs = sorted([r for r in src if _is_noisy_seed(r)],
                                 key=lambda r: r.get('adc_cutoff', 0.0))
 
             for run in noisy_runs:
@@ -349,16 +368,19 @@ def _make_summary_noise_figure(by_param_track, all_track_names, output_dir):
                         for pt in by_param_track.values()
                         for runs in pt.values()
                         for r in runs if r.get('noise_scale', 0.0) > 0.0), 1.0)
+    seed_label = f'  |  noise seed={seed}' if seed is not None else ''
     fig.suptitle(
         f'Loss landscape — noisy GT (σ={noise_scale:.3g}) — ADC cutoff comparison\n'
         f'{n_tracks} tracks + combined   |   '
-        f'{len(cutoffs)} cutoffs: {cutoffs}',
+        f'{len(cutoffs)} cutoffs: {cutoffs}{seed_label}',
         fontsize=12,
+        y=1.0,
     )
-    fig.tight_layout()
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
 
     os.makedirs(output_dir, exist_ok=True)
-    out = os.path.join(output_dir, 'sobolev_cutoff_summary_noise.pdf')
+    seed_suffix = f'_seed{seed}' if seed is not None else ''
+    out = os.path.join(output_dir, f'sobolev_cutoff_summary_noise{seed_suffix}.pdf')
     fig.savefig(out, bbox_inches='tight')
     plt.close(fig)
     print(f'  → {out}')
@@ -386,26 +408,32 @@ def main():
     print(f'Found params : {sorted(by_param_track.keys())}')
     print()
 
-    for param_name, runs_per_track in sorted(by_param_track.items()):
-        for track_name, runs in sorted(runs_per_track.items()):
-            n_clean = sum(1 for r in runs if r.get('noise_scale', 0.0) == 0.0)
-            n_noisy = len(runs) - n_clean
-            print(f'Plotting {param_name}  track={track_name}'
-                  f'  ({n_clean} clean + {n_noisy} noisy runs) …')
-            _make_per_param_figure(param_name, track_name, runs, output_dir)
+    noisy_seeds = sorted({r.get('noise_seed', 42) for r in results
+                          if r.get('noise_scale', 0.0) > 0.0})
 
-        # Combined figure (sum across all tracks)
-        combined_runs = _aggregate_across_tracks(runs_per_track, param_name)
-        n_tracks = len(runs_per_track)
-        print(f'Plotting {param_name}  combined ({n_tracks} tracks) …')
-        _make_per_param_figure(param_name, 'combined', combined_runs, output_dir,
-                               title_suffix=f'  |  {n_tracks} tracks summed')
+    for seed in noisy_seeds:
+        print(f'\n── seed={seed} ──')
+        for param_name, runs_per_track in sorted(by_param_track.items()):
+            for track_name, runs in sorted(runs_per_track.items()):
+                n_clean = sum(1 for r in runs if r.get('noise_scale', 0.0) == 0.0)
+                n_noisy = sum(1 for r in runs
+                              if r.get('noise_scale', 0.0) > 0.0
+                              and r.get('noise_seed', 42) == seed)
+                print(f'Plotting {param_name}  track={track_name}'
+                      f'  ({n_clean} clean + {n_noisy} noisy runs) …')
+                _make_per_param_figure(param_name, track_name, runs, output_dir, seed=seed)
 
-    print('Plotting gradient overlay …')
-    _make_overlay_figure(by_param_track, all_track_names, output_dir)
+            combined_runs = _aggregate_across_tracks(runs_per_track, param_name)
+            n_tracks = len(runs_per_track)
+            print(f'Plotting {param_name}  combined ({n_tracks} tracks) …')
+            _make_per_param_figure(param_name, 'combined', combined_runs, output_dir,
+                                   title_suffix=f'  |  {n_tracks} tracks summed', seed=seed)
 
-    print('Plotting noise summary …')
-    _make_summary_noise_figure(by_param_track, all_track_names, output_dir)
+        print(f'Plotting gradient overlay for seed={seed} …')
+        _make_overlay_figure(by_param_track, all_track_names, output_dir, seed=seed)
+
+        print(f'Plotting noise summary for seed={seed} …')
+        _make_summary_noise_figure(by_param_track, all_track_names, output_dir, seed=seed)
 
     print(f'\nDone.  Figures in {output_dir}')
 

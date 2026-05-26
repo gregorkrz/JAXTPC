@@ -243,6 +243,15 @@ button{padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:1
 .min-tbl th.trk-hdr{text-align:left}
 .min-tbl td{padding:6px 12px;border:1px solid #ddd;text-align:center;font-family:monospace;font-size:12px}
 .min-tbl td.trk-lbl{text-align:left;font-family:inherit;font-weight:500;background:#fafafa}
+/* ── min-factor vs cutoff tab ── */
+#minfactor-view{background:#fff;display:flex;flex-direction:column}
+/* ── seed ensemble tab ── */
+#seeds-view{flex:1;flex-direction:column;min-height:0;overflow:hidden;background:#fff}
+.mf-bar{display:flex;align-items:center;gap:10px;padding:7px 12px;background:#fafafa;border-bottom:1px solid #ddd;flex-wrap:wrap;flex-shrink:0}
+.mf-section{padding:10px 12px 8px}
+.mf-section-hdr{font-size:11px;font-weight:700;color:#888;text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px}
+.mf-row{display:flex;gap:8px}
+.mf-plot{flex:1;min-width:0;height:400px}
 </style>
 </head>
 <body>
@@ -250,6 +259,10 @@ button{padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:1
 
 <!-- ══ Left panel ══════════════════════════════════════════════════════════ -->
 <div id="left">
+
+  <div class="sec" style="padding:8px 12px">
+    <button id="btn-copy" onclick="copyLink()" style="width:100%;padding:6px;background:#e8f5e9;color:#2e7d32;border:1px solid #a5d6a7;border-radius:4px;cursor:pointer;font-size:12px;font-weight:500">Copy sharable link</button>
+  </div>
 
   <div class="sec">
     <h3>Filters</h3>
@@ -301,8 +314,10 @@ button{padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:1
 <!-- ══ Right panel ══════════════════════════════════════════════════════════ -->
 <div id="right">
   <div id="right-tab-bar">
-    <button class="rtab active" id="rtab-plots" onclick="setRightTab('plots')">Plots</button>
-    <button class="rtab"        id="rtab-table" onclick="setRightTab('table')">Min. factor table</button>
+    <button class="rtab active" id="rtab-plots"     onclick="setRightTab('plots')">Plots</button>
+    <button class="rtab"        id="rtab-table"     onclick="setRightTab('table')">Min. factor table</button>
+    <button class="rtab"        id="rtab-minfactor" onclick="setRightTab('minfactor')">Min-factor vs Cutoff</button>
+    <button class="rtab"        id="rtab-seeds"     onclick="setRightTab('seeds')">Seed ensemble</button>
   </div>
   <div id="plot-bar">
     <span class="bar-lbl">Quantity:</span>
@@ -338,6 +353,57 @@ button{padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:1
     </div>
   </div>
   <div id="table-view" style="display:none;flex:1;overflow:auto;padding:16px"></div>
+
+  <!-- Min-factor vs Cutoff tab -->
+  <div id="minfactor-view" style="display:none;flex:1;overflow-y:auto">
+    <!-- top bar -->
+    <div class="mf-bar">
+      <span class="bar-lbl">Noise/Seed:</span>
+      <select id="mf-ns-sel" style="width:auto;min-width:140px;margin:0"></select>
+      <span class="bar-lbl" style="margin-left:8px">Plane group (groups plot):</span>
+      <div class="tab-bar" id="mf-plane-tabs" style="margin:0">
+        <button class="tab active" data-pg="all" onclick="setMfPlaneGroup('all')">All</button>
+        <button class="tab" data-pg="U"   onclick="setMfPlaneGroup('U')">U</button>
+        <button class="tab" data-pg="V"   onclick="setMfPlaneGroup('V')">V</button>
+        <button class="tab" data-pg="Y"   onclick="setMfPlaneGroup('Y')">Y</button>
+      </div>
+    </div>
+    <!-- fixed groups section -->
+    <div class="mf-section">
+      <div class="mf-section-hdr">Track groups — factor at loss minimum vs ADC cutoff</div>
+      <div id="mf-fixed-row" class="mf-row"></div>
+    </div>
+    <hr style="margin:0 12px">
+    <!-- custom section -->
+    <div style="display:flex;gap:12px;padding:10px 12px">
+      <div style="width:210px;flex-shrink:0">
+        <div class="mf-section-hdr">Custom selection</div>
+        <div style="font-size:11px;color:#888;margin-bottom:3px">Wire planes</div>
+        <select id="mf-custom-plane-sel" style="width:100%;margin-bottom:8px" onchange="renderMfCustom()">
+          <option value="all">All</option>
+          <option value="U">U (U1+U2)</option>
+          <option value="V">V (V1+V2)</option>
+          <option value="Y">Y (Y1+Y2)</option>
+        </select>
+        <div style="font-size:11px;color:#888;margin-bottom:3px">Tracks</div>
+        <div class="quick-row">
+          <button class="btn-sm quick-btn" onclick="mfSelAll()">All</button>
+          <button class="btn-sm quick-btn none" onclick="mfSelNone()">None</button>
+        </div>
+        <div id="mf-track-checks" class="scrollable" style="max-height:320px"></div>
+      </div>
+      <div style="flex:1;min-width:0">
+        <div class="mf-section-hdr">Custom tracks — factor at loss minimum vs ADC cutoff</div>
+        <div id="mf-custom-row" class="mf-row"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="seeds-view" style="display:none">
+    <div class="col-header" style="flex-shrink:0">Seed ensemble <span style="font-weight:400;color:#aaa;text-transform:none;font-size:11px">— all seeds, individual points + mean ± 1σ band</span></div>
+    <div id="seeds-plot" style="flex:1;min-height:0"></div>
+  </div>
+
 </div>
 
 </div><!-- /#app -->
@@ -367,8 +433,10 @@ let fCutoff  = DATA.cutoff_options[0] || 0.0;
 
 let series   = [];
 let colorIdx = 0;
+let _noiseSeedOptions = [];
 let liveInited = false;
 let canvasInited = false;
+let seedsInited = false;
 let rightTab = 'plots';
 
 function nextColor() { return PALETTE[colorIdx++ % PALETTE.length]; }
@@ -463,7 +531,7 @@ function buildFilters() {
   /* combined noise + seed dropdown */
   const ns = document.getElementById('sel-noise-seed');
   ns.innerHTML = '';
-  const _noiseSeedOptions = [];
+  _noiseSeedOptions = [];
   if (DATA.noise_options.includes(0.0)) {
     _noiseSeedOptions.push({ noise: 0.0, seed: null, label: 'No noise' });
   }
@@ -504,7 +572,7 @@ function buildCheckboxes() {
   DATA.all_tracks.forEach(t => {
     const lbl = document.createElement('label'); lbl.className = 'ck';
     const cb  = document.createElement('input'); cb.type = 'checkbox'; cb.id = 'ck-t-' + sid(t); cb.checked = true;
-    cb.onchange = renderLivePlot;
+    cb.onchange = () => { renderLivePlot(); if (rightTab === 'seeds') renderSeedsPlot(); saveState(); };
     lbl.appendChild(cb); lbl.appendChild(document.createTextNode(' ' + t));
     td.appendChild(lbl);
   });
@@ -517,7 +585,7 @@ function buildCheckboxes() {
   DATA.all_planes.forEach(p => {
     const lbl = document.createElement('label'); lbl.className = 'ck';
     const cb  = document.createElement('input'); cb.type = 'checkbox'; cb.id = 'ck-p-' + sid(p); cb.checked = true;
-    cb.onchange = renderLivePlot;
+    cb.onchange = () => { renderLivePlot(); if (rightTab === 'seeds') renderSeedsPlot(); saveState(); };
     lbl.appendChild(cb); lbl.appendChild(document.createTextNode(' ' + p));
     pd.appendChild(lbl);
   });
@@ -527,33 +595,42 @@ function selAll(kind) {
   const items = kind === 'track' ? DATA.all_tracks : DATA.all_planes;
   const prefix = kind === 'track' ? 'ck-t-' : 'ck-p-';
   items.forEach(x => { const el = document.getElementById(prefix + sid(x)); if (el) el.checked = true; });
-  renderLivePlot();
+  renderLivePlot(); if (rightTab === 'seeds') renderSeedsPlot(); saveState();
 }
 function selNone(kind) {
   const items = kind === 'track' ? DATA.all_tracks : DATA.all_planes;
   const prefix = kind === 'track' ? 'ck-t-' : 'ck-p-';
   items.forEach(x => { const el = document.getElementById(prefix + sid(x)); if (el) el.checked = false; });
-  renderLivePlot();
+  renderLivePlot(); if (rightTab === 'seeds') renderSeedsPlot(); saveState();
 }
 
 function onFilt() {
   const run = getRun(fParam, fNoise, fSeed, fCutoff);
   document.getElementById('no-run-warn').style.display = run ? 'none' : '';
-  if (rightTab === 'plots') renderLivePlot();
-  else renderMinTable();
+  if      (rightTab === 'plots') renderLivePlot();
+  else if (rightTab === 'seeds') renderSeedsPlot();
+  else if (rightTab === 'table') renderMinTable();
+  saveState();
 }
 
 /* ─────────────────────────────── right tab ─────────────────────────────── */
 function setRightTab(tab) {
   rightTab = tab;
   const isPlots = tab === 'plots';
-  document.getElementById('plots-row').style.display  = isPlots ? '' : 'none';
-  document.getElementById('plot-bar').style.display   = isPlots ? '' : 'none';
-  document.getElementById('table-view').style.display = isPlots ? 'none' : '';
-  ['plots','table'].forEach(k =>
+  const isMf    = tab === 'minfactor';
+  const isSeeds = tab === 'seeds';
+  document.getElementById('plots-row').style.display       = isPlots ? '' : 'none';
+  document.getElementById('plot-bar').style.display        = (isPlots || isSeeds) ? '' : 'none';
+  document.getElementById('table-view').style.display      = tab === 'table' ? '' : 'none';
+  document.getElementById('minfactor-view').style.display  = isMf ? '' : 'none';
+  document.getElementById('seeds-view').style.display      = isSeeds ? 'flex' : 'none';
+  ['plots','table','minfactor','seeds'].forEach(k =>
     document.getElementById('rtab-'+k).classList.toggle('active', k===tab));
-  if (!isPlots) renderMinTable();
-  else { renderLivePlot(); renderCanvas(); }
+  if (isPlots)       { renderLivePlot(); renderCanvas(); }
+  else if (tab === 'table') renderMinTable();
+  else if (isMf)     { if (!mfInited) initMfTab(); else { _mfRenderFixed(); renderMfCustom(); } }
+  else if (isSeeds)  renderSeedsPlot();
+  saveState();
 }
 
 /* ─────────────────────────────── min-factor table ─────────────────────────────── */
@@ -654,18 +731,21 @@ function addSeries() {
   const label  = buildLabel(run, tracks, planes);
   const color  = nextColor();
 
-  series.push({ id: colorIdx - 1, label, color, vals });
+  series.push({ id: colorIdx - 1, label, color, vals,
+                spec: { param: fParam, noise: fNoise, seed: fSeed, cutoff: fCutoff, tracks, planes } });
   renderSeriesList();
   renderCanvas();
+  saveState();
 }
 
 function removeSeries(id) {
   series = series.filter(s => s.id !== id);
   renderSeriesList();
   renderCanvas();
+  saveState();
 }
 
-function clearAll() { series = []; colorIdx = 0; renderSeriesList(); renderCanvas(); }
+function clearAll() { series = []; colorIdx = 0; renderSeriesList(); renderCanvas(); saveState(); }
 
 function renderSeriesList() {
   const el    = document.getElementById('series-list');
@@ -798,7 +878,7 @@ function renderCanvas() {
 }
 
 /* ─────────────────────────────── toolbar toggles ─────────────────────────────── */
-function _renderBoth() { renderLivePlot(); renderCanvas(); }
+function _renderBoth() { renderLivePlot(); renderCanvas(); if (rightTab === 'seeds') renderSeedsPlot(); }
 
 function setQty(q) {
   qty = q;
@@ -808,6 +888,7 @@ function setQty(q) {
   if (q === 'grad' && yscale === 'log') { yscale='lin'; _syncYscale(); }
   logBtn.disabled = (q === 'grad');
   _renderBoth();
+  saveState();
 }
 
 function setXax(x) {
@@ -815,12 +896,14 @@ function setXax(x) {
   ['factor','param'].forEach(k =>
     document.getElementById('xax-'+k).classList.toggle('active', k===x));
   _renderBoth();
+  saveState();
 }
 
 function setYscale(s) {
   yscale = s;
   _syncYscale();
   _renderBoth();
+  saveState();
 }
 function _syncYscale() {
   ['log','lin'].forEach(k =>
@@ -832,14 +915,408 @@ function setBandMode(m) {
   ['none','range'].forEach(k =>
     document.getElementById('band-'+k).classList.toggle('active', k===m));
   renderCanvas();
+  saveState();
+}
+
+/* ─────────────────────────────── URL state persistence ─────────────────────────────── */
+function _encState(obj) {
+  try { return btoa(unescape(encodeURIComponent(JSON.stringify(obj)))); } catch(e) { return ''; }
+}
+function _decState(s) {
+  try { return JSON.parse(decodeURIComponent(escape(atob(s)))); } catch(e) { return null; }
+}
+
+function saveState() {
+  const state = {
+    v:1, qty, xax, ys:yscale, bm:bandMode, rt:rightTab,
+    fp:fParam, fn:fNoise, fs:fSeed, fc:fCutoff,
+    trk:getSelectedTracks(),
+    pln:getSelectedPlanes(),
+    ser:series.map(s=>({
+      p:s.spec.param, n:s.spec.noise, sd:s.spec.seed,
+      c:s.spec.cutoff, t:s.spec.tracks, pl:s.spec.planes, clr:s.color
+    }))
+  };
+  const enc = _encState(state);
+  if (enc) window.location.hash = enc;
+}
+
+function loadState() {
+  const raw = window.location.hash.slice(1);
+  if (!raw) return false;
+  const st = _decState(raw);
+  if (!st || st.v !== 1) return false;
+
+  if (st.qty) qty = st.qty;
+  if (st.xax) xax = st.xax;
+  if (st.ys)  yscale = st.ys;
+  if (st.bm)  bandMode = st.bm;
+  if (st.rt)  rightTab = st.rt;
+  if (st.fp)  fParam = st.fp;
+  if (st.fn !== undefined) fNoise  = st.fn;
+  if (st.fs !== undefined) fSeed   = st.fs;
+  if (st.fc !== undefined) fCutoff = st.fc;
+
+  // Sync filter selects
+  const sp = document.getElementById('sel-param');
+  if (sp) sp.value = fParam;
+  const ns = document.getElementById('sel-noise-seed');
+  if (ns) {
+    const idx = _noiseSeedOptions.findIndex(o =>
+      Math.abs(o.noise - fNoise) < 1e-9 && (o.seed === null || o.seed === fSeed));
+    if (idx >= 0) ns.value = idx;
+  }
+  const sc = document.getElementById('sel-cutoff');
+  if (sc) sc.value = fCutoff;
+
+  // Sync track checkboxes
+  if (st.trk) {
+    DATA.all_tracks.forEach(t => {
+      const el = document.getElementById('ck-t-' + sid(t));
+      if (el) el.checked = st.trk.includes(t);
+    });
+  }
+  // Sync plane checkboxes
+  if (st.pln) {
+    DATA.all_planes.forEach(p => {
+      const el = document.getElementById('ck-p-' + sid(p));
+      if (el) el.checked = st.pln.includes(p);
+    });
+  }
+
+  // Sync toolbar button states
+  ['loss','absgrad','grad'].forEach(k => document.getElementById('qty-'+k)?.classList.toggle('active', k===qty));
+  ['factor','param'].forEach(k => document.getElementById('xax-'+k)?.classList.toggle('active', k===xax));
+  ['log','lin'].forEach(k => document.getElementById('ys-'+k)?.classList.toggle('active', k===yscale));
+  ['none','range'].forEach(k => document.getElementById('band-'+k)?.classList.toggle('active', k===bandMode));
+  ['plots','table','minfactor','seeds'].forEach(k => document.getElementById('rtab-'+k)?.classList.toggle('active', k===rightTab));
+  const isPlots = rightTab === 'plots';
+  const isSeeds = rightTab === 'seeds';
+  document.getElementById('plots-row').style.display       = isPlots ? '' : 'none';
+  document.getElementById('plot-bar').style.display        = (isPlots || isSeeds) ? '' : 'none';
+  document.getElementById('table-view').style.display      = rightTab === 'table' ? '' : 'none';
+  document.getElementById('minfactor-view').style.display  = rightTab === 'minfactor' ? '' : 'none';
+  document.getElementById('seeds-view').style.display      = isSeeds ? 'flex' : 'none';
+  const logBtn = document.getElementById('ys-log');
+  if (logBtn) logBtn.disabled = (qty === 'grad');
+
+  // Restore series
+  if (st.ser && st.ser.length > 0) {
+    series = []; colorIdx = 0;
+    st.ser.forEach(ss => {
+      const run = getRun(ss.p, ss.n, ss.sd, ss.c);
+      if (!run) return;
+      const tracks = ss.t || [];
+      const planes = ss.pl || [];
+      const vals   = computeVals(run, tracks, planes);
+      const label  = buildLabel(run, tracks, planes);
+      series.push({ id: colorIdx, label, color: ss.clr, vals,
+                    spec: { param: ss.p, noise: ss.n, seed: ss.sd,
+                            cutoff: ss.c, tracks, planes } });
+      colorIdx++;
+    });
+  }
+  return true;
+}
+
+function copyLink() {
+  const url = window.location.href;
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(url).then(() => {
+      const btn = document.getElementById('btn-copy');
+      const orig = btn.textContent;
+      btn.textContent = 'Copied!';
+      setTimeout(() => { btn.textContent = orig; }, 1500);
+    }).catch(() => prompt('Copy this link:', url));
+  } else {
+    prompt('Copy this link:', url);
+  }
+}
+
+/* ─────────────────────────────── Seed ensemble tab ─────────────────────────────── */
+function renderSeedsPlot() {
+  const el = document.getElementById('seeds-plot');
+  if (!el) return;
+
+  const xTitle = xax === 'factor' ? 'Factor  (param / GT)' : 'Parameter value';
+  const yTitle = { loss: 'Loss', absgrad: '|∂L/∂p|', grad: '∂L/∂p' }[qty];
+  const layout = _baseLayout(yTitle, xTitle);
+  const cfg    = { responsive: true };
+
+  // All runs for current (param, noise_scale, cutoff) regardless of seed
+  const matchRuns = DATA.runs.filter(r =>
+    r.param_name === fParam &&
+    Math.abs(r.noise_scale - fNoise) < 1e-9 &&
+    Math.abs(r.adc_cutoff  - fCutoff) < 1e-9
+  ).sort((a, b) => a.noise_seed - b.noise_seed);
+
+  const tracks = getSelectedTracks();
+  const planes = getSelectedPlanes();
+  const traces = [];
+
+  const _flush = () => {
+    if (!seedsInited) { Plotly.newPlot('seeds-plot', traces, layout, cfg); seedsInited = true; }
+    else               { Plotly.react('seeds-plot', traces, layout, cfg); }
+  };
+
+  if (matchRuns.length === 0 || tracks.length === 0) { _flush(); return; }
+
+  const allVals = matchRuns.map(r => ({
+    seed: r.noise_seed, v: computeVals(r, tracks, planes)
+  }));
+
+  const refX   = allVals[0].v[xax === 'factor' ? 'factors' : 'param_values'];
+  const n      = refX.length;
+  const getY   = v => qty === 'loss' ? v.loss : qty === 'absgrad' ? v.absgrad : v.grad;
+  const yArrs  = allVals.map(d => getY(d.v));
+
+  if (allVals.length < 2) {
+    // Single seed or clean — just a line
+    const label = fNoise === 0 ? 'clean' : `seed ${allVals[0].seed}`;
+    traces.push({ x: refX, y: yArrs[0], mode: 'lines+markers', type: 'scatter',
+                  name: label, line: { color: '#1565C0', width: 2.5 },
+                  marker: { color: '#1565C0', size: 5 } });
+    _flush(); return;
+  }
+
+  // Mean and std
+  const yMean = new Array(n).fill(0);
+  const yStd  = new Array(n).fill(0);
+  for (let i = 0; i < n; i++) {
+    const vals = yArrs.map(y => y[i]);
+    const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
+    yMean[i]   = mean;
+    yStd[i]    = Math.sqrt(vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length);
+  }
+  const yHi = yMean.map((m, i) => m + yStd[i]);
+  const yLo = yMean.map((m, i) => m - yStd[i]);
+
+  // ± 1σ band
+  traces.push({
+    x: [...refX, ...[...refX].reverse()],
+    y: [...yHi, ...[...yLo].reverse()],
+    fill: 'toself', fillcolor: 'rgba(21,101,192,0.12)',
+    line: { color: 'transparent' },
+    name: 'mean ± 1σ', showlegend: true,
+    hoverinfo: 'skip', type: 'scatter'
+  });
+
+  // Individual seed dots (one trace per seed, distinct colors)
+  allVals.forEach((d, i) => {
+    const hex = PALETTE[i % PALETTE.length];
+    const [r, g, b] = hex.match(/[\da-f]{2}/gi).slice(0, 3).map(h => parseInt(h, 16));
+    traces.push({
+      x: refX, y: yArrs[i],
+      mode: 'markers', type: 'scatter',
+      name: `seed ${d.seed}`,
+      marker: { size: 6, color: `rgba(${r},${g},${b},0.55)` },
+      showlegend: true,
+    });
+  });
+
+  // Mean line (on top)
+  traces.push({
+    x: refX, y: yMean,
+    mode: 'lines', type: 'scatter',
+    name: 'mean',
+    line: { color: '#1565C0', width: 2.5 },
+    showlegend: true,
+  });
+
+  _flush();
+}
+
+/* ─────────────────────────────── Min-factor vs Cutoff tab ─────────────────────────────── */
+let mfNoise = 1.0, mfSeed = 42, mfPlaneGroup = 'all', mfInited = false;
+const _mfDivs = new Set();
+
+// Six predefined track groups
+const MF_GROUPS = [
+  { label:'FirstQuarter', color:'#1f77b4', fn: t =>  t.includes('_FirstQuarter') },
+  { label:'LastQuarter',  color:'#ff7f0e', fn: t =>  t.includes('_LastQuarter')  },
+  { label:'All 15',       color:'#2ca02c', fn: t => !t.includes('Quarter') },
+  { label:'1000 MeV',     color:'#d62728', fn: t => !t.includes('Quarter') && (t.includes('_1000MeV') || t === 'diagonal') },
+  { label:'500 MeV',      color:'#9467bd', fn: t => !t.includes('Quarter') && t.includes('_500MeV') },
+  { label:'100 MeV',      color:'#8c564b', fn: t => !t.includes('Quarter') && t.includes('_100MeV') },
+];
+
+// null → use per_track_loss (all planes); otherwise filter plane names by prefix
+function mfGetPlanes(group) {
+  if (!group || group === 'all') return null;
+  return DATA.all_planes.filter(p => p.toUpperCase().startsWith(group.toUpperCase()));
+}
+
+// Sum losses across tracks (geomean_log1p over planes, matching computeVals), return factor at argmin
+function mfMinFactor(run, tracks, planes) {
+  if (!tracks.length) return null;
+  const n = run.factors.length;
+  const loss = new Float64Array(n);
+  let ok = false;
+  for (const t of tracks) {
+    if (planes === null) {
+      const tl = run.per_track_loss[t];
+      if (!tl) continue;
+      for (let i = 0; i < n; i++) loss[i] += tl[i];
+      ok = true;
+    } else {
+      const ppl = run.per_plane_loss;
+      if (!ppl || !ppl[t]) continue;
+      const pds = planes.map(p => ppl[t][p]).filter(Boolean);
+      if (!pds.length) continue;
+      for (let i = 0; i < n; i++) {
+        let s = 0;
+        for (const pd of pds) s += Math.log1p(pd[i]);
+        loss[i] += Math.expm1(s / pds.length);
+      }
+      ok = true;
+    }
+  }
+  if (!ok) return null;
+  let mi = 0;
+  for (let i = 1; i < n; i++) if (loss[i] < loss[mi]) mi = i;
+  return run.factors[mi];
+}
+
+function mfRunsByCutoff(param, noise, seed) {
+  return DATA.runs.filter(r =>
+    r.param_name === param &&
+    Math.abs(r.noise_scale - noise) < 1e-9 &&
+    (noise < 1e-9 || r.noise_seed === seed)
+  ).sort((a,b) => a.adc_cutoff - b.adc_cutoff);
+}
+
+function _mfDo(divId, traces, layout) {
+  const cfg = { responsive:true };
+  if (_mfDivs.has(divId)) Plotly.react(divId, traces, layout, cfg);
+  else { Plotly.newPlot(divId, traces, layout, cfg); _mfDivs.add(divId); }
+}
+
+function _mfLayout(title) {
+  return {
+    title: { text:title, font:{size:13} },
+    xaxis: { title:'ADC cutoff', gridcolor:'#eee', zeroline:false },
+    yaxis: { title:'Factor at min loss (param/GT)', gridcolor:'#eee', zeroline:false },
+    shapes: [{ type:'line', x0:0, x1:1, y0:1, y1:1, xref:'paper', yref:'y',
+               line:{ color:'#555', width:1.5, dash:'dot' } }],
+    legend: { font:{size:11} },
+    margin: { t:40, b:52, l:76, r:16 },
+    paper_bgcolor:'#fff', plot_bgcolor:'#fcfcfc',
+    hovermode:'x unified',
+  };
+}
+
+// Create one div per parameter inside rowId if not already done
+function _mfEnsureRow(rowId, prefix) {
+  const row = document.getElementById(rowId);
+  if (!row || row.children.length) return;
+  DATA.params.forEach(p => {
+    const d = document.createElement('div');
+    d.id = prefix + sid(p);
+    d.className = 'mf-plot';
+    row.appendChild(d);
+  });
+}
+
+function _mfRenderFixed() {
+  _mfEnsureRow('mf-fixed-row', 'mf-fp-');
+  const planes = mfGetPlanes(mfPlaneGroup);
+  DATA.params.forEach(p => {
+    const runs = mfRunsByCutoff(p, mfNoise, mfSeed);
+    const xs   = runs.map(r => r.adc_cutoff);
+    const traces = MF_GROUPS.map(g => ({
+      x: xs,
+      y: runs.map(r => mfMinFactor(r, DATA.all_tracks.filter(g.fn), planes)),
+      name: g.label, type:'scatter', mode:'lines+markers', connectgaps:true,
+      line:{ color:g.color, width:2 }, marker:{ color:g.color, size:6 },
+    }));
+    const lbl = DATA.runs.find(r => r.param_name === p)?.param_label || p;
+    _mfDo('mf-fp-' + sid(p), traces, _mfLayout(lbl));
+  });
+}
+
+function renderMfCustom() {
+  _mfEnsureRow('mf-custom-row', 'mf-cp-');
+  const tracks = DATA.all_tracks.filter(t => {
+    const e = document.getElementById('mf-ck-' + sid(t)); return e && e.checked;
+  });
+  const pg     = document.getElementById('mf-custom-plane-sel')?.value || 'all';
+  const planes = mfGetPlanes(pg);
+  DATA.params.forEach(p => {
+    const runs = mfRunsByCutoff(p, mfNoise, mfSeed);
+    const xs   = runs.map(r => r.adc_cutoff);
+    const ys   = runs.map(r => mfMinFactor(r, tracks, planes));
+    const traces = tracks.length ? [{ x:xs, y:ys,
+      name:`${tracks.length} tracks [${pg}]`, type:'scatter', mode:'lines+markers', connectgaps:true,
+      line:{color:'#1565C0',width:2.5}, marker:{color:'#1565C0',size:7} }] : [];
+    const lbl = DATA.runs.find(r => r.param_name === p)?.param_label || p;
+    _mfDo('mf-cp-' + sid(p), traces, _mfLayout(lbl));
+  });
+}
+
+function setMfPlaneGroup(g) {
+  mfPlaneGroup = g;
+  document.querySelectorAll('#mf-plane-tabs .tab').forEach(b =>
+    b.classList.toggle('active', b.dataset.pg === g));
+  _mfRenderFixed();
+}
+
+function buildMfNoiseSel() {
+  const sel = document.getElementById('mf-ns-sel');
+  if (!sel) return;
+  sel.innerHTML = '';
+  _noiseSeedOptions.forEach((opt,i) => {
+    const o = document.createElement('option'); o.value = i; o.textContent = opt.label;
+    sel.appendChild(o);
+  });
+  // Try to find first noisy option as default; fall back to index 0
+  let idx = _noiseSeedOptions.findIndex(o => o.noise > 0 && Math.abs(o.seed - mfSeed) < 1e-9);
+  if (idx < 0) idx = _noiseSeedOptions.findIndex(o => o.noise > 0);
+  if (idx < 0) idx = 0;
+  sel.value = idx;
+  const initOpt = _noiseSeedOptions[idx];
+  if (initOpt) { mfNoise = initOpt.noise; if (initOpt.seed !== null) mfSeed = initOpt.seed; }
+  sel.onchange = () => {
+    const opt = _noiseSeedOptions[+sel.value];
+    mfNoise = opt.noise; if (opt.seed !== null) mfSeed = opt.seed;
+    _mfRenderFixed(); renderMfCustom();
+  };
+}
+
+function buildMfCheckboxes() {
+  const el = document.getElementById('mf-track-checks');
+  if (!el) return;
+  el.innerHTML = '';
+  DATA.all_tracks.forEach(t => {
+    const lbl = document.createElement('label'); lbl.className = 'ck';
+    const cb  = document.createElement('input'); cb.type = 'checkbox';
+    cb.id = 'mf-ck-' + sid(t); cb.checked = true;
+    cb.onchange = renderMfCustom;
+    lbl.appendChild(cb); lbl.appendChild(document.createTextNode(' ' + t));
+    el.appendChild(lbl);
+  });
+}
+
+function mfSelAll()  { DATA.all_tracks.forEach(t=>{const e=document.getElementById('mf-ck-'+sid(t));if(e)e.checked=true; }); renderMfCustom(); }
+function mfSelNone() { DATA.all_tracks.forEach(t=>{const e=document.getElementById('mf-ck-'+sid(t));if(e)e.checked=false;}); renderMfCustom(); }
+
+function initMfTab() {
+  buildMfNoiseSel();
+  buildMfCheckboxes();
+  _mfRenderFixed();
+  renderMfCustom();
+  mfInited = true;
 }
 
 /* ─────────────────────────────── init ─────────────────────────────── */
 window.addEventListener('load', () => {
   buildFilters();
   buildCheckboxes();
-  onFilt();   // calls renderLivePlot internally
+  loadState();   // applies URL hash state if present, no-op otherwise
+  onFilt();      // render live plot + update warning
+  renderSeriesList();
   renderCanvas();
+  if (rightTab === 'minfactor' && !mfInited) initMfTab();
+  else if (rightTab === 'seeds') renderSeedsPlot();
 });
 </script>
 </body>

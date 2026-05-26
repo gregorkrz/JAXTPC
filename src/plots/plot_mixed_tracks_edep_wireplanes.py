@@ -427,14 +427,126 @@ def write_dedx_distributions_pdf(specs, step_tracks, output_dir):
                 ax.set_ylabel('density' + (' (log)' if use_log else ''), fontsize=8)
             ax.tick_params(axis='both', labelsize=5)
             if row == 0:
-                short_name = name if len(name) <= 18 else name[:16] + '…'
-                ax.set_title(short_name, fontsize=6)
+                ax.set_title(name, fontsize=6)
             if i == 0 and row == 0:
                 ax.legend(fontsize=5)
 
     path = os.path.join(output_dir, 'dedx_distributions.pdf')
     fig.savefig(path, bbox_inches='tight')
     plt.close(fig)
+    print(f'  Saved {path}')
+
+
+def write_bragg_peak_pdf(specs, step_tracks, output_dir):
+    """dE/dx vs cumulative path length (Bragg peak) per track, step sizes overlaid.
+
+    Layout: 2 × ceil(N/3) rows × 3 columns — top half linear, bottom half log y-scale.
+    """
+    n_tracks = max(i for i, _ in step_tracks) + 1
+    n_cols = 3
+    n_data_rows = (n_tracks + n_cols - 1) // n_cols
+
+    fig, axes = plt.subplots(
+        2 * n_data_rows, n_cols,
+        figsize=(5.0 * n_cols, 3.2 * 2 * n_data_rows),
+        constrained_layout=True,
+    )
+    axes = np.asarray(axes).reshape(2 * n_data_rows, n_cols)
+    fig.suptitle('dE/dx vs path length (Bragg peak) — step sizes 0.1 / 0.5 / 1 mm\n'
+                 'top: linear  |  bottom: log y', fontsize=11)
+
+    for i in range(n_tracks):
+        data_row, col = divmod(i, n_cols)
+        name = specs[i]['name']
+        for use_log in (False, True):
+            ax = axes[2 * data_row + int(use_log), col]
+            for ss, color, lbl in zip(_STEP_SIZES_MM, _STEP_COLORS, _STEP_LABELS):
+                track = step_tracks[(i, ss)]
+                de = np.asarray(track['de'])
+                dx = np.asarray(track['dx'])
+                if len(de) == 0:
+                    continue
+                dedx = de / (dx / 10.0)
+                path_mm = np.cumsum(dx)
+                ax.plot(path_mm, dedx, color=color, label=lbl, linewidth=0.8, alpha=0.85)
+            if use_log:
+                ax.set_yscale('log')
+            ax.set_xlabel('path length (mm)', fontsize=7)
+            ax.set_ylabel('dE/dx (MeV/cm)' + (' (log)' if use_log else ''), fontsize=7)
+            ax.set_title(name, fontsize=8)
+            ax.tick_params(axis='both', labelsize=6)
+            if i == 0 and not use_log:
+                ax.legend(fontsize=6)
+
+    for i in range(n_tracks, n_data_rows * n_cols):
+        data_row, col = divmod(i, n_cols)
+        for use_log in (False, True):
+            axes[2 * data_row + int(use_log), col].set_visible(False)
+
+    path = os.path.join(output_dir, 'bragg_peak_dedx_vs_pathlen.pdf')
+    fig.savefig(path, bbox_inches='tight')
+    plt.close(fig)
+    print(f'  Saved {path}')
+
+
+def write_bragg_peak_html(specs, step_tracks, output_dir):
+    """Interactive Plotly: dE/dx vs path length for all tracks; toggle per track in legend.
+
+    One trace per (track, step_size). 0.5 mm and 1 mm traces start hidden (legendonly)
+    to keep the initial view readable. Click a legend group to show/hide all step sizes
+    for that track; click an individual entry to toggle just that step size.
+    """
+    n_tracks = max(i for i, _ in step_tracks) + 1
+
+    _PLOTLY_COLORS = [
+        '#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
+        '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf',
+        '#aec7e8', '#ffbb78', '#98df8a', '#ff9896', '#c5b0d5',
+    ]
+    _STEP_DASH = {1.0: 'solid', 0.5: 'dash', 0.1: 'dot'}
+
+    fig = go.Figure()
+    for i in range(n_tracks):
+        name = specs[i]['name']
+        color = _PLOTLY_COLORS[i % len(_PLOTLY_COLORS)]
+        first_in_group = True
+        for ss in _STEP_SIZES_MM:
+            track = step_tracks[(i, ss)]
+            de = np.asarray(track['de'])
+            dx = np.asarray(track['dx'])
+            if len(de) == 0:
+                continue
+            dedx = de / (dx / 10.0)
+            path_mm = np.cumsum(dx)
+            extra_kwargs = {}
+            if first_in_group:
+                extra_kwargs['legendgrouptitle_text'] = name
+                first_in_group = False
+            fig.add_trace(go.Scatter(
+                x=path_mm,
+                y=dedx,
+                mode='lines',
+                name=f'{ss} mm',
+                legendgroup=name,
+                line=dict(color=color, dash=_STEP_DASH[ss], width=1.5),
+                visible=True if ss == 0.1 else 'legendonly',
+                hovertemplate=(
+                    f'<b>{name}</b> ({ss} mm)<br>'
+                    'path=%{x:.1f} mm<br>dE/dx=%{y:.3f} MeV/cm<extra></extra>'
+                ),
+                **extra_kwargs,
+            ))
+
+    fig.update_layout(
+        title='dE/dx vs path length (Bragg peak) — click legend to toggle tracks / step sizes',
+        xaxis_title='path length (mm)',
+        yaxis_title='dE/dx (MeV/cm)',
+        legend=dict(groupclick='togglegroup', tracegroupgap=4),
+        hovermode='closest',
+        margin=dict(l=60, r=20, t=60, b=60),
+    )
+    path = os.path.join(output_dir, 'bragg_peak_dedx_vs_pathlen.html')
+    fig.write_html(path)
     print(f'  Saved {path}')
 
 
@@ -688,6 +800,8 @@ def main():
     step_tracks = _build_step_size_tracks(
         specs, tracks_raw, start_positions_used, cfg)
     write_dedx_distributions_pdf(specs, step_tracks, args.output_dir)
+    write_bragg_peak_pdf(specs, step_tracks, args.output_dir)
+    write_bragg_peak_html(specs, step_tracks, args.output_dir)
     write_coordinate_distributions_pdf(specs, step_tracks, args.output_dir)
 
     de_all = np.concatenate(all_de) if all_de else np.array([0.0])

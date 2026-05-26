@@ -52,12 +52,14 @@ Available profiles
                                   Same tracks/seeds as fine_nosched_bs1 (20 Slurm jobs).
   Adam_NoiseCutoff25_DebugTracks_3k_CollectionOnly  Same as Adam_NoiseCutoff25_DebugTracks_3k but loss over Y1,Y2 (collection) planes only.
   Adam_NoiseCutoff25_DebugTracks_3k_CollectionOnly_3trk  Same but 3 tracks only (Muon4_100MeV removed).
+  Adam_NoiseCutoff50_DebugTracks_3k_3trk_BothPlanes      Same 3-track setup; cutoff=50; submits collection-only AND all-planes variants (24 jobs).
+  Adam_NoiseCutoff25_DebugTracks_3k_CollectionOnly_3trk_MoreCutoffs  Same; sweeps cutoffs 5,10,15,20,30 (60 jobs).
   Adam_NoiseCutoff25_DebugTracks_2phase  Phase-1: trans+long diffusion 4k steps; phase-2: all params 8k steps;
                                          plus trans-only 8k, long-only 8k, and growing param chain
                                          (trans→+recomb_alpha→+recomb_beta_90 4k each).
                                          ±10% spread, noise, debug 4-track, seeds 1000–1001.
   gradient_cutoff_sweep_15trk  1d-gradient landscape: 15 tracks, cutoffs 0–50, per-plane loss;
-                                600 commands in n_jobs=2 Slurm jobs (1 per diffusion param)
+                                32 commands (8 noisy seeds) in n_jobs=2 Slurm jobs
 
 Profile runs pass --wandb-tags <profile> to run_optimization.py (optional extras via
 --wandb-extra-tags comma,separated).
@@ -3937,6 +3939,94 @@ def profile_Adam_NoiseCutoff25_DebugTracks_3k_CollectionOnly(
             )
 
 
+def profile_Adam_NoiseCutoff25_DebugTracks_3k_CollectionOnly_3trk_MoreCutoffs(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+    skip_complete=False,
+    verbose=False,
+):
+    """Same as Adam_NoiseCutoff25_DebugTracks_3k_CollectionOnly_3trk but sweeps cutoffs 5,10,15,20,30.
+
+    3 tracks (no Muon4_100MeV), collection planes only (Y1,Y2), ±75% spread, noise_scale=1.0.
+    5 cutoffs × 3 param sets × 4 seeds = 60 jobs.
+    """
+    _DEBUG_3TRACKS = (
+        "Muon1_1000MeV:-0.747872530,0.661463000,0.056154945:1000"
+        "+Muon2_500MeV:-0.641581737,0.275323919,-0.715939672:500"
+        "+Muon_diagCross_1000MeV:-0.577350269,-0.577350269,-0.577350269:1000"
+    )
+
+    shared = dict(
+        tracks=_DEBUG_3TRACKS,
+        optimizer="adam",
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.001,
+        lr_schedule="cosine",
+        max_steps=3000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.25,
+        range_hi=1.75,
+        grad_clip=0.0,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=1.0,
+        max_num_deposits=5000,
+        batch_size=1,
+        effective_batch_size=1,
+        gt_step_size=1.0,
+        gt_max_deposits=5000,
+        adam_beta2=0.9,
+        log_interval=50,
+        planes="Y1,Y2",
+    )
+
+    param_sets = [
+        ("trans_only",     "diffusion_trans_cm2_us"),
+        ("long_only",      "diffusion_long_cm2_us"),
+        ("trans_and_long", "diffusion_trans_cm2_us,diffusion_long_cm2_us"),
+    ]
+
+    for cutoff in [5.0, 10.0, 15.0, 20.0, 30.0]:
+        cutoff_tag = f"cutoff{int(cutoff)}"
+        prev_job = None
+        for param_label, params in param_sets:
+            profile_tag  = f"Adam_NoiseCutoff25_DebugTracks_{param_label}_CollectionOnly_3trk_{cutoff_tag}"
+            results_base = f"$RESULTS_DIR/opt/{profile_tag}"
+
+            for seed in [44, 45, 46, 47]:
+                if verbose or skip_complete:
+                    is_done = _seed_is_complete(results_base, "noise", seed, verbose=verbose)
+                    if is_done and skip_complete:
+                        print(f"  SKIP complete: {profile_tag} seed={seed}")
+                        continue
+                    elif not is_done and verbose:
+                        print(f"  → will submit: {profile_tag} seed={seed}")
+
+                command = make_opt_command(
+                    params=params,
+                    seed=seed,
+                    noise_scale=1.0,
+                    sobolev_loss_cutoff=cutoff,
+                    results_base=f"{results_base}/noise",
+                    wandb_tags=(wandb_tags or []) + [cutoff_tag, param_label, "noise", "debug_3trk", "collection_only"],
+                    **shared,
+                )
+                if not print_sbatch_only:
+                    print(command)
+                prev_job = s3df_submit(
+                    command,
+                    time="01:05:00",
+                    submit=submit,
+                    mem_gb=64,
+                    print_sbatch_command=print_sbatch_only,
+                    dependency=prev_job,
+                )
+
+
 def profile_Adam_NoiseCutoff25_DebugTracks_3k_CollectionOnly_3trk(
     *,
     submit=True,
@@ -4023,6 +4113,109 @@ def profile_Adam_NoiseCutoff25_DebugTracks_3k_CollectionOnly_3trk(
                 print_sbatch_command=print_sbatch_only,
                 dependency=prev_job,
             )
+
+
+def profile_Adam_NoiseCutoff50_DebugTracks_3k_3trk_BothPlanes(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+    skip_complete=False,
+    verbose=False,
+):
+    """ADC cutoff=50, ±75% spread, debug 3-track ensemble, noisy GT.
+
+    Same as Adam_NoiseCutoff25_DebugTracks_3k_CollectionOnly_3trk but:
+      • sobolev_loss_cutoff = 50.0 (was 25)
+      • Submits each param set twice: once collection-only (Y1,Y2) and once all planes.
+    3 param sets × 2 plane configs × 4 seeds = 24 jobs.
+    Seeds chained within each (param_set, plane_config) group.
+    """
+    _DEBUG_3TRACKS = (
+        "Muon1_1000MeV:-0.747872530,0.661463000,0.056154945:1000"
+        "+Muon2_500MeV:-0.641581737,0.275323919,-0.715939672:500"
+        "+Muon_diagCross_1000MeV:-0.577350269,-0.577350269,-0.577350269:1000"
+    )
+
+    shared = dict(
+        tracks=_DEBUG_3TRACKS,
+        optimizer="adam",
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.001,
+        lr_schedule="cosine",
+        max_steps=3000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.25,
+        range_hi=1.75,
+        grad_clip=0.0,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=1.0,
+        max_num_deposits=5000,
+        batch_size=1,
+        effective_batch_size=1,
+        gt_step_size=1.0,
+        gt_max_deposits=5000,
+        adam_beta2=0.9,
+        log_interval=50,
+        sobolev_loss_cutoff=50.0,
+    )
+
+    cutoff_tag = "cutoff50"
+
+    param_sets = [
+        ("trans_only",     "diffusion_trans_cm2_us"),
+        ("long_only",      "diffusion_long_cm2_us"),
+        ("trans_and_long", "diffusion_trans_cm2_us,diffusion_long_cm2_us"),
+    ]
+
+    plane_configs = [
+        ("collection_only", "Y1,Y2"),
+        ("all_planes",      None),
+    ]
+
+    # Collect all pending commands in submission order, then assign to 2 lanes
+    # so at most 2 jobs run simultaneously.
+    pending = []
+    for param_label, params in param_sets:
+        for plane_tag, planes in plane_configs:
+            profile_tag  = f"Adam_NoiseCutoff50_DebugTracks_{param_label}_{plane_tag}_3trk"
+            results_base = f"$RESULTS_DIR/opt/{profile_tag}"
+            for seed in [44, 45, 46, 47]:
+                if verbose or skip_complete:
+                    is_done = _seed_is_complete(results_base, "noise", seed, verbose=verbose)
+                    if is_done and skip_complete:
+                        print(f"  SKIP complete: {profile_tag} seed={seed}")
+                        continue
+                    elif not is_done and verbose:
+                        print(f"  → will submit: {profile_tag} seed={seed}")
+                command = make_opt_command(
+                    params=params,
+                    seed=seed,
+                    noise_scale=1.0,
+                    results_base=f"{results_base}/noise",
+                    planes=planes,
+                    wandb_tags=(wandb_tags or []) + [cutoff_tag, param_label, "noise", "debug_3trk", plane_tag],
+                    **shared,
+                )
+                pending.append(command)
+
+    # Submit across 2 lanes: job i goes to lane i%2, depends on the previous job in that lane
+    prev = [None, None]
+    for i, command in enumerate(pending):
+        lane = i % 2
+        if not print_sbatch_only:
+            print(command)
+        prev[lane] = s3df_submit(
+            command,
+            time="01:05:00",
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+            dependency=prev[lane],
+        )
 
 
 def profile_Adam_NoiseCutoff25_DebugTracks_3k_3trk(
@@ -4482,24 +4675,24 @@ def profile_gradient_cutoff_sweep_15trk(
     """1d-gradient landscape sweep: 15 tracks + 30 fraction-slice tracks, 10 ADC cutoffs.
 
     Params       : diffusion_trans_cm2_us, diffusion_long_cm2_us
-    Noise        : 0.0 (seed 42) and 1.0 (seeds 42, 0, 1)
+    Noise        : 0.0 (seed 42) and 1.0 (seeds 42, 0, 1, 2, 3, 4, 5, 6)
     Cutoffs      : 0, 1, 2, 5, 10, 15, 20, 25, 30, 50  (ADC units)
     N=20, ±75% range, step_size=1.0 mm, max_deposits=5000.
     Output       : $RESULTS_DIR/1d_gradients/sobolev_cutoff_15trk_all_planes/
 
     Structure: each 1d_gradients.py call covers all tracks (combined with '+')
     AND all 10 cutoffs (--adc-cutoffs), so it compiles once and sweeps everything.
-    16 commands total: 2 sets (15 full tracks + 30 fraction tracks)
-                       × 2 params × (1 no-noise + 3 noisy seeds).
+    32 commands total: 2 sets (15 full tracks + 30 fraction tracks)
+                       × 2 params × (1 no-noise + 8 noisy seeds).
     The fraction-track pkls are merged with the full-track pkls by the viewer
     via the (param, noise, seed, cutoff) key.
-    With n_jobs=2 (default) each job handles 8 invocations.
+    With n_jobs=2 (default) each job handles 16 invocations.
     Increase n_jobs to distribute across more Slurm jobs.
     """
     results_dir      = "$RESULTS_DIR/1d_gradients/sobolev_cutoff_15trk_all_planes"
     cutoffs          = [0.0, 1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 50.0]
     params           = ["diffusion_trans_cm2_us", "diffusion_long_cm2_us"]
-    noise_seeds      = [42, 0, 1]  # 3 seeds for the noisy (noise_scale=1.0) runs
+    noise_seeds      = [42, 0, 1, 2, 3, 4, 5, 6]  # 8 seeds for the noisy (noise_scale=1.0) runs
 
     all_tracks_arg      = "+".join(spec for _, spec in _GRADIENT_15_TRACKS)
     fraction_tracks_arg = "+".join(spec for _, spec in _GRADIENT_FRACTION_TRACKS)
@@ -4693,6 +4886,8 @@ PROFILES = {
     "Adam_NoiseCutoff25_DebugTracks_3k": profile_Adam_NoiseCutoff25_DebugTracks_3k,
     "Adam_NoiseCutoff25_DebugTracks_3k_CollectionOnly": profile_Adam_NoiseCutoff25_DebugTracks_3k_CollectionOnly,
     "Adam_NoiseCutoff25_DebugTracks_3k_CollectionOnly_3trk": profile_Adam_NoiseCutoff25_DebugTracks_3k_CollectionOnly_3trk,
+    "Adam_NoiseCutoff50_DebugTracks_3k_3trk_BothPlanes":    profile_Adam_NoiseCutoff50_DebugTracks_3k_3trk_BothPlanes,
+    "Adam_NoiseCutoff25_DebugTracks_3k_CollectionOnly_3trk_MoreCutoffs": profile_Adam_NoiseCutoff25_DebugTracks_3k_CollectionOnly_3trk_MoreCutoffs,
     "Adam_NoiseCutoff25_DebugTracks_3k_3trk": profile_Adam_NoiseCutoff25_DebugTracks_3k_3trk,
     "Adam_NoiseCutoff25_DebugTracks_3k_TransLong_Chain": profile_Adam_NoiseCutoff25_DebugTracks_3k_TransLong_Chain,
     "Adam_NoiseCutoff25_DebugTracks_2phase": profile_Adam_NoiseCutoff25_DebugTracks_2phase,
