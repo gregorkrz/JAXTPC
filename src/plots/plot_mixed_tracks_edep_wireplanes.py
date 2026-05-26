@@ -70,7 +70,11 @@ _TRACK_NAME_ONLY = {
 
 
 def parse_mixed_tracks(tracks_str: str):
-    """Parse '+'-separated items: ``name:dx,dy,dz:T`` or preset ``name`` only."""
+    """Parse '+'-separated items: ``name:dx,dy,dz:T[:sx,sy,sz]`` or preset ``name`` only.
+
+    The optional 4th colon-field is a comma-separated start position in mm.
+    This matches the 4-field format used in ``_GRADIENT_15_TRACKS`` in submit_jobs.py.
+    """
     specs = []
     for item in tracks_str.split('+'):
         item = item.strip()
@@ -78,20 +82,28 @@ def parse_mixed_tracks(tracks_str: str):
             continue
         if ':' in item:
             parts = item.split(':')
-            if len(parts) != 3:
-                raise ValueError(f'Expected name:dx,dy,dz:momentum_mev, got {item!r}')
+            if len(parts) not in (3, 4):
+                raise ValueError(
+                    f'Expected name:dx,dy,dz:T or name:dx,dy,dz:T:sx,sy,sz, got {item!r}')
             name = parts[0].strip()
             direction = tuple(float(x) for x in parts[1].split(','))
             momentum_mev = float(parts[2])
             if len(direction) != 3:
                 raise ValueError(f'Direction must have 3 components in {item!r}')
+            spec = dict(name=name, direction=direction, momentum_mev=momentum_mev)
+            if len(parts) == 4:
+                start = tuple(float(x) for x in parts[3].split(','))
+                if len(start) != 3:
+                    raise ValueError(f'Start position must have 3 components in {item!r}')
+                spec['start_position_mm'] = start
         else:
             if item not in _TRACK_NAME_ONLY:
                 raise ValueError(
                     f'Unknown bare track name {item!r}. Known: {list(_TRACK_NAME_ONLY)}')
             direction, momentum_mev = _TRACK_NAME_ONLY[item]
             name = item
-        specs.append(dict(name=name, direction=direction, momentum_mev=momentum_mev))
+            spec = dict(name=name, direction=direction, momentum_mev=momentum_mev)
+        specs.append(spec)
     if not specs:
         raise ValueError('No tracks parsed from --tracks')
     return specs
@@ -251,7 +263,200 @@ def write_edep_3d_html(track, spec, path, de_min, de_max, de_range, volumes, sta
     fig.write_html(path)
 
 
-def write_edep_index_html(specs, output_dir, stats=None):
+def _pixel_count_table(specs, pixel_counts, plane_names=None):
+    """Return a closed <details> with optional plane picker and pixel-count table.
+
+    If ``plane_names`` and per-plane data ('by_plane_cutoff', 'plane_totals') are
+    present in pixel_counts entries, renders an interactive JS plane picker.
+    Otherwise falls back to a static combined table.
+    """
+    if not pixel_counts:
+        return ''
+    cutoffs = pixel_counts[0]['cutoffs']
+    has_per_plane = (plane_names and 'by_plane_cutoff' in pixel_counts[0]
+                     and 'plane_totals' in pixel_counts[0])
+
+    if not has_per_plane:
+        header = '<th>Track</th>' + ''.join(f'<th>≥{c}</th>' for c in cutoffs)
+        rows = []
+        for spec, pc in zip(specs, pixel_counts):
+            total = pc['total']
+            cells = ''.join(
+                f'<td>{pc["by_cutoff"][c]:,}<br><small style="color:#888">'
+                f'{100*pc["by_cutoff"][c]/total:.1f}%</small></td>'
+                for c in cutoffs
+            )
+            rows.append(f'<tr><td style="text-align:left;white-space:nowrap">'
+                        f'{html.escape(spec["name"])}</td>{cells}</tr>')
+        return f'''<details style="margin:0.6rem 0">
+  <summary style="cursor:pointer;font-weight:600;font-size:0.9rem">
+    Pixels passing |ADC| ≥ cutoff (all 6 planes combined)
+  </summary>
+  <table style="border-collapse:collapse;font-size:0.78rem;margin-top:0.4rem">
+    <thead><tr style="background:#f0f0f0">{header}</tr></thead>
+    <tbody>{''.join(rows)}</tbody>
+  </table>
+</details>'''
+
+    n_planes = len(plane_names)
+    js_plane_names = '[' + ', '.join(f'"{html.escape(n, quote=True)}"' for n in plane_names) + ']'
+    js_cutoffs = '[' + ', '.join(str(c) for c in cutoffs) + ']'
+    js_track_names = '[' + ', '.join(f'"{html.escape(spec["name"], quote=True)}"' for spec in specs) + ']'
+    js_data_rows = []
+    for pc in pixel_counts:
+        pt = '[' + ', '.join(str(t) for t in pc['plane_totals']) + ']'
+        per_plane = '[' + ', '.join(
+            '[' + ', '.join(str(pc['by_plane_cutoff'][pi][c]) for c in cutoffs) + ']'
+            for pi in range(n_planes)
+        ) + ']'
+        js_data_rows.append(f'  {{planeTotals: {pt}, byPlaneCutoff: {per_plane}}}')
+    js_data = 'const PC_DATA = [\n' + ',\n'.join(js_data_rows) + '\n];'
+
+    cb_html = ' '.join(
+        f'<label style="margin-right:0.4rem"><input type="checkbox" class="pc-plane-cb"'
+        f' value="{pi}" checked> {html.escape(pn)}</label>'
+        for pi, pn in enumerate(plane_names)
+    )
+
+    return f'''<details style="margin:0.6rem 0">
+  <summary style="cursor:pointer;font-weight:600;font-size:0.9rem">
+    Pixels passing |ADC| ≥ cutoff
+  </summary>
+  <div style="margin:0.5rem 0 0.3rem;font-size:0.82rem">
+    <strong>Planes:</strong> {cb_html}
+    <button onclick="pcSelectAll(true)" style="margin-left:0.6rem;font-size:0.78rem">All</button>
+    <button onclick="pcSelectAll(false)" style="font-size:0.78rem">None</button>
+  </div>
+  <div id="pc-table"></div>
+  <script>
+  (function() {{
+    const PLANE_NAMES = {js_plane_names};
+    const CUTOFFS = {js_cutoffs};
+    const TRACK_NAMES = {js_track_names};
+    {js_data}
+
+    function render() {{
+      const sel = Array.from(document.querySelectorAll('.pc-plane-cb:checked')).map(cb => +cb.value);
+      const el = document.getElementById('pc-table');
+      if (sel.length === 0) {{
+        el.innerHTML = '<em style="color:#888;font-size:0.82rem">No planes selected.</em>';
+        return;
+      }}
+      const label = sel.length === PLANE_NAMES.length
+        ? 'all ' + PLANE_NAMES.length + ' planes'
+        : sel.map(i => PLANE_NAMES[i]).join(', ');
+      let hdr = '<th style="text-align:left">Track</th>';
+      for (const c of CUTOFFS) hdr += '<th>≥' + c + '</th>';
+      let tbody = '';
+      for (let ti = 0; ti < TRACK_NAMES.length; ti++) {{
+        const d = PC_DATA[ti];
+        const total = sel.reduce((s, pi) => s + d.planeTotals[pi], 0);
+        let cells = '';
+        for (let ci = 0; ci < CUTOFFS.length; ci++) {{
+          const cnt = sel.reduce((s, pi) => s + d.byPlaneCutoff[pi][ci], 0);
+          const pct = total > 0 ? (100 * cnt / total).toFixed(1) : '0.0';
+          cells += '<td>' + cnt.toLocaleString() + '<br><small style="color:#888">' + pct + '%</small></td>';
+        }}
+        tbody += '<tr><td style="text-align:left;white-space:nowrap">' + TRACK_NAMES[ti] + '</td>' + cells + '</tr>';
+      }}
+      el.innerHTML =
+        '<div style="font-size:0.75rem;color:#666;margin-bottom:0.25rem">Showing: ' + label + '</div>' +
+        '<table style="border-collapse:collapse;font-size:0.78rem"><thead><tr style="background:#f0f0f0">' +
+        hdr + '</tr></thead><tbody>' + tbody + '</tbody></table>';
+    }}
+
+    document.querySelectorAll('.pc-plane-cb').forEach(cb => cb.addEventListener('change', render));
+    window.pcSelectAll = function(v) {{
+      document.querySelectorAll('.pc-plane-cb').forEach(cb => {{ cb.checked = v; }});
+      render();
+    }};
+    render();
+  }})();
+  </script>
+</details>'''
+
+
+def _compute_drift_dist_stats(tracks_raw):
+    """Per-track deposit-distance stats to wireplanes at x=+2000 mm (east) and x=−2000 mm (west).
+
+    Returns a list (one entry per track) of dicts with keys 'east' and 'west', each containing
+    min / max / mean / ewm (energy-weighted mean, weights = dE) / stdev in mm.
+    Entry is None if the track has no deposits.
+    """
+    result = []
+    for track in tracks_raw:
+        pos = np.asarray(track['position'])
+        de  = np.asarray(track['de'])
+        if len(pos) == 0:
+            result.append(None)
+            continue
+        px = pos[:, 0]
+        de_sum = float(de.sum())
+        plane_stats = {}
+        for name, xp in (('east', 2000.0), ('west', -2000.0)):
+            d    = np.abs(px - xp)
+            mean = float(d.mean())
+            ewm  = float((de * d).sum() / de_sum) if de_sum > 0 else float('nan')
+            plane_stats[name] = dict(
+                min=float(d.min()), max=float(d.max()),
+                mean=mean,
+                ewm=ewm,
+                stdev=float(np.sqrt(np.mean((d - mean) ** 2))),
+            )
+        result.append(plane_stats)
+    return result
+
+
+def _drift_dist_table(specs, dist_stats):
+    """Closed <details> table: per-track drift-distance stats to east and west wireplanes."""
+    if not dist_stats or not any(d is not None for d in dist_stats):
+        return ''
+
+    def fmt(v):
+        if v is None or (isinstance(v, float) and v != v):
+            return '—'
+        return f'{v:.1f}'
+
+    col_keys = ('min', 'max', 'mean', 'ewm', 'stdev')
+    col_heads = 'min max mean ewm stdev'.split()
+    header = (
+        '<tr style="background:#f0f0f0">'
+        '<th rowspan="2" style="text-align:left;vertical-align:bottom">Track</th>'
+        '<th colspan="5" style="text-align:center">East wireplane (x = +2000 mm)</th>'
+        '<th colspan="5" style="text-align:center">West wireplane (x = −2000 mm)</th>'
+        '</tr>'
+        '<tr style="background:#f5f5f5">'
+        + ''.join(f'<th>{h}</th>' for h in col_heads * 2)
+        + '</tr>'
+    )
+    rows_html = []
+    for spec, ds in zip(specs, dist_stats):
+        if ds is None:
+            cells = '<td colspan="10" style="text-align:center;color:#888">no deposits</td>'
+        else:
+            cells = ''
+            for side in ('east', 'west'):
+                cells += ''.join(f'<td>{fmt(ds[side][k])}</td>' for k in col_keys)
+        rows_html.append(
+            f'<tr><td style="text-align:left;white-space:nowrap">'
+            f'{html.escape(spec["name"])}</td>{cells}</tr>'
+        )
+
+    return f'''<details style="margin:0.6rem 0">
+  <summary style="cursor:pointer;font-weight:600;font-size:0.9rem">
+    Drift distance to wireplanes (mm)
+  </summary>
+  <div style="font-size:0.72rem;color:#666;margin:0.3rem 0 0.25rem">
+    All values in mm &nbsp;|&nbsp; ewm = energy-weighted mean (weights = dE per deposit)
+  </div>
+  <table style="border-collapse:collapse;font-size:0.78rem">
+    <thead>{header}</thead>
+    <tbody>{''.join(rows_html)}</tbody>
+  </table>
+</details>'''
+
+
+def write_edep_index_html(specs, output_dir, stats=None, pdf_name=None, pixel_counts=None, plane_names=None, dist_stats=None):
     """Single-page picker: iframe loads ``edep_3d_<stem>.html`` for the selected track."""
     if not specs:
         return
@@ -307,6 +512,7 @@ def write_edep_index_html(specs, output_dir, stats=None):
     h1 {{ font-size: 1.25rem; font-weight: 600; }}
     label {{ margin-right: 0.5rem; }}
     select {{ min-width: min(40rem, 100%); max-width: 100%; font-size: 0.9rem; }}
+    table td, table th {{ border: 1px solid #ddd; padding: 3px 7px; text-align: right; }}
     iframe {{
       width: 100%;
       height: calc(100vh - 8rem);
@@ -318,6 +524,18 @@ def write_edep_index_html(specs, output_dir, stats=None):
 </head>
 <body>
   <h1>3D energy deposits</h1>
+  <p style="display:flex;flex-wrap:wrap;gap:1rem;font-size:0.9rem">
+    {f'<a href="{html.escape(pdf_name, quote=True)}" target="_blank">📄 Wireplanes PDF</a>' if pdf_name else ''}
+    <a href="dedx_distributions.pdf" target="_blank">📄 dE/dx histograms</a>
+    <a href="bragg_peak_dedx_vs_pathlen.pdf" target="_blank">📄 Bragg peak (PDF)</a>
+    <a href="bragg_peak_tail150mm.pdf" target="_blank">📄 Bragg peak tail 150 mm</a>
+    <a href="bragg_peak_tail50mm.pdf" target="_blank">📄 Bragg peak tail 50 mm</a>
+    <a href="bragg_peak_dedx_vs_pathlen.html" target="_blank">🌐 Bragg peak (interactive)</a>
+    <a href="coordinate_distributions.pdf" target="_blank">📄 Coordinate distributions</a>
+    <a href="track_catalog.pdf" target="_blank">📄 Track catalog</a>
+  </p>
+  {_pixel_count_table(specs, pixel_counts, plane_names=plane_names) if pixel_counts else ''}
+  {_drift_dist_table(specs, dist_stats) if dist_stats else ''}
   <p>
     <label for="track-select">Track</label>
     <select id="track-select" aria-label="Choose track">
@@ -484,6 +702,58 @@ def write_bragg_peak_pdf(specs, step_tracks, output_dir):
             axes[2 * data_row + int(use_log), col].set_visible(False)
 
     path = os.path.join(output_dir, 'bragg_peak_dedx_vs_pathlen.pdf')
+    fig.savefig(path, bbox_inches='tight')
+    plt.close(fig)
+    print(f'  Saved {path}')
+
+
+def write_bragg_peak_tail_pdf(specs, step_tracks, output_dir, tail_mm=150.0):
+    """Same as write_bragg_peak_pdf but zoomed to the last ``tail_mm`` of each track."""
+    n_tracks = max(i for i, _ in step_tracks) + 1
+    n_cols = 3
+    n_data_rows = (n_tracks + n_cols - 1) // n_cols
+
+    fig, axes = plt.subplots(
+        2 * n_data_rows, n_cols,
+        figsize=(5.0 * n_cols, 3.2 * 2 * n_data_rows),
+        constrained_layout=True,
+    )
+    axes = np.asarray(axes).reshape(2 * n_data_rows, n_cols)
+    fig.suptitle(f'dE/dx vs path length — last {tail_mm:.0f} mm (Bragg peak tail)\n'
+                 'top: linear  |  bottom: log y', fontsize=11)
+
+    for i in range(n_tracks):
+        data_row, col = divmod(i, n_cols)
+        name = specs[i]['name']
+        for use_log in (False, True):
+            ax = axes[2 * data_row + int(use_log), col]
+            for ss, color, lbl in zip(_STEP_SIZES_MM, _STEP_COLORS, _STEP_LABELS):
+                track = step_tracks[(i, ss)]
+                de = np.asarray(track['de'])
+                dx = np.asarray(track['dx'])
+                if len(de) == 0:
+                    continue
+                dedx    = de / (dx / 10.0)
+                path_mm = np.cumsum(dx)
+                mask    = path_mm >= path_mm[-1] - tail_mm
+                ax.plot(path_mm[mask], dedx[mask],
+                        color=color, label=lbl, linewidth=0.8, alpha=0.85,
+                        marker='.', markersize=3)
+            if use_log:
+                ax.set_yscale('log')
+            ax.set_xlabel('path length (mm)', fontsize=7)
+            ax.set_ylabel('dE/dx (MeV/cm)' + (' (log)' if use_log else ''), fontsize=7)
+            ax.set_title(name, fontsize=8)
+            ax.tick_params(axis='both', labelsize=6)
+            if i == 0 and not use_log:
+                ax.legend(fontsize=6)
+
+    for i in range(n_tracks, n_data_rows * n_cols):
+        data_row, col = divmod(i, n_cols)
+        for use_log in (False, True):
+            axes[2 * data_row + int(use_log), col].set_visible(False)
+
+    path = os.path.join(output_dir, f'bragg_peak_tail{tail_mm:.0f}mm.pdf')
     fig.savefig(path, bbox_inches='tight')
     plt.close(fig)
     print(f'  Saved {path}')
@@ -801,6 +1071,8 @@ def main():
         specs, tracks_raw, start_positions_used, cfg)
     write_dedx_distributions_pdf(specs, step_tracks, args.output_dir)
     write_bragg_peak_pdf(specs, step_tracks, args.output_dir)
+    write_bragg_peak_tail_pdf(specs, step_tracks, args.output_dir, tail_mm=150.0)
+    write_bragg_peak_tail_pdf(specs, step_tracks, args.output_dir, tail_mm=50.0)
     write_bragg_peak_html(specs, step_tracks, args.output_dir)
     write_coordinate_distributions_pdf(specs, step_tracks, args.output_dir)
 
@@ -863,7 +1135,26 @@ def main():
             ax.set_xlabel('t (μs)', fontsize=7)
             ax.tick_params(axis='both', labelsize=6)
 
-    write_edep_index_html(specs, args.output_dir, stats=track_stats)
+    _ADC_CUTOFFS = [0, 1, 2, 5, 10, 15, 20, 25, 30, 50]
+    pixel_counts = []
+    for planes in all_planes:
+        plane_totals = [p.size for p in planes]
+        by_plane_cutoff = [{c: int(np.sum(np.abs(p) >= c)) for c in _ADC_CUTOFFS} for p in planes]
+        by_cut = {c: sum(bpc[c] for bpc in by_plane_cutoff) for c in _ADC_CUTOFFS}
+        pixel_counts.append({
+            'total': sum(plane_totals),
+            'by_cutoff': by_cut,
+            'cutoffs': _ADC_CUTOFFS,
+            'plane_totals': plane_totals,
+            'by_plane_cutoff': by_plane_cutoff,
+        })
+
+    dist_stats = _compute_drift_dist_stats(tracks_raw)
+    write_edep_index_html(specs, args.output_dir, stats=track_stats,
+                          pdf_name=os.path.basename(pdf_path),
+                          pixel_counts=pixel_counts,
+                          plane_names=col_labels,
+                          dist_stats=dist_stats)
 
     cbar = fig_pdf.colorbar(
         im, ax=axes.ravel().tolist(), shrink=0.35, aspect=60, pad=0.02, label='signal (e⁻)')

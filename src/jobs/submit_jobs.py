@@ -60,6 +60,8 @@ Available profiles
                                          ±10% spread, noise, debug 4-track, seeds 1000–1001.
   gradient_cutoff_sweep_15trk  1d-gradient landscape: 15 tracks, cutoffs 0–50, per-plane loss;
                                 32 commands (8 noisy seeds) in n_jobs=2 Slurm jobs
+  gradient_signal_viewer_20trk  Signal-array run for all 20 tracks → cutoff_loss_landscape_20260526/;
+                                4 jobs (2 params × clean+noisy), --store-arrays, no cutoff sweep
 
 Profile runs pass --wandb-tags <profile> to run_optimization.py (optional extras via
 --wandb-extra-tags comma,separated).
@@ -193,6 +195,23 @@ _GRADIENT_15_TRACKS = [
      "Muon_throughEw_skew02_1000MeV:0.934631179,-0.282614666,0.215855296:1000:-2100.0,750.0,-550.0"),
     ("Muon_throughWe_skew03_1000MeV",
      "Muon_throughWe_skew03_1000MeV:-0.938658230,0.268188066,-0.216785353:1000:2100.0,-620.0,480.0"),
+    # 5 extra 100 MeV tracks entering through y/z faces at |x| < 1000 mm (seed=77)
+    # These sample the near-cathode region that x-face tracks miss.
+    ("Muon13_100MeV",
+     "Muon13_100MeV:-0.194353283,-0.967595642,-0.161200106:100:102.344,2160.000,-1106.403"),
+    # face=top(y+)   x_entry=102mm   x_deposit=[45,102]   west volume
+    ("Muon14_100MeV",
+     "Muon14_100MeV:-0.108495799,0.312632631,0.943657512:100:602.601,-1767.737,-2160.000"),
+    # face=back(z-)  x_entry=603mm   x_deposit=[570,603]  west volume
+    ("Muon15_100MeV",
+     "Muon15_100MeV:0.290155194,0.467674594,-0.834919420:100:-738.504,-605.471,2160.000"),
+    # face=front(z+) x_entry=-739mm  x_deposit=[-738,-652] east volume
+    ("Muon16_100MeV",
+     "Muon16_100MeV:-0.362498911,-0.215251579,-0.906786247:100:-678.254,1635.218,2160.000"),
+    # face=front(z+) x_entry=-678mm  x_deposit=[-786,-678] east volume
+    ("Muon17_100MeV",
+     "Muon17_100MeV:0.348470036,0.919222376,-0.183299913:100:-768.051,-2160.000,-1358.605"),
+    # face=bottom(y-) x_entry=-768mm x_deposit=[-768,-664] east volume
 ]
 
 
@@ -4820,6 +4839,59 @@ def profile_run_params_diffusion_sweep_pixel(
     )
 
 
+def profile_gradient_signal_viewer_20trk(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+    time="00:30:00",
+):
+    """Signal-array 1d-gradient run for all 20 tracks → cutoff_loss_landscape_20260526/.
+
+    Params  : diffusion_trans_cm2_us, diffusion_long_cm2_us
+    Noise   : 0.0 (seed 42) and 1.0 (seed 42)
+    N=20, ±75% range, step_size=1.0 mm, max_deposits=5000, adc_cutoff=0.
+    Flags   : --store-arrays --store-per-plane-loss  (no cutoff sweep)
+    Output  : $RESULTS_DIR/1d_gradients/cutoff_loss_landscape_20260526/
+
+    4 jobs total (2 params × 2 noise conditions), chained sequentially so each
+    has its own GPU allocation.  Feed results to generate_gradient_viewer.py to
+    produce viewer.html alongside the landscape_viewer.html from
+    plot_gradient_landscape_viewer.py (which uses sobolev_cutoff_15trk_all_planes).
+    """
+    results_dir      = "$RESULTS_DIR/1d_gradients/cutoff_loss_landscape_20260526"
+    params           = ["diffusion_trans_cm2_us", "diffusion_long_cm2_us"]
+    noise_conditions = [(0.0, 42), (1.0, 42)]
+
+    all_tracks_arg = "+".join(spec for _, spec in _GRADIENT_15_TRACKS)
+
+    prev_job = None
+    for param in params:
+        for noise_scale, noise_seed in noise_conditions:
+            cmd = make_gradient_command(
+                param=param,
+                tracks=all_tracks_arg,
+                N=20,
+                range_frac=0.75,
+                noise_scale=noise_scale,
+                noise_seed=noise_seed,
+                adc_cutoff=0.0,
+                results_dir=results_dir,
+                store_per_plane_loss=True,
+                store_arrays=True,
+            )
+            if not print_sbatch_only:
+                print(cmd)
+            prev_job = s3df_submit(
+                cmd,
+                time=time,
+                submit=submit,
+                mem_gb=64,
+                print_sbatch_command=print_sbatch_only,
+                dependency=prev_job,
+            )
+
+
 PROFILES = {
     "3_part_schedule": profile_3_part_schedule,
     "2_part_schedule": profile_2_part_schedule,
@@ -4892,6 +4964,7 @@ PROFILES = {
     "Adam_NoiseCutoff25_DebugTracks_3k_TransLong_Chain": profile_Adam_NoiseCutoff25_DebugTracks_3k_TransLong_Chain,
     "Adam_NoiseCutoff25_DebugTracks_2phase": profile_Adam_NoiseCutoff25_DebugTracks_2phase,
     "gradient_cutoff_sweep_15trk": profile_gradient_cutoff_sweep_15trk,
+    "gradient_signal_viewer_20trk": profile_gradient_signal_viewer_20trk,
     "Adam_NoiseSeedSweep_3k_GT2_NoDiffLifetime": profile_15Trk_Adam_NoiseSeedSweep_3k_GT2_NoDiffLifetime,
     "Adam_NoiseSeedSweep_3k_GT3_NoDiff": profile_15Trk_Adam_NoiseSeedSweep_3k_GT3_NoDiff,
     "Adam_NoiseSeedSweep_3k_GT3_NoDiffLifetime": profile_15Trk_Adam_NoiseSeedSweep_3k_GT3_NoDiffLifetime,

@@ -65,6 +65,8 @@ def parse_args():
                    help='Directory with pkl files (default: %(default)s)')
     p.add_argument('--output-dir', default=None,
                    help='Where to save PDFs (default: plots/<results-dir-name>)')
+    p.add_argument('--index-table-only', action='store_true',
+                   help='Skip PDF generation; only write index.html from existing PDFs')
     return p.parse_args()
 
 
@@ -294,34 +296,49 @@ def _make_overlay_figure(by_param_track, all_track_names, output_dir, seed=None)
     print(f'  → {out}')
 
 
+def _param_sort_key(p):
+    if 'trans' in p: return 0
+    if 'long'  in p: return 1
+    return 2
+
+
+def _indiv_track_names(by_param_track):
+    """Extract individual track names from per_track_loss_values across all runs."""
+    names = set()
+    for runs_per_track in by_param_track.values():
+        for runs in runs_per_track.values():
+            for r in runs:
+                names.update(r.get('per_track_loss_values', {}).keys())
+    return sorted(names)
+
+
+def _all_runs_for_param(by_param_track, param_name):
+    return [r for runs in by_param_track[param_name].values() for r in runs]
+
+
 def _make_summary_noise_figure(by_param_track, all_track_names, output_dir, seed=None):
     """
-    Summary: noisy-GT loss landscape for every track + combined.
+    Summary: noisy-GT loss landscape, one row per individual track + combined.
 
-    Rows: one per individual track (sorted) + 'combined'.
-    Columns: D⊥ (trans) left, D∥ (long) right (or whatever two params exist).
-    Each cell: loss vs. factor curves, one per ADC cutoff (viridis, log y).
+    Uses per_track_loss_values from pkls so each track gets its own row.
+    Falls back to all_track_names (aggregate _track_name groups) for older pkls
+    that lack per_track_loss_values.
 
-    If seed is given, only noisy runs with that noise_seed are included and the
-    output file is named sobolev_cutoff_summary_noise_seed{seed}.pdf.
+    If seed is given, only runs with that noise_seed are shown and the output
+    file is named sobolev_cutoff_summary_noise_seed{seed}.pdf.
     """
-    # Put trans before long for the column order; fall back to sorted for other params.
-    def _param_sort_key(p):
-        if 'trans' in p: return 0
-        if 'long'  in p: return 1
-        return 2
-    param_list  = sorted(by_param_track.keys(), key=_param_sort_key)
-    track_order = sorted(all_track_names)
+    param_list = sorted(by_param_track.keys(), key=_param_sort_key)
+    if not param_list:
+        return
+
+    indiv = _indiv_track_names(by_param_track)
+    use_per_track = bool(indiv)
+    track_order = indiv if use_per_track else sorted(all_track_names)
     row_labels  = track_order + ['combined']
     n_rows      = len(row_labels)
     n_cols      = len(param_list)
 
-    if not param_list:
-        return
-
-    # Build a shared cutoff→colour map across all runs.
-    all_runs_flat = [r for pt in by_param_track.values()
-                       for runs in pt.values() for r in runs]
+    all_runs_flat = [r for pn in param_list for r in _all_runs_for_param(by_param_track, pn)]
     cutoff_color, cutoffs = _cutoff_colormap(all_runs_flat)
 
     fig, axes = plt.subplots(n_rows, n_cols,
@@ -336,20 +353,30 @@ def _make_summary_noise_figure(by_param_track, all_track_names, output_dir, seed
         return True
 
     for col, param_name in enumerate(param_list):
-        runs_per_track  = by_param_track[param_name]
-        combined_runs   = _aggregate_across_tracks(runs_per_track, param_name)
+        noisy_runs = sorted(
+            [r for r in _all_runs_for_param(by_param_track, param_name) if _is_noisy_seed(r)],
+            key=lambda r: r.get('adc_cutoff', 0.0),
+        )
 
         for row, row_label in enumerate(row_labels):
             ax = axes[row, col]
-            src = (combined_runs if row_label == 'combined'
-                   else runs_per_track.get(row_label, []))
-            noisy_runs = sorted([r for r in src if _is_noisy_seed(r)],
-                                key=lambda r: r.get('adc_cutoff', 0.0))
 
             for run in noisy_runs:
                 cutoff  = run.get('adc_cutoff', 0.0)
                 factors = np.array(run['factors'])
-                losses  = np.array(run['loss_values'])
+
+                if row_label == 'combined':
+                    losses = np.array(run['loss_values'])
+                elif use_per_track:
+                    ptlv = run.get('per_track_loss_values', {})
+                    if row_label not in ptlv:
+                        continue
+                    losses = np.array(ptlv[row_label])
+                else:
+                    if run['_track_name'] != row_label:
+                        continue
+                    losses = np.array(run['loss_values'])
+
                 ax.plot(factors, losses, color=cutoff_color[cutoff],
                         lw=1.6, marker='o', ms=3, label=f'cutoff={cutoff:.4g}')
 
@@ -358,23 +385,18 @@ def _make_summary_noise_figure(by_param_track, all_track_names, output_dir, seed
             ax.set_xlabel('Factor  (param / GT)')
             ax.grid(True, which='both', alpha=0.3)
             ax.set_ylabel(f'{row_label}\nLoss', fontsize=8)
-
             if row == 0:
                 ax.set_title(PARAM_LABELS.get(param_name, param_name), fontsize=11)
             ax.legend(fontsize=7, ncol=2)
 
-    n_tracks = len(track_order)
-    noise_scale = next((r.get('noise_scale', 1.0)
-                        for pt in by_param_track.values()
-                        for runs in pt.values()
-                        for r in runs if r.get('noise_scale', 0.0) > 0.0), 1.0)
+    noise_scale = next((r.get('noise_scale', 1.0) for r in all_runs_flat
+                        if r.get('noise_scale', 0.0) > 0.0), 1.0)
     seed_label = f'  |  noise seed={seed}' if seed is not None else ''
     fig.suptitle(
         f'Loss landscape — noisy GT (σ={noise_scale:.3g}) — ADC cutoff comparison\n'
-        f'{n_tracks} tracks + combined   |   '
+        f'{len(track_order)} tracks + combined   |   '
         f'{len(cutoffs)} cutoffs: {cutoffs}{seed_label}',
-        fontsize=12,
-        y=1.0,
+        fontsize=12, y=1.0,
     )
     fig.tight_layout(rect=[0, 0, 1, 0.96])
 
@@ -383,6 +405,204 @@ def _make_summary_noise_figure(by_param_track, all_track_names, output_dir, seed
     out = os.path.join(output_dir, f'sobolev_cutoff_summary_noise{seed_suffix}.pdf')
     fig.savefig(out, bbox_inches='tight')
     plt.close(fig)
+    print(f'  → {out}')
+
+
+def _make_seeds_mean_figure(by_param_track, output_dir):
+    """
+    Mean ± 1σ over noise seeds: one row per individual track + combined.
+    Only called when there are >1 noise seeds.
+    Output: sobolev_cutoff_summary_seeds_mean.pdf
+    """
+    param_list = sorted(by_param_track.keys(), key=_param_sort_key)
+    if not param_list:
+        return
+
+    indiv = _indiv_track_names(by_param_track)
+    track_order = indiv if indiv else []
+    row_labels  = track_order + ['combined']
+    n_rows      = len(row_labels)
+    n_cols      = len(param_list)
+
+    all_noisy = [r for pn in param_list
+                   for r in _all_runs_for_param(by_param_track, pn)
+                   if r.get('noise_scale', 0.0) > 0.0]
+    if not all_noisy:
+        return
+
+    cutoff_color, cutoffs = _cutoff_colormap(all_noisy)
+    noise_scale = next(r.get('noise_scale', 1.0) for r in all_noisy)
+    all_seeds   = sorted({r.get('noise_seed', 42) for r in all_noisy})
+
+    fig, axes = plt.subplots(n_rows, n_cols,
+                             figsize=(8 * n_cols, 3.5 * n_rows),
+                             squeeze=False)
+
+    for col, param_name in enumerate(param_list):
+        noisy_runs = [r for r in _all_runs_for_param(by_param_track, param_name)
+                      if r.get('noise_scale', 0.0) > 0.0]
+        runs_by_cutoff = defaultdict(list)
+        for r in noisy_runs:
+            runs_by_cutoff[r.get('adc_cutoff', 0.0)].append(r)
+
+        for row, row_label in enumerate(row_labels):
+            ax = axes[row, col]
+
+            for cutoff in sorted(runs_by_cutoff.keys()):
+                cutoff_runs = runs_by_cutoff[cutoff]
+                factors = np.array(cutoff_runs[0]['factors'])
+
+                seed_losses = []
+                for r in cutoff_runs:
+                    if row_label == 'combined':
+                        losses = np.array(r['loss_values'])
+                    else:
+                        ptlv = r.get('per_track_loss_values', {})
+                        if row_label not in ptlv:
+                            break
+                        losses = np.array(ptlv[row_label])
+                    seed_losses.append(losses)
+
+                if not seed_losses:
+                    continue
+
+                arr  = np.array(seed_losses)          # (n_seeds, n_factors)
+                mean = arr.mean(axis=0)
+                std  = arr.std(axis=0)
+                color = cutoff_color[cutoff]
+                ax.plot(factors, mean, color=color, lw=1.6, marker='o', ms=3,
+                        label=f'cutoff={cutoff:.4g}')
+                ax.fill_between(factors,
+                                np.maximum(mean - std, 1e-12),
+                                mean + std,
+                                color=color, alpha=0.2)
+
+            ax.axvline(1.0, color='black', ls=':', lw=1.2, alpha=0.7)
+            ax.set_yscale('log')
+            ax.set_xlabel('Factor  (param / GT)')
+            ax.grid(True, which='both', alpha=0.3)
+            ax.set_ylabel(f'{row_label}\nLoss', fontsize=8)
+            if row == 0:
+                ax.set_title(PARAM_LABELS.get(param_name, param_name), fontsize=11)
+            ax.legend(fontsize=7, ncol=2)
+
+    fig.suptitle(
+        f'Loss landscape — noisy GT (σ={noise_scale:.3g}) — mean ± 1σ over {len(all_seeds)} seeds\n'
+        f'Seeds: {all_seeds}   |   {len(track_order)} tracks + combined   |   '
+        f'{len(cutoffs)} cutoffs: {cutoffs}',
+        fontsize=12, y=1.0,
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+    os.makedirs(output_dir, exist_ok=True)
+    out = os.path.join(output_dir, 'sobolev_cutoff_summary_seeds_mean.pdf')
+    fig.savefig(out, bbox_inches='tight')
+    plt.close(fig)
+    print(f'  → {out}')
+
+
+def _make_index_html(output_dir, param_list, track_order, noisy_seeds, has_seeds_mean):
+    """
+    Write index.html with an organised table of links to all PDFs.
+
+    Layout:
+      • Summary table  — rows: summary_noise, grad_overlay
+                       — columns: one per seed  (+  seeds_mean column if available)
+      • One table per parameter — rows: individual tracks + combined
+                                — columns: one per seed
+    """
+    existing = set(os.path.basename(p)
+                   for p in glob.glob(os.path.join(output_dir, '*.pdf')))
+
+    def _cell(fname):
+        if fname in existing:
+            return f'<a href="{fname}" target="_blank">view</a>'
+        return '<span style="color:#bbb">—</span>'
+
+    def _th(label):
+        return f'<th>{label}</th>'
+
+    seed_headers = ''.join(_th(f'seed {s}') for s in noisy_seeds)
+    mean_header  = _th('mean ± σ') if has_seeds_mean else ''
+
+    # ── Summary table ──────────────────────────────────────────────────────────
+    rows_summary = []
+    for row_label, fname_tpl in [
+        ('Noise summary (all tracks)',  'sobolev_cutoff_summary_noise_seed{s}.pdf'),
+        ('Gradient overlay',            'sobolev_cutoff_grad_overlay_seed{s}.pdf'),
+    ]:
+        cells = ''.join(f'<td>{_cell(fname_tpl.format(s=s))}</td>' for s in noisy_seeds)
+        mean_cell = (f'<td>{_cell("sobolev_cutoff_summary_seeds_mean.pdf")}</td>'
+                     if has_seeds_mean and row_label.startswith('Noise') else '<td>—</td>')
+        mean_cell = mean_cell if has_seeds_mean else ''
+        rows_summary.append(f'<tr><td class="lbl">{row_label}</td>{cells}{mean_cell}</tr>')
+
+    summary_table = f'''
+    <table>
+      <thead><tr><th>Plot type</th>{seed_headers}{mean_header}</tr></thead>
+      <tbody>{''.join(rows_summary)}</tbody>
+    </table>'''
+
+    # ── Per-parameter tables ───────────────────────────────────────────────────
+    param_sections = []
+    for param_name in param_list:
+        plabel = PARAM_LABELS.get(param_name, param_name)
+        rows = []
+        for track in track_order + ['combined']:
+            safe = track.replace('/', '_')
+            cells = ''.join(
+                f'<td>{_cell(f"sobolev_cutoff_{param_name}_{safe}_seed{s}.pdf")}</td>'
+                for s in noisy_seeds
+            )
+            mean_cell = f'<td>—</td>' if has_seeds_mean else ''
+            rows.append(f'<tr><td class="lbl">{track}</td>{cells}{mean_cell}</tr>')
+        param_sections.append(f'''
+    <h3>{plabel}</h3>
+    <table>
+      <thead><tr><th>Track</th>{seed_headers}{mean_header}</tr></thead>
+      <tbody>{''.join(rows)}</tbody>
+    </table>''')
+
+    dirname = os.path.basename(output_dir.rstrip('/'))
+    html = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Sobolev cutoff — {dirname}</title>
+  <style>
+    body{{font-family:sans-serif;max-width:1400px;margin:0 auto;padding:24px;color:#222}}
+    h1{{font-size:20px;border-bottom:2px solid #ccc;padding-bottom:8px}}
+    h2{{font-size:15px;color:#333;margin-top:28px;border-bottom:1px solid #ddd;padding-bottom:4px}}
+    h3{{font-size:13px;color:#555;margin-top:16px;margin-bottom:4px}}
+    table{{border-collapse:collapse;margin-bottom:12px;font-size:12px}}
+    th,td{{border:1px solid #ddd;padding:5px 10px;text-align:center;white-space:nowrap}}
+    th{{background:#f5f5f5;font-weight:600}}
+    td.lbl{{text-align:left;background:#fafafa;font-weight:500;max-width:260px;
+            overflow:hidden;text-overflow:ellipsis}}
+    a{{color:#1565C0;text-decoration:none}}
+    a:hover{{text-decoration:underline}}
+  </style>
+</head>
+<body>
+<h1>Sobolev cutoff — {dirname}</h1>
+<p style="font-size:12px;color:#888">
+  Seeds: {noisy_seeds} &nbsp;|&nbsp;
+  Params: {[PARAM_LABELS.get(p,p) for p in param_list]} &nbsp;|&nbsp;
+  Tracks: {len(track_order)}
+</p>
+
+<h2>Summary plots</h2>
+{summary_table}
+
+<h2>Per-parameter detail</h2>
+{''.join(param_sections)}
+</body>
+</html>
+'''
+    out = os.path.join(output_dir, 'index.html')
+    os.makedirs(output_dir, exist_ok=True)
+    with open(out, 'w') as f:
+        f.write(html)
     print(f'  → {out}')
 
 
@@ -411,29 +631,41 @@ def main():
     noisy_seeds = sorted({r.get('noise_seed', 42) for r in results
                           if r.get('noise_scale', 0.0) > 0.0})
 
-    for seed in noisy_seeds:
-        print(f'\n── seed={seed} ──')
-        for param_name, runs_per_track in sorted(by_param_track.items()):
-            for track_name, runs in sorted(runs_per_track.items()):
-                n_clean = sum(1 for r in runs if r.get('noise_scale', 0.0) == 0.0)
-                n_noisy = sum(1 for r in runs
-                              if r.get('noise_scale', 0.0) > 0.0
-                              and r.get('noise_seed', 42) == seed)
-                print(f'Plotting {param_name}  track={track_name}'
-                      f'  ({n_clean} clean + {n_noisy} noisy runs) …')
-                _make_per_param_figure(param_name, track_name, runs, output_dir, seed=seed)
+    indiv_tracks = _indiv_track_names(by_param_track)
+    param_list   = sorted(by_param_track.keys(), key=_param_sort_key)
 
-            combined_runs = _aggregate_across_tracks(runs_per_track, param_name)
-            n_tracks = len(runs_per_track)
-            print(f'Plotting {param_name}  combined ({n_tracks} tracks) …')
-            _make_per_param_figure(param_name, 'combined', combined_runs, output_dir,
-                                   title_suffix=f'  |  {n_tracks} tracks summed', seed=seed)
+    if not args.index_table_only:
+        for seed in noisy_seeds:
+            print(f'\n── seed={seed} ──')
+            for param_name, runs_per_track in sorted(by_param_track.items()):
+                for track_name, runs in sorted(runs_per_track.items()):
+                    n_clean = sum(1 for r in runs if r.get('noise_scale', 0.0) == 0.0)
+                    n_noisy = sum(1 for r in runs
+                                  if r.get('noise_scale', 0.0) > 0.0
+                                  and r.get('noise_seed', 42) == seed)
+                    print(f'Plotting {param_name}  track={track_name}'
+                          f'  ({n_clean} clean + {n_noisy} noisy runs) …')
+                    _make_per_param_figure(param_name, track_name, runs, output_dir, seed=seed)
 
-        print(f'Plotting gradient overlay for seed={seed} …')
-        _make_overlay_figure(by_param_track, all_track_names, output_dir, seed=seed)
+                combined_runs = _aggregate_across_tracks(runs_per_track, param_name)
+                n_tracks = len(runs_per_track)
+                print(f'Plotting {param_name}  combined ({n_tracks} tracks) …')
+                _make_per_param_figure(param_name, 'combined', combined_runs, output_dir,
+                                       title_suffix=f'  |  {n_tracks} tracks summed', seed=seed)
 
-        print(f'Plotting noise summary for seed={seed} …')
-        _make_summary_noise_figure(by_param_track, all_track_names, output_dir, seed=seed)
+            print(f'Plotting gradient overlay for seed={seed} …')
+            _make_overlay_figure(by_param_track, all_track_names, output_dir, seed=seed)
+
+            print(f'Plotting noise summary for seed={seed} …')
+            _make_summary_noise_figure(by_param_track, all_track_names, output_dir, seed=seed)
+
+        if len(noisy_seeds) > 1:
+            print('\nPlotting mean ± stdev over all seeds …')
+            _make_seeds_mean_figure(by_param_track, output_dir)
+
+    print('\nWriting index.html …')
+    _make_index_html(output_dir, param_list, indiv_tracks, noisy_seeds,
+                     has_seeds_mean=len(noisy_seeds) > 1)
 
     print(f'\nDone.  Figures in {output_dir}')
 

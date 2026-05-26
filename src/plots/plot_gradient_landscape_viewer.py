@@ -284,6 +284,9 @@ button{padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:1
     <div class="quick-row">
       <button class="btn-sm quick-btn"      onclick="selAll('track')">All</button>
       <button class="btn-sm quick-btn none" onclick="selNone('track')">None</button>
+      <button class="btn-sm quick-btn"      onclick="selTrackGroup('FirstQuarter')">1st¼</button>
+      <button class="btn-sm quick-btn"      onclick="selTrackGroup('LastQuarter')">Last¼</button>
+      <button class="btn-sm quick-btn"      onclick="selTrackGroup('original')">Orig</button>
     </div>
     <div id="track-checks" class="scrollable"></div>
   </div>
@@ -307,6 +310,17 @@ button{padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:1
   </div>
   <div id="series-list">
     <p style="color:#bbb;font-size:12px;padding:8px 12px" id="s-empty">No series yet.</p>
+  </div>
+
+  <div class="sec" id="resources-sec">
+    <h3>Resources</h3>
+    <div style="display:flex;flex-direction:column;gap:5px;font-size:12px">
+      <a href="https://d3jk0djzcq11zh.cloudfront.net/landscape_interactive_20260508.html"
+         target="_blank" style="color:#1565C0">2D loss landscape viewer</a>
+      <a href="viewer.html" target="_blank" style="color:#1565C0">Signal viewer (interactive)</a>
+      <a id="res-signals" href="#" target="_blank" style="color:#1565C0">Signal wireplanes PDF</a>
+      <a id="res-tracks"  href="#" target="_blank" style="color:#1565C0">Track event display</a>
+    </div>
   </div>
 
 </div><!-- /#left -->
@@ -389,6 +403,9 @@ button{padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:1
         <div class="quick-row">
           <button class="btn-sm quick-btn" onclick="mfSelAll()">All</button>
           <button class="btn-sm quick-btn none" onclick="mfSelNone()">None</button>
+          <button class="btn-sm quick-btn" onclick="mfSelGroup('FirstQuarter')">1st¼</button>
+          <button class="btn-sm quick-btn" onclick="mfSelGroup('LastQuarter')">Last¼</button>
+          <button class="btn-sm quick-btn" onclick="mfSelGroup('original')">Orig</button>
         </div>
         <div id="mf-track-checks" class="scrollable" style="max-height:320px"></div>
       </div>
@@ -402,6 +419,7 @@ button{padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:1
   <div id="seeds-view" style="display:none">
     <div class="col-header" style="flex-shrink:0">Seed ensemble <span style="font-weight:400;color:#aaa;text-transform:none;font-size:11px">— all seeds, individual points + mean ± 1σ band</span></div>
     <div id="seeds-plot" style="flex:1;min-height:0"></div>
+    <div id="seeds-stats" style="flex-shrink:0;padding:6px 12px;font-size:12px;font-family:monospace;color:#333;border-top:1px solid #e0e0e0;background:#fafafa;white-space:pre-wrap"></div>
   </div>
 
 </div>
@@ -602,6 +620,23 @@ function selNone(kind) {
   const prefix = kind === 'track' ? 'ck-t-' : 'ck-p-';
   items.forEach(x => { const el = document.getElementById(prefix + sid(x)); if (el) el.checked = false; });
   renderLivePlot(); if (rightTab === 'seeds') renderSeedsPlot(); saveState();
+}
+function selTrackGroup(group) {
+  DATA.all_tracks.forEach(t => {
+    const el = document.getElementById('ck-t-' + sid(t));
+    if (!el) return;
+    if (group === 'FirstQuarter')  el.checked = t.includes('FirstQuarter');
+    else if (group === 'LastQuarter') el.checked = t.includes('LastQuarter');
+    else /* original */            el.checked = !t.includes('Quarter');
+  });
+  renderLivePlot(); if (rightTab === 'seeds') renderSeedsPlot(); saveState();
+}
+function updateResourceLinks() {
+  const base = 'https://d3jk0djzcq11zh.cloudfront.net/20260605/event_displays_15_tracks';
+  const sig = document.getElementById('res-signals');
+  const trk = document.getElementById('res-tracks');
+  if (sig) { sig.href = base + '/wireplanes_15x6_gt_signals.pdf'; }
+  if (trk) { trk.href = base + '/index.html'; }
 }
 
 function onFilt() {
@@ -1070,13 +1105,25 @@ function renderSeedsPlot() {
   const getY   = v => qty === 'loss' ? v.loss : qty === 'absgrad' ? v.absgrad : v.grad;
   const yArrs  = allVals.map(d => getY(d.v));
 
+  const _argmin = arr => arr.indexOf(Math.min(...arr));
+  const _fmtFactor = (x, arr) => {
+    const f = refX[_argmin(arr)];
+    return typeof f === 'number' ? f.toFixed(4) : '—';
+  };
+  const _showStats = (lines) => {
+    const el = document.getElementById('seeds-stats');
+    if (el) el.textContent = lines.join('\n');
+  };
+
   if (allVals.length < 2) {
     // Single seed or clean — just a line
     const label = fNoise === 0 ? 'clean' : `seed ${allVals[0].seed}`;
     traces.push({ x: refX, y: yArrs[0], mode: 'lines+markers', type: 'scatter',
                   name: label, line: { color: '#1565C0', width: 2.5 },
                   marker: { color: '#1565C0', size: 5 } });
-    _flush(); return;
+    _flush();
+    _showStats([`param/GT at min loss:  ${_fmtFactor(null, yArrs[0])}`]);
+    return;
   }
 
   // Mean and std
@@ -1124,10 +1171,19 @@ function renderSeedsPlot() {
   });
 
   _flush();
+
+  // Stats panel: param/GT at min loss for mean and each seed
+  const statsLines = [];
+  statsLines.push(`param/GT at min loss:`);
+  statsLines.push(`  mean  →  ${refX[_argmin(yMean)].toFixed(4)}`);
+  allVals.forEach((d, i) => {
+    statsLines.push(`  seed ${d.seed}  →  ${refX[_argmin(yArrs[i])].toFixed(4)}`);
+  });
+  _showStats(statsLines);
 }
 
 /* ─────────────────────────────── Min-factor vs Cutoff tab ─────────────────────────────── */
-let mfNoise = 1.0, mfSeed = 42, mfPlaneGroup = 'all', mfInited = false;
+let mfNoise = 1.0, mfSeed = 42, mfPlaneGroup = 'all', mfAllSeeds = false, mfInited = false;
 const _mfDivs = new Set();
 
 // Six predefined track groups
@@ -1184,6 +1240,15 @@ function mfRunsByCutoff(param, noise, seed) {
     (noise < 1e-9 || r.noise_seed === seed)
   ).sort((a,b) => a.adc_cutoff - b.adc_cutoff);
 }
+// Returns [{cutoff, runs[]}] across ALL seeds for a given (param, noise)
+function mfAllSeedsByCutoff(param, noise) {
+  const noisy = DATA.runs.filter(r =>
+    r.param_name === param && Math.abs(r.noise_scale - noise) < 1e-9 && noise > 1e-9
+  );
+  const map = {};
+  noisy.forEach(r => { (map[r.adc_cutoff] = map[r.adc_cutoff] || []).push(r); });
+  return Object.keys(map).map(Number).sort((a,b)=>a-b).map(c=>({cutoff:c, runs:map[c]}));
+}
 
 function _mfDo(divId, traces, layout) {
   const cfg = { responsive:true };
@@ -1217,18 +1282,40 @@ function _mfEnsureRow(rowId, prefix) {
   });
 }
 
+function _mfMeanErrTrace(groups, tracks, planes, label, color) {
+  const xs = [], ys = [], errs = [];
+  groups.forEach(({cutoff, runs}) => {
+    const vals = runs.map(r => mfMinFactor(r, tracks, planes)).filter(v => v !== null);
+    if (!vals.length) return;
+    const mean = vals.reduce((a,b)=>a+b,0) / vals.length;
+    const std  = vals.length > 1
+      ? Math.sqrt(vals.reduce((a,b)=>a+(b-mean)**2,0) / vals.length) : 0;
+    xs.push(cutoff); ys.push(mean); errs.push(std);
+  });
+  return { x:xs, y:ys, name:label, type:'scatter', mode:'lines+markers', connectgaps:true,
+    line:{color, width:2}, marker:{color, size:6},
+    error_y:{ type:'data', array:errs, visible:true, color, thickness:1.5, width:4 } };
+}
+
 function _mfRenderFixed() {
   _mfEnsureRow('mf-fixed-row', 'mf-fp-');
   const planes = mfGetPlanes(mfPlaneGroup);
   DATA.params.forEach(p => {
-    const runs = mfRunsByCutoff(p, mfNoise, mfSeed);
-    const xs   = runs.map(r => r.adc_cutoff);
-    const traces = MF_GROUPS.map(g => ({
-      x: xs,
-      y: runs.map(r => mfMinFactor(r, DATA.all_tracks.filter(g.fn), planes)),
-      name: g.label, type:'scatter', mode:'lines+markers', connectgaps:true,
-      line:{ color:g.color, width:2 }, marker:{ color:g.color, size:6 },
-    }));
+    let traces;
+    if (mfAllSeeds) {
+      const groups = mfAllSeedsByCutoff(p, mfNoise);
+      traces = MF_GROUPS.map(g =>
+        _mfMeanErrTrace(groups, DATA.all_tracks.filter(g.fn), planes, g.label, g.color));
+    } else {
+      const runs = mfRunsByCutoff(p, mfNoise, mfSeed);
+      const xs   = runs.map(r => r.adc_cutoff);
+      traces = MF_GROUPS.map(g => ({
+        x: xs,
+        y: runs.map(r => mfMinFactor(r, DATA.all_tracks.filter(g.fn), planes)),
+        name: g.label, type:'scatter', mode:'lines+markers', connectgaps:true,
+        line:{ color:g.color, width:2 }, marker:{ color:g.color, size:6 },
+      }));
+    }
     const lbl = DATA.runs.find(r => r.param_name === p)?.param_label || p;
     _mfDo('mf-fp-' + sid(p), traces, _mfLayout(lbl));
   });
@@ -1241,13 +1328,22 @@ function renderMfCustom() {
   });
   const pg     = document.getElementById('mf-custom-plane-sel')?.value || 'all';
   const planes = mfGetPlanes(pg);
+  const color  = '#1565C0';
   DATA.params.forEach(p => {
-    const runs = mfRunsByCutoff(p, mfNoise, mfSeed);
-    const xs   = runs.map(r => r.adc_cutoff);
-    const ys   = runs.map(r => mfMinFactor(r, tracks, planes));
-    const traces = tracks.length ? [{ x:xs, y:ys,
-      name:`${tracks.length} tracks [${pg}]`, type:'scatter', mode:'lines+markers', connectgaps:true,
-      line:{color:'#1565C0',width:2.5}, marker:{color:'#1565C0',size:7} }] : [];
+    let traces;
+    if (mfAllSeeds) {
+      const groups = mfAllSeedsByCutoff(p, mfNoise);
+      traces = tracks.length
+        ? [_mfMeanErrTrace(groups, tracks, planes, `${tracks.length} tracks [${pg}]`, color)]
+        : [];
+    } else {
+      const runs = mfRunsByCutoff(p, mfNoise, mfSeed);
+      const xs   = runs.map(r => r.adc_cutoff);
+      const ys   = runs.map(r => mfMinFactor(r, tracks, planes));
+      traces = tracks.length ? [{ x:xs, y:ys,
+        name:`${tracks.length} tracks [${pg}]`, type:'scatter', mode:'lines+markers', connectgaps:true,
+        line:{color, width:2.5}, marker:{color, size:7} }] : [];
+    }
     const lbl = DATA.runs.find(r => r.param_name === p)?.param_label || p;
     _mfDo('mf-cp-' + sid(p), traces, _mfLayout(lbl));
   });
@@ -1264,20 +1360,28 @@ function buildMfNoiseSel() {
   const sel = document.getElementById('mf-ns-sel');
   if (!sel) return;
   sel.innerHTML = '';
-  _noiseSeedOptions.forEach((opt,i) => {
+  // Build mf-local options: shared options + "All seeds" if >1 seeds exist
+  const mfOpts = [..._noiseSeedOptions];
+  const noisyBase = mfOpts.find(o => o.noise > 0);
+  if (noisyBase && DATA.seed_options.length > 1)
+    mfOpts.push({ noise: noisyBase.noise, seed: '__all__', label: 'All seeds (mean ± σ)' });
+  mfOpts.forEach((opt,i) => {
     const o = document.createElement('option'); o.value = i; o.textContent = opt.label;
     sel.appendChild(o);
   });
-  // Try to find first noisy option as default; fall back to index 0
-  let idx = _noiseSeedOptions.findIndex(o => o.noise > 0 && Math.abs(o.seed - mfSeed) < 1e-9);
-  if (idx < 0) idx = _noiseSeedOptions.findIndex(o => o.noise > 0);
+  let idx = mfOpts.findIndex(o => o.noise > 0 && o.seed !== '__all__' && Math.abs(o.seed - mfSeed) < 1e-9);
+  if (idx < 0) idx = mfOpts.findIndex(o => o.noise > 0 && o.seed !== '__all__');
   if (idx < 0) idx = 0;
   sel.value = idx;
-  const initOpt = _noiseSeedOptions[idx];
-  if (initOpt) { mfNoise = initOpt.noise; if (initOpt.seed !== null) mfSeed = initOpt.seed; }
+  const initOpt = mfOpts[idx];
+  if (initOpt) {
+    mfNoise = initOpt.noise; mfAllSeeds = initOpt.seed === '__all__';
+    if (!mfAllSeeds && initOpt.seed !== null) mfSeed = initOpt.seed;
+  }
   sel.onchange = () => {
-    const opt = _noiseSeedOptions[+sel.value];
-    mfNoise = opt.noise; if (opt.seed !== null) mfSeed = opt.seed;
+    const opt = mfOpts[+sel.value];
+    mfNoise = opt.noise; mfAllSeeds = opt.seed === '__all__';
+    if (!mfAllSeeds && opt.seed !== null) mfSeed = opt.seed;
     _mfRenderFixed(); renderMfCustom();
   };
 }
@@ -1298,6 +1402,16 @@ function buildMfCheckboxes() {
 
 function mfSelAll()  { DATA.all_tracks.forEach(t=>{const e=document.getElementById('mf-ck-'+sid(t));if(e)e.checked=true; }); renderMfCustom(); }
 function mfSelNone() { DATA.all_tracks.forEach(t=>{const e=document.getElementById('mf-ck-'+sid(t));if(e)e.checked=false;}); renderMfCustom(); }
+function mfSelGroup(group) {
+  DATA.all_tracks.forEach(t => {
+    const e = document.getElementById('mf-ck-' + sid(t));
+    if (!e) return;
+    if (group === 'FirstQuarter')     e.checked = t.includes('FirstQuarter');
+    else if (group === 'LastQuarter') e.checked = t.includes('LastQuarter');
+    else                              e.checked = !t.includes('Quarter');
+  });
+  renderMfCustom();
+}
 
 function initMfTab() {
   buildMfNoiseSel();
@@ -1315,6 +1429,7 @@ window.addEventListener('load', () => {
   onFilt();      // render live plot + update warning
   renderSeriesList();
   renderCanvas();
+  updateResourceLinks();
   if (rightTab === 'minfactor' && !mfInited) initMfTab();
   else if (rightTab === 'seeds') renderSeedsPlot();
 });
