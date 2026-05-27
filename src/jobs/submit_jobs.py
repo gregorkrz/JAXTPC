@@ -61,7 +61,7 @@ Available profiles
   gradient_cutoff_sweep_15trk  1d-gradient landscape: 15 tracks, cutoffs 0–50, per-plane loss;
                                 32 commands (8 noisy seeds) in n_jobs=2 Slurm jobs
   gradient_signal_viewer_20trk  Signal-array run for all 20 tracks → cutoff_loss_landscape_20260526/;
-                                4 jobs (2 params × clean+noisy), --store-arrays, no cutoff sweep
+                                4 jobs (2 params × clean+noisy), N=5, --store-arrays, 128 GB RAM
 
 Profile runs pass --wandb-tags <profile> to run_optimization.py (optional extras via
 --wandb-extra-tags comma,separated).
@@ -4850,9 +4850,12 @@ def profile_gradient_signal_viewer_20trk(
 
     Params  : diffusion_trans_cm2_us, diffusion_long_cm2_us
     Noise   : 0.0 (seed 42) and 1.0 (seed 42)
-    N=20, ±75% range, step_size=1.0 mm, max_deposits=5000, adc_cutoff=0.
+    N=5, ±75% range, step_size=1.0 mm, max_deposits=5000, adc_cutoff=0.
     Flags   : --store-arrays --store-per-plane-loss  (no cutoff sweep)
     Output  : $RESULTS_DIR/1d_gradients/cutoff_loss_landscape_20260526/
+
+    N=5 (11 sweep points) is enough for the signal viewer and avoids the OOM
+    that N=20 causes: 41 points × 20 tracks × 6 planes fills >64 GB RAM.
 
     4 jobs total (2 params × 2 noise conditions), chained sequentially so each
     has its own GPU allocation.  Feed results to generate_gradient_viewer.py to
@@ -4871,7 +4874,7 @@ def profile_gradient_signal_viewer_20trk(
             cmd = make_gradient_command(
                 param=param,
                 tracks=all_tracks_arg,
-                N=20,
+                N=5,
                 range_frac=0.75,
                 noise_scale=noise_scale,
                 noise_seed=noise_seed,
@@ -4886,7 +4889,7 @@ def profile_gradient_signal_viewer_20trk(
                 cmd,
                 time=time,
                 submit=submit,
-                mem_gb=64,
+                mem_gb=128,
                 print_sbatch_command=print_sbatch_only,
                 dependency=prev_job,
             )
