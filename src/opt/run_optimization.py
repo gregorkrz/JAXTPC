@@ -326,11 +326,12 @@ def parse_params(params_str):
 
 
 def parse_tracks(tracks_str):
-    """Parse '+'-separated preset names or name:dx,dy,dz:mom_mev specs.
+    """Parse '+'-separated preset names or name:dx,dy,dz:mom_mev[:x,y,z] specs.
 
-    '+' separates tracks; ',' is used only inside direction components.
+    '+' separates tracks; ',' is used only inside direction/position components.
     Mixed input is supported, e.g. 'diagonal+mytrack:0.1,0.2,0.9:500'.
-    Returns list of dicts: {name, direction (tuple), momentum_mev}.
+    Optional 4th field 'x,y,z' sets a per-track start position in mm.
+    Returns list of dicts: {name, direction (tuple), momentum_mev, start_position_mm (tuple or None)}.
     """
     specs = []
     for item in tracks_str.split('+'):
@@ -338,11 +339,12 @@ def parse_tracks(tracks_str):
         if not item:
             continue
         if ':' in item:
-            # Full spec: name:dx,dy,dz:momentum_mev
+            # Full spec: name:dx,dy,dz:momentum_mev[:x,y,z]
             parts = item.split(':')
-            if len(parts) != 3:
+            if len(parts) not in (3, 4):
                 raise ValueError(
-                    f'Custom track must be name:dx,dy,dz:momentum_mev, got {item!r}')
+                    f'Custom track must be name:dx,dy,dz:momentum_mev or '
+                    f'name:dx,dy,dz:momentum_mev:x,y,z, got {item!r}')
             name = parts[0].strip()
             try:
                 direction = tuple(float(x) for x in parts[1].split(','))
@@ -354,7 +356,16 @@ def parse_tracks(tracks_str):
                 momentum_mev = float(parts[2])
             except ValueError:
                 raise ValueError(f'Bad momentum in track spec {item!r}')
-            specs.append(dict(name=name, direction=direction, momentum_mev=momentum_mev))
+            start_position_mm = None
+            if len(parts) == 4:
+                try:
+                    start_position_mm = tuple(float(x) for x in parts[3].split(','))
+                except ValueError:
+                    raise ValueError(f'Bad start position in track spec {item!r}')
+                if len(start_position_mm) != 3:
+                    raise ValueError(f'Start position must have 3 components in {item!r}')
+            specs.append(dict(name=name, direction=direction, momentum_mev=momentum_mev,
+                               start_position_mm=start_position_mm))
         else:
             # Preset name
             if item not in TRACK_PRESETS:
@@ -363,7 +374,8 @@ def parse_tracks(tracks_str):
                     f'Known: {list(TRACK_PRESETS)}. '
                     f'Use name:dx,dy,dz:mom_mev for custom tracks.')
             direction, momentum_mev = TRACK_PRESETS[item]
-            specs.append(dict(name=item, direction=direction, momentum_mev=momentum_mev))
+            specs.append(dict(name=item, direction=direction, momentum_mev=momentum_mev,
+                               start_position_mm=None))
     if not specs:
         raise ValueError('--tracks produced no entries')
     return specs
@@ -1692,7 +1704,7 @@ def main():
     for track_idx, ts in enumerate(track_specs):
         print(f'  track {ts["name"]}  dir={ts["direction"]}  T={ts["momentum_mev"]} MeV')
         track_gt = generate_muon_track(
-            start_position_mm=(0.0, 0.0, 0.0),
+            start_position_mm=ts['start_position_mm'] if ts['start_position_mm'] is not None else track_start_mm,
             direction=ts['direction'],
             kinetic_energy_mev=ts['momentum_mev'],
             step_size_mm=args.gt_step_size,
@@ -1760,7 +1772,7 @@ def main():
 
         for ti, ts in enumerate(track_specs):
             track_ph = generate_muon_track(
-                start_position_mm=track_start_mm,
+                start_position_mm=ts['start_position_mm'] if ts['start_position_mm'] is not None else track_start_mm,
                 direction=ts['direction'],
                 kinetic_energy_mev=ts['momentum_mev'],
                 step_size_mm=phase['step_size'],

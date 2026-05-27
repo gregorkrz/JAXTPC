@@ -121,6 +121,11 @@ def _b64z(arr):
     return base64.b64encode(zlib.compress(np.asarray(arr, dtype=np.float32).tobytes(), 6)).decode()
 
 
+def _inflate_b64z(b64_str: str) -> np.ndarray:
+    """Decompress a b64z-encoded flat float32 array."""
+    return np.frombuffer(zlib.decompress(base64.b64decode(b64_str)), dtype=np.float32).copy()
+
+
 def build_data(pkl, bbox_override=None):
     """Build viewer data dict from a pkl.
 
@@ -163,10 +168,12 @@ def build_data(pkl, bbox_override=None):
     arrays = {}
     refs   = {}
     bboxes = {}
+    dims   = {}
     pixel_arrays = {}
     for track in track_names:
         arrays[track] = {}
         refs[track]   = {}
+        dims[track]   = {}
         pixel_arrays[track] = {}
         gt_all  = gt_arrays_all[track]   # list of n_planes arrays [n_wire, n_time]
         sim_all = sim_arrays_all[track]  # list[n_sweep] of list[n_planes] arrays
@@ -205,6 +212,7 @@ def build_data(pkl, bbox_override=None):
                 'data':     _b64z(combined),
             }
             refs[track][plane] = {'wire': wire_ref, 'time': time_ref}
+            dims[track][plane] = {'wire_lo': wl, 'time_lo': tl, 'n_wire': nw, 'n_time': nt}
 
             if pixel_loss_all and pixel_grad_all:
                 loss_sweeps = pixel_loss_all[track]
@@ -252,6 +260,7 @@ def build_data(pkl, bbox_override=None):
         'track_names':   track_names,
         'arrays':        arrays,
         'refs':          refs,
+        'dims':          dims,
         'bboxes':        bboxes,
         'loss_total':    pkl['loss_values'],
         'grad_total':    pkl['grad_values'],
@@ -263,6 +272,9 @@ def build_data(pkl, bbox_override=None):
     }
 
 
+# ── keys that hold large binary blobs (excluded from PARAMS meta JSON) ────────
+_DATA_KEYS = ('arrays_clean', 'arrays_noisy', 'pixel_arrays_clean', 'pixel_arrays_noisy')
+
 # ── HTML template ─────────────────────────────────────────────────────────────
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -272,6 +284,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <title>__TITLE__</title>
 <script src="https://cdn.plot.ly/plotly-2.26.0.min.js" charset="utf-8"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pako/2.1.0/pako.min.js"></script>
+__DATA_SCRIPTS__
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f0f2f5;color:#222}
@@ -426,61 +439,126 @@ tr.sel:hover td{background:#BBDEFB}
 </div><!-- /.wrap -->
 
 <script>
-const PARAMS = __PARAMS_JSON__;
+const PARAMS = __PARAMS_META_JSON__;
+
+/* ── per-value lazy loading ──────────────────────────────────────────────────
+   Each param_pi_val_vi.js file calls VALUE_DATA_READY(pi, vi, data) when it
+   executes.  vi=0 is the GT frame; vi=1..n_sweep are the simulated sweep pts.
+   The browser loads them all in parallel via <script defer> tags.
+── */
+const _valueLoaded = PARAMS.map(p => new Array(p.n_sweep + 1).fill(false));
+const _whenValueLoaded = PARAMS.map(p =>
+  Array.from({length: p.n_sweep + 1}, () => {
+    const o = {}; o.promise = new Promise(r => { o._r = r; }); return o;
+  })
+);
+
+/* Buffer storage: [pi][vi]['track/plane'] = Float32Array (single frame, n_wire×n_time) */
+const _cleanBufs = PARAMS.map(p => Array.from({length: p.n_sweep + 1}, () => ({})));
+const _noisyBufs = PARAMS.map(p => Array.from({length: p.n_sweep + 1}, () => ({})));
+/* Pixel bufs: [pi][vi]['track/plane'] = {loss: Float32Array, grad: Float32Array} */
+const _pixelCleanBufs = PARAMS.map(p => Array.from({length: p.n_sweep + 1}, () => ({})));
+const _pixelNoisyBufs = PARAMS.map(p => Array.from({length: p.n_sweep + 1}, () => ({})));
+
+function _inflateB64(b64) {
+  const bin = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  return new Float32Array(pako.inflate(bin).buffer);
+}
+
+function _storeValueData(pi, vi, data) {
+  if (data.arrays_clean) {
+    for (const track of Object.keys(data.arrays_clean)) {
+      for (const plane of Object.keys(data.arrays_clean[track])) {
+        _cleanBufs[pi][vi][track + '/' + plane] = _inflateB64(data.arrays_clean[track][plane].data);
+      }
+    }
+  }
+  if (data.arrays_noisy) {
+    for (const track of Object.keys(data.arrays_noisy)) {
+      for (const plane of Object.keys(data.arrays_noisy[track])) {
+        _noisyBufs[pi][vi][track + '/' + plane] = _inflateB64(data.arrays_noisy[track][plane].data);
+      }
+    }
+  }
+  if (data.pixel_clean) {
+    for (const track of Object.keys(data.pixel_clean)) {
+      for (const plane of Object.keys(data.pixel_clean[track])) {
+        const pa = data.pixel_clean[track][plane];
+        _pixelCleanBufs[pi][vi][track + '/' + plane] = {
+          loss: _inflateB64(pa.data_loss), grad: _inflateB64(pa.data_grad),
+        };
+      }
+    }
+  }
+  if (data.pixel_noisy) {
+    for (const track of Object.keys(data.pixel_noisy)) {
+      for (const plane of Object.keys(data.pixel_noisy[track])) {
+        const pa = data.pixel_noisy[track][plane];
+        _pixelNoisyBufs[pi][vi][track + '/' + plane] = {
+          loss: _inflateB64(pa.data_loss), grad: _inflateB64(pa.data_grad),
+        };
+      }
+    }
+  }
+}
+
+function VALUE_DATA_READY(pi, vi, data) {
+  _storeValueData(pi, vi, data);
+  _valueLoaded[pi][vi] = true;
+  _whenValueLoaded[pi][vi]._r(vi);
+  if (_uiReady) {
+    const needsEvd = (_evdParamIdx === pi) && (vi === 0 || vi === _sweepPt[pi]);
+    const needsTrace = (vi === 0) || _entries.some(e => e.pi === pi && e.pt === vi)
+                     || (_trParamIdx === pi && vi === _sweepPt[pi]);
+    if (needsEvd || needsTrace) { _drawEvd(); _drawTraces(); }
+  }
+}
 
 /* ── colour palette ── */
 const _PALETTE = ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd',
   '#8c564b','#e377c2','#7f7f7f','#bcbd22','#17becf',
   '#aec7e8','#ffbb78','#98df8a','#ff9896','#c5b0d5'];
 
-/* ── inflate / data access ── */
-const _inflClean = {}, _inflNoisy = {};
-const _inflPixelLoss = {}, _inflPixelGrad = {};
-
-function _getBuf(pi, track, plane, useNoisy) {
-  const cache = useNoisy ? _inflNoisy : _inflClean;
-  const k = pi + '/' + track + '/' + plane;
-  if (cache[k]) return cache[k];
-  const p = PARAMS[pi];
-  const arrays = useNoisy ? p.arrays_noisy : p.arrays_clean;
-  if (!arrays) return _getBuf(pi, track, plane, false);
-  const a = arrays[track][plane];
-  const bin = Uint8Array.from(atob(a.data), c => c.charCodeAt(0));
-  cache[k] = new Float32Array(pako.inflate(bin).buffer);
-  return cache[k];
-}
-
+/* ── data access ─────────────────────────────────────────────────────────────
+   All functions take an explicit pt (0=GT, 1..n_sweep=sweep).
+   Dims come from PARAMS meta so they're always available before any value loads.
+── */
 function _dims(pi, track, plane) {
-  return (PARAMS[pi].arrays_clean || PARAMS[pi].arrays_noisy)[track][plane];
+  return (PARAMS[pi].dims[track] && PARAMS[pi].dims[track][plane]) || null;
 }
 
-function _ptBuf(pi, track, plane, pt, noisy) {
-  return _getBuf(pi, track, plane, pt === 0 && noisy);
+function _getBuf(pi, pt, track, plane, useNoisy) {
+  if (!_valueLoaded[pi][pt]) return null;
+  const k = track + '/' + plane;
+  if (useNoisy) return _noisyBufs[pi][pt][k] || _cleanBufs[pi][pt][k] || null;
+  return _cleanBufs[pi][pt][k] || null;
 }
 
 function _getZ(pi, track, plane, pt, noisy=false) {
   const a = _dims(pi, track, plane);
-  const buf = _ptBuf(pi, track, plane, pt, noisy);
-  const off = pt * a.n_wire * a.n_time;
+  if (!a) return [];
+  const buf = _getBuf(pi, pt, track, plane, pt === 0 && noisy);
+  if (!buf) return [];
   const z = [];
   for (let w = 0; w < a.n_wire; w++) {
     const row = [];
-    for (let t = 0; t < a.n_time; t++) row.push(buf[off + w * a.n_time + t]);
+    for (let t = 0; t < a.n_time; t++) row.push(buf[w * a.n_time + t]);
     z.push(row);
   }
   return z;
 }
 
 function _getZDiff(pi, track, plane, pt, noisy=false) {
-  const a    = _dims(pi, track, plane);
-  const bufS = _getBuf(pi, track, plane, false);
-  const bufG = _ptBuf(pi, track, plane, 0, noisy);
-  const offS = pt * a.n_wire * a.n_time, offG = 0;
+  const a = _dims(pi, track, plane);
+  if (!a) return [];
+  const bufS = _getBuf(pi, pt, track, plane, false);
+  const bufG = _getBuf(pi, 0, track, plane, noisy);
+  if (!bufS || !bufG) return [];
   const z = [];
   for (let w = 0; w < a.n_wire; w++) {
     const row = [];
     for (let t = 0; t < a.n_time; t++)
-      row.push(bufS[offS + w * a.n_time + t] - bufG[offG + w * a.n_time + t]);
+      row.push(bufS[w * a.n_time + t] - bufG[w * a.n_time + t]);
     z.push(row);
   }
   return z;
@@ -488,57 +566,49 @@ function _getZDiff(pi, track, plane, pt, noisy=false) {
 
 function _getTimeTrace(pi, track, plane, pt, wireAbs, noisy=false) {
   const a = _dims(pi, track, plane);
+  if (!a) return null;
   const w = wireAbs - a.wire_lo;
   if (w < 0 || w >= a.n_wire) return null;
-  const buf = _ptBuf(pi, track, plane, pt, noisy);
-  const off = pt * a.n_wire * a.n_time + w * a.n_time;
+  const buf = _getBuf(pi, pt, track, plane, pt === 0 && noisy);
+  if (!buf) return null;
+  const off = w * a.n_time;
   return {x: Array.from({length:a.n_time}, (_,i) => a.time_lo+i),
           y: Array.from(buf.slice(off, off+a.n_time))};
 }
 
 function _getWireTrace(pi, track, plane, pt, timeAbs, noisy=false) {
   const a = _dims(pi, track, plane);
+  if (!a) return null;
   const t = timeAbs - a.time_lo;
   if (t < 0 || t >= a.n_time) return null;
-  const buf = _ptBuf(pi, track, plane, pt, noisy);
-  const off = pt * a.n_wire * a.n_time;
+  const buf = _getBuf(pi, pt, track, plane, pt === 0 && noisy);
+  if (!buf) return null;
   const y = [];
-  for (let w = 0; w < a.n_wire; w++) y.push(buf[off + w * a.n_time + t]);
+  for (let w = 0; w < a.n_wire; w++) y.push(buf[w * a.n_time + t]);
   return {x: Array.from({length:a.n_wire}, (_,i) => a.wire_lo+i), y};
 }
 
-function _pixelArrays(pi, useNoisy) {
-  const p = PARAMS[pi];
-  return (useNoisy && p.pixel_arrays_noisy) ? p.pixel_arrays_noisy
-       : (p.pixel_arrays_clean || null);
-}
-
 function _getPixelZ(pi, track, plane, pt, type, useNoisy) {
-  if (pt === 0) return null;
-  const pxa = _pixelArrays(pi, useNoisy);
-  if (!pxa || !pxa[track] || !pxa[track][plane]) return null;
-  const pa = pxa[track][plane];
-  const swIdx = pt - 1;
-  const nw = pa.n_wire, nt = pa.n_time;
-  const cacheKey = pi+'/'+track+'/'+plane+'/'+type+'/'+(useNoisy?'n':'c');
-  const cache = type === 'loss' ? _inflPixelLoss : _inflPixelGrad;
-  if (!cache[cacheKey]) {
-    const bin = Uint8Array.from(atob(pa['data_'+type]), c => c.charCodeAt(0));
-    cache[cacheKey] = new Float32Array(pako.inflate(bin).buffer);
-  }
-  const buf = cache[cacheKey];
-  const off = swIdx * nw * nt;
+  if (pt === 0 || !_valueLoaded[pi][pt]) return null;
+  const k = track + '/' + plane;
+  const noisyEntry = _pixelNoisyBufs[pi][pt][k];
+  const cleanEntry = _pixelCleanBufs[pi][pt][k];
+  const entry = (useNoisy && noisyEntry) ? noisyEntry : cleanEntry;
+  if (!entry) return null;
+  const buf = entry[type];
+  if (!buf) return null;
+  const a = _dims(pi, track, plane);
+  const nw = a.n_wire, nt = a.n_time;
   const thresh = parseFloat(document.getElementById('pixel-mask-thresh').value) || 0;
   let gtBuf = null;
-  if (thresh > 0) gtBuf = _getBuf(pi, track, plane, useNoisy);
+  if (thresh > 0) gtBuf = _getBuf(pi, 0, track, plane, useNoisy);
   const z = [];
   for (let w = 0; w < nw; w++) {
     const row = [];
     for (let t = 0; t < nt; t++) {
-      const val = buf[off + w * nt + t];
+      const val = buf[w * nt + t];
       if (thresh > 0 && gtBuf) {
-        const a = _dims(pi, track, plane);
-        row.push(Math.abs(gtBuf[w * a.n_time + t]) < thresh ? null : val);
+        row.push(Math.abs(gtBuf[w * nt + t]) < thresh ? null : val);
       } else {
         row.push(val);
       }
@@ -577,6 +647,7 @@ function _makeLabel(e) {
 function _drawEvd() {
   const pi = _evdParamIdx;
   const a  = _dims(pi, _evdTrack, _evdPlane);
+  if (!a) return;
   const xArr = Array.from({length:a.n_time}, (_,i) => a.time_lo+i);
   const yArr = Array.from({length:a.n_wire}, (_,i) => a.wire_lo+i);
   const pt = Math.max(1, _sweepPt[pi]);
@@ -592,6 +663,8 @@ function _drawEvd() {
     z = _getZDiff(pi, _evdTrack, _evdPlane, pt, _noiseOn);
     titleSuffix = 'Sim−GT @ ' + _ptLabel(pi, pt);
   }
+
+  if (!z.length) return;  // value not yet loaded — skip until VALUE_DATA_READY fires
 
   let absmax = 0;
   z.forEach(row => row.forEach(v => { if (Math.abs(v) > absmax) absmax = Math.abs(v); }));
@@ -683,10 +756,10 @@ let _pixelLossInited = false, _pixelGradInited = false;
 function _drawPixelMaps() {
   const pi = _evdParamIdx;
   const pt = Math.max(1, _sweepPt[pi]);
-  const pxa = _pixelArrays(pi, _noiseOn);
+  const hasPx = PARAMS[pi].has_pixel_clean || PARAMS[pi].has_pixel_noisy;
   const lossEl = document.getElementById('evd-pixel-loss');
   const gradEl = document.getElementById('evd-pixel-grad');
-  if (!pxa) {
+  if (!hasPx) {
     const msg = '<div style="color:#aaa;padding:140px 10px;text-align:center;font-size:12px">No pixel data<br>(re-run with --store-per-pixel-loss-and-grad)</div>';
     lossEl.innerHTML = msg; gradEl.innerHTML = msg;
     _pixelLossInited = false; _pixelGradInited = false;
@@ -881,11 +954,10 @@ let _histInited = false;
 
 function _getFlatADC(e, plane) {
   const a = _dims(e.pi, e.track, plane);
-  const buf = _ptBuf(e.pi, e.track, plane, e.pt, e.noisy || false);
-  const off = e.pt * a.n_wire * a.n_time;
-  const flat = new Array(a.n_wire * a.n_time);
-  for (let i = 0; i < flat.length; i++) flat[i] = buf[off + i];
-  return flat;
+  if (!a) return [];
+  const buf = _getBuf(e.pi, e.pt, e.track, plane, e.noisy || false);
+  if (!buf) return [];
+  return Array.from(buf);
 }
 
 function _drawHist() {
@@ -1177,7 +1249,7 @@ function _initUI() {
   _renderTable(); _drawEvd(); _drawTraces();
 }
 
-window.addEventListener('load', () => {
+window.addEventListener('load', async () => {
   // Mode buttons
   document.querySelectorAll('.mode-btn').forEach(b => {
     b.addEventListener('click', () => {
@@ -1209,6 +1281,11 @@ window.addEventListener('load', () => {
   document.getElementById('btn-upd').addEventListener('click', _updateSel);
   document.getElementById('btn-cxl').addEventListener('click', _cancelEdit);
 
+  // Wait for GT + first sweep point of first param before showing the UI
+  await Promise.all([
+    _whenValueLoaded[0][0].promise,
+    _whenValueLoaded[0][1].promise,
+  ]);
   document.getElementById('loading').style.display = 'none';
   _initUI();
 });
@@ -1259,16 +1336,125 @@ def _load_pkl(pkl_path: Path):
     """Load one pkl and return its data dict, or None if arrays are missing."""
     print(f'  Loading {pkl_path.name} …')
     with open(pkl_path, 'rb') as f:
-        pkl = pickle.load(f)
-    if 'per_track_gt_arrays' not in pkl:
+        raw_pkl = pickle.load(f)
+    if 'per_track_gt_arrays' not in raw_pkl:
         print(f'  SKIP {pkl_path.name}: no array data (re-run with --store-arrays)')
         return None
     print(f'  Building data …')
-    data = build_data(pkl)
-    data['_pkl_path'] = pkl_path
+    data = build_data(raw_pkl)
+    data['_raw_pkl'] = raw_pkl
     print(f'  Tracks: {data["track_names"]},  Planes: {data["plane_names"]},  '
           f'N sweep={data["n_sweep"]},  noise={data["noise_scale"]}')
     return data
+
+
+def _merge_key(pkl: dict) -> tuple:
+    """Grouping key: pkls with the same key belong to one sweep series."""
+    return (
+        pkl.get('param_name'),
+        round(float(pkl.get('noise_scale', 0.0)), 6),
+        int(pkl.get('noise_seed', 42)),
+        round(float(pkl.get('adc_cutoff', 0.0)), 6),
+    )
+
+
+def _merge_pkl_group(pkls: list) -> dict:
+    """Merge multiple single-sweep-point pkls (from per-factor jobs) into one.
+
+    Pkls are sorted by factor value.  Sweep-indexed lists are concatenated;
+    non-sweep fields (GT arrays, metadata) come from the pkl whose factor is
+    closest to 1.0 (GT point), which is always present.
+    """
+    pkls_sorted = sorted(pkls, key=lambda p: (p['factors'] or [0])[0])
+    base = min(pkls_sorted,
+               key=lambda p: abs((p['factors'] or [0])[0] - 1.0))
+
+    merged = dict(base)
+
+    sweep_scalar_keys = ['factors', 'param_values', 'p_n_values',
+                         'loss_values', 'grad_values', 'grad_times_s']
+    for k in sweep_scalar_keys:
+        merged[k] = []
+        for p in pkls_sorted:
+            merged[k].extend(p.get(k, []))
+
+    track_names = [ts['name'] for ts in base['track_specs']]
+    plane_names = base.get('plane_names', [])
+
+    merged['per_track_loss_values'] = {t: [] for t in track_names}
+    merged['per_track_grad_values'] = {t: [] for t in track_names}
+    for p in pkls_sorted:
+        for t in track_names:
+            merged['per_track_loss_values'][t].extend(p['per_track_loss_values'][t])
+            merged['per_track_grad_values'][t].extend(p['per_track_grad_values'][t])
+
+    if 'per_track_sim_arrays' in base:
+        merged['per_track_sim_arrays'] = {t: [] for t in track_names}
+        for p in pkls_sorted:
+            if 'per_track_sim_arrays' in p:
+                for t in track_names:
+                    merged['per_track_sim_arrays'][t].extend(p['per_track_sim_arrays'][t])
+
+    if 'per_track_pixel_loss' in base:
+        merged['per_track_pixel_loss'] = {t: [] for t in track_names}
+        merged['per_track_pixel_grad'] = {t: [] for t in track_names}
+        for p in pkls_sorted:
+            if 'per_track_pixel_loss' in p:
+                for t in track_names:
+                    merged['per_track_pixel_loss'][t].extend(p['per_track_pixel_loss'][t])
+                    merged['per_track_pixel_grad'][t].extend(p['per_track_pixel_grad'][t])
+
+    if 'per_plane_loss_values' in base:
+        merged['per_plane_loss_values'] = {t: {pn: [] for pn in plane_names}
+                                            for t in track_names}
+        for p in pkls_sorted:
+            if 'per_plane_loss_values' in p:
+                for t in track_names:
+                    for pn in plane_names:
+                        merged['per_plane_loss_values'][t][pn].extend(
+                            p['per_plane_loss_values'][t][pn])
+
+    return merged
+
+
+def _load_and_merge_dir(dir_path: Path) -> list:
+    """Load all pkls in dir_path, merge per-factor groups, return data dicts."""
+    pkls_paths = sorted(dir_path.glob('*.pkl'))
+    if not pkls_paths:
+        print(f'No *.pkl files found in {dir_path}')
+        return []
+    print(f'Found {len(pkls_paths)} pkl file(s) in {dir_path}')
+
+    raw_pkls = []
+    for pkl_path in pkls_paths:
+        print(f'  Loading {pkl_path.name} …')
+        with open(pkl_path, 'rb') as f:
+            raw = pickle.load(f)
+        if 'per_track_gt_arrays' not in raw:
+            print(f'  SKIP {pkl_path.name}: no array data (re-run with --store-arrays)')
+            continue
+        raw_pkls.append(raw)
+
+    # Group by merge key; merge multi-pkl groups into one
+    groups: dict = defaultdict(list)
+    for raw in raw_pkls:
+        groups[_merge_key(raw)].append(raw)
+
+    all_data = []
+    for key, group in sorted(groups.items()):
+        if len(group) > 1:
+            print(f'  Merging {len(group)} factor pkls for '
+                  f'{key[0]} noise={key[1]} cutoff={key[3]} …')
+            raw_pkl = _merge_pkl_group(group)
+        else:
+            raw_pkl = group[0]
+        print(f'  Building data …')
+        data = build_data(raw_pkl)
+        data['_raw_pkl'] = raw_pkl
+        print(f'  Tracks: {data["track_names"]},  Planes: {data["plane_names"]},  '
+              f'N sweep={data["n_sweep"]},  noise={data["noise_scale"]}')
+        all_data.append(data)
+    return all_data
 
 
 def _group_by_param(all_data: list) -> list:
@@ -1292,14 +1478,21 @@ def _group_by_param(all_data: list) -> list:
         base = clean if clean else noisy
 
         # Rebuild noisy arrays with the clean bbox so the track stays visible.
-        if clean and noisy and '_pkl_path' in noisy:
+        if clean and noisy and '_raw_pkl' in noisy:
+            print(f'  Rebuilding noisy arrays for {param_name} using clean bbox …')
+            noisy_rebuilt = build_data(noisy['_raw_pkl'], bbox_override=clean['bboxes'])
+            noisy_arrays = noisy_rebuilt['arrays']
+            noisy_pixel  = noisy_rebuilt['pixel_arrays']
+        elif clean and noisy and '_pkl_path' in noisy:  # legacy fallback
             print(f'  Rebuilding noisy arrays for {param_name} using clean bbox …')
             with open(noisy['_pkl_path'], 'rb') as f:
                 noisy_pkl = pickle.load(f)
             noisy_rebuilt = build_data(noisy_pkl, bbox_override=clean['bboxes'])
             noisy_arrays = noisy_rebuilt['arrays']
+            noisy_pixel  = noisy_rebuilt['pixel_arrays']
         else:
             noisy_arrays = noisy['arrays'] if noisy else None
+            noisy_pixel  = noisy['pixel_arrays'] if noisy else None
 
         entry = {
             'param_name':   param_name,
@@ -1313,22 +1506,145 @@ def _group_by_param(all_data: list) -> list:
             'plane_names':  base['plane_names'],
             'track_names':  base['track_names'],
             'refs':         base['refs'],
+            'dims':         base['dims'],
             'has_noise':    (clean is not None and noisy is not None),
             'noise_scale':  float(noisy['noise_scale']) if noisy else 0.0,
-            'arrays_clean': clean['arrays'] if clean else base['arrays'],
-            'arrays_noisy': noisy_arrays,
-            'pixel_arrays_clean': clean['pixel_arrays'] if clean else None,
-            'pixel_arrays_noisy': (noisy_rebuilt['pixel_arrays'] if (clean and noisy and '_pkl_path' in noisy) else (noisy['pixel_arrays'] if noisy else None)),
+            # Large binary blobs — kept in params_list but excluded from PARAMS meta JSON
+            'arrays_clean':        clean['arrays'] if clean else base['arrays'],
+            'arrays_noisy':        noisy_arrays,
+            'pixel_arrays_clean':  clean['pixel_arrays'] if clean else None,
+            'pixel_arrays_noisy':  noisy_pixel,
         }
         params_list.append(entry)
     return params_list
 
 
 def _write_html(params_list: list, out_path: Path, title: str):
+    """Write viewer HTML with per-(param, value) data files for lazy loading."""
     print(f'  Serialising {len(params_list)} param(s) …')
-    params_json = json.dumps(params_list, cls=_NpEncoder, separators=(',', ':'))
+
+    data_dir_name = out_path.stem + '_data'
+    data_dir = out_path.parent / data_dir_name
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    script_tags = []
+    params_meta = []
+
+    for pi, p in enumerate(params_list):
+        n_sweep = p['n_sweep']
+
+        # PARAMS meta: everything small (no binary blobs)
+        param_meta = {k: v for k, v in p.items()
+                      if k not in _DATA_KEYS and not k.startswith('_')}
+        param_meta['has_pixel_clean'] = p.get('pixel_arrays_clean') is not None
+        param_meta['has_pixel_noisy'] = p.get('pixel_arrays_noisy') is not None
+        params_meta.append(param_meta)
+
+        # Pre-decompress stacked arrays once per (track, plane) to avoid
+        # decompressing the same blob n_sweep+1 times.
+        clean_frames: dict = {}   # (track, plane) -> np.ndarray (n_pts, nw, nt)
+        noisy_frames: dict = {}
+        px_clean_loss: dict = {}  # (track, plane) -> np.ndarray (n_sweep, nw, nt)
+        px_clean_grad: dict = {}
+        px_noisy_loss: dict = {}
+        px_noisy_grad: dict = {}
+
+        arrays_clean = p.get('arrays_clean')
+        if arrays_clean:
+            for track, tdata in arrays_clean.items():
+                for plane, pdata in tdata.items():
+                    nw, nt = pdata['n_wire'], pdata['n_time']
+                    buf = _inflate_b64z(pdata['data'])
+                    n_pts = len(buf) // (nw * nt)
+                    clean_frames[(track, plane)] = buf.reshape(n_pts, nw, nt)
+
+        arrays_noisy = p.get('arrays_noisy')
+        if arrays_noisy:
+            for track, tdata in arrays_noisy.items():
+                for plane, pdata in tdata.items():
+                    nw, nt = pdata['n_wire'], pdata['n_time']
+                    buf = _inflate_b64z(pdata['data'])
+                    n_pts = len(buf) // (nw * nt)
+                    noisy_frames[(track, plane)] = buf.reshape(n_pts, nw, nt)
+
+        pixel_clean = p.get('pixel_arrays_clean')
+        if pixel_clean:
+            for track, tdata in pixel_clean.items():
+                for plane, pdata in tdata.items():
+                    nw, nt = pdata['n_wire'], pdata['n_time']
+                    lbuf = _inflate_b64z(pdata['data_loss'])
+                    gbuf = _inflate_b64z(pdata['data_grad'])
+                    n_pts = len(lbuf) // (nw * nt)
+                    px_clean_loss[(track, plane)] = lbuf.reshape(n_pts, nw, nt)
+                    px_clean_grad[(track, plane)] = gbuf.reshape(n_pts, nw, nt)
+
+        pixel_noisy = p.get('pixel_arrays_noisy')
+        if pixel_noisy:
+            for track, tdata in pixel_noisy.items():
+                for plane, pdata in tdata.items():
+                    nw, nt = pdata['n_wire'], pdata['n_time']
+                    lbuf = _inflate_b64z(pdata['data_loss'])
+                    gbuf = _inflate_b64z(pdata['data_grad'])
+                    n_pts = len(lbuf) // (nw * nt)
+                    px_noisy_loss[(track, plane)] = lbuf.reshape(n_pts, nw, nt)
+                    px_noisy_grad[(track, plane)] = gbuf.reshape(n_pts, nw, nt)
+
+        # Write one JS file per sweep value (vi=0 = GT, vi=1..n_sweep = sim pts)
+        for vi in range(n_sweep + 1):
+            val_data: dict = {}
+
+            if clean_frames:
+                val_data['arrays_clean'] = {}
+                for (track, plane), frames in clean_frames.items():
+                    if vi < len(frames):
+                        val_data['arrays_clean'].setdefault(track, {})[plane] = {
+                            'data': _b64z(frames[vi]),
+                        }
+
+            if noisy_frames:
+                val_data['arrays_noisy'] = {}
+                for (track, plane), frames in noisy_frames.items():
+                    if vi < len(frames):
+                        val_data['arrays_noisy'].setdefault(track, {})[plane] = {
+                            'data': _b64z(frames[vi]),
+                        }
+
+            # Pixel arrays only exist for sweep points (vi >= 1); sw_idx is 0-based
+            if vi >= 1:
+                sw_idx = vi - 1
+                if px_clean_loss:
+                    val_data['pixel_clean'] = {}
+                    for (track, plane), lframes in px_clean_loss.items():
+                        if sw_idx < len(lframes):
+                            gframes = px_clean_grad.get((track, plane))
+                            val_data['pixel_clean'].setdefault(track, {})[plane] = {
+                                'data_loss': _b64z(lframes[sw_idx]),
+                                'data_grad': _b64z(gframes[sw_idx]) if gframes is not None else '',
+                            }
+                if px_noisy_loss:
+                    val_data['pixel_noisy'] = {}
+                    for (track, plane), lframes in px_noisy_loss.items():
+                        if sw_idx < len(lframes):
+                            gframes = px_noisy_grad.get((track, plane))
+                            val_data['pixel_noisy'].setdefault(track, {})[plane] = {
+                                'data_loss': _b64z(lframes[sw_idx]),
+                                'data_grad': _b64z(gframes[sw_idx]) if gframes is not None else '',
+                            }
+
+            data_js = (f'VALUE_DATA_READY({pi},{vi},'
+                       + json.dumps(val_data, cls=_NpEncoder, separators=(',', ':'))
+                       + ');')
+            val_path = data_dir / f'param_{pi}_val_{vi}.js'
+            val_path.write_text(data_js, encoding='utf-8')
+            print(f'  → {val_path.name}  ({val_path.stat().st_size / 1e6:.2f} MB)')
+            script_tags.append(
+                f'<script defer src="{data_dir_name}/param_{pi}_val_{vi}.js"></script>')
+
+    params_meta_json = json.dumps(params_meta, cls=_NpEncoder, separators=(',', ':'))
+    scripts_html = '\n'.join(script_tags)
     html = (HTML_TEMPLATE
-            .replace('__PARAMS_JSON__', params_json)
+            .replace('__DATA_SCRIPTS__', scripts_html)
+            .replace('__PARAMS_META_JSON__', params_meta_json)
             .replace('__TITLE__', title))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(html, encoding='utf-8')
@@ -1365,12 +1681,7 @@ def main():
             _write_html(params_list, out_path, title)
     else:
         dir_path = Path(args.dir)
-        pkls = sorted(dir_path.glob('*.pkl'))
-        if not pkls:
-            print(f'No *.pkl files found in {dir_path}')
-            return
-        print(f'Found {len(pkls)} pkl file(s) in {dir_path}')
-        all_data = [d for p in pkls if (d := _load_pkl(p)) is not None]
+        all_data = _load_and_merge_dir(dir_path)
         if not all_data:
             print('No datasets with array data found.')
             return

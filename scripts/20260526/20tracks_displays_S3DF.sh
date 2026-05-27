@@ -16,16 +16,16 @@ OUT=$PLOTS_DIR/cutoff_loss_landscape_20260526
 
 mkdir -p "$OUT"
 
+echo "=== Loss landscape (landscape_viewer.html) ==="
+$PY src/plots/plot_gradient_landscape_viewer.py \
+    --results-dir "$RESULTS_DIR/1d_gradients/sobolev_cutoff_20trk_all_planes" \
+    --output "$OUT/landscape_viewer.html"
+
 echo "=== Signal viewer (viewer.html) ==="
 $PY src/analysis/sim_param_sweeps/generate_gradient_viewer.py \
     --dir "$RESULTS_DIR/1d_gradients/cutoff_loss_landscape_20260526" \
     --output "$OUT/viewer.html"
 
 echo ""
-echo "=== Loss landscape (landscape_viewer.html) ==="
-$PY src/plots/plot_gradient_landscape_viewer.py \
-    --results-dir "$RESULTS_DIR/1d_gradients/sobolev_cutoff_15trk_all_planes" \
-    --output "$OUT/landscape_viewer.html"
 
-echo ""
 echo "Done. Output in $OUT"

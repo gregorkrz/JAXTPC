@@ -2,7 +2,7 @@
 # Sobolev loss cutoff study — diffusion parameters (local run)
 #
 # Sweeps both diffusion constants over ±75% of GT in 41 points (N=20),
-# at ADC cutoffs of 0 (baseline), 1, 3, 5, 10, 15, 20, 25,
+# at ADC cutoffs of 0 (baseline), 1, 3, 5, 10, 15, 20, 25, 50,
 # for both clean and noisy GT (noise-scale 1.0).
 # No arrays stored — only loss values and gradients are saved.
 #
@@ -33,7 +33,7 @@ done
 if [[ -n "$CUTOFFS_CSV" ]]; then
   CUTOFF_LIST="${CUTOFFS_CSV//,/ }"
 else
-  CUTOFF_LIST="0.0 1.0 3.0 5.0 10.0 15.0 20.0 25.0"
+  CUTOFF_LIST="0.0 1.0 3.0 5.0 10.0 15.0 20.0 25.0 50.0"
 fi
 
 # Extra flags forwarded to 1d_gradients.py.
@@ -48,7 +48,7 @@ if [[ $OVERWRITE -eq 1 && -d "$OUTDIR" ]]; then
   rm -rf "$OUTDIR"
 fi
 
-# Original 4 tracks — full cutoff sweep (0, 1, 3, 5, 10, 15, 20, 25 ADC).
+# Original 4 tracks — full cutoff sweep (0, 1, 3, 5, 10, 15, 20, 25, 50  ADC).
 # diagonal = body-diagonal chord; Muon1/2/4 from the 15-track ensemble (seed=42).
 declare -A TRACKS=(
   [diagonal]="diagonal:-0.577350,-0.577350,-0.577350:1000"

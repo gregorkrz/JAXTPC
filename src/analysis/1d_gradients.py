@@ -143,6 +143,14 @@ def parse_args():
                    help='Points on each side of GT (default: 2 → 2N+1 total)')
     p.add_argument('--range-frac', type=float, default=0.05,
                    help='Half-range as fraction of GT value (default: 0.05 = ±5%%)')
+    p.add_argument('--factors', default=None,
+                   help='Comma-separated explicit factor values to evaluate, e.g. "0.75,1.0,1.25". '
+                        'Overrides --N / --range-frac. Single-factor runs append _fac<value> '
+                        'to the output filename so parallel per-factor jobs do not collide.')
+    p.add_argument('--save-per-factor', action='store_true',
+                   help='Write one small pkl per sweep point immediately after computing it, '
+                        'then write a combined summary pkl (no arrays) at the end. '
+                        'Keeps peak memory at ~1 sweep point instead of all 2N+1.')
     p.add_argument('--tracks', default='diagonal:1,1,1:1000',
                    help='"+"-separated track specs  name:dx,dy,dz:mom_mev '
                         '(default: diagonal:1,1,1:1000)')
@@ -365,7 +373,7 @@ def build_pixel_grad_fn(loss_name, n_planes):
 
 # ── Output path ────────────────────────────────────────────────────────────────
 
-def auto_output_path(args, loss_name, track_specs):
+def auto_output_path(args, loss_name, track_specs, factor=None):
     tracks_tag  = (f'{len(track_specs)}tracks' if len(track_specs) > 1
                    else track_specs[0]['name'])
     if args.noise_scale > 0.0:
@@ -377,8 +385,15 @@ def auto_output_path(args, loss_name, track_specs):
     fixed_tag   = f'_fixed_{args.fixed_param}{args.fixed_value}' if args.fixed_param else ''
     range_tag   = f'_range{args.range_frac:.3g}'.replace('.', 'p')
     perplane_tag = '_perplane' if args.store_per_plane_loss else ''
+    factor_tag  = ''
+    if factor is not None:
+        factor_tag = f'_fac{factor:.7g}'.replace('.', 'p').replace('-', 'm')
+    elif getattr(args, 'factors', None) is not None:
+        facs = [float(f) for f in args.factors.split(',')]
+        if len(facs) == 1:
+            factor_tag = f'_fac{facs[0]:.7g}'.replace('.', 'p').replace('-', 'm')
     name = (f'{loss_name}_N{args.N}{range_tag}_{args.param}'
-            f'_{tracks_tag}{noise_tag}{cutoff_tag}{perplane_tag}{fixed_tag}.pkl')
+            f'_{tracks_tag}{noise_tag}{cutoff_tag}{factor_tag}{perplane_tag}{fixed_tag}.pkl')
     return os.path.join(args.results_dir, name)
 
 
@@ -541,13 +556,18 @@ def main():
         }
 
     # ── Parameter grid ────────────────────────────────────────────────────────
-    left_factors  = np.linspace(1.0 - args.range_frac, 1.0, args.N + 1)[:-1]
-    right_factors = np.linspace(1.0, 1.0 + args.range_frac, args.N + 1)[1:]
-    factors       = np.concatenate([left_factors, [1.0], right_factors])
-    p_n_values    = p_n_gt * factors
-    param_values  = p_n_values * scale
-
-    print(f'\nParameter grid ({len(factors)} points, ±{args.range_frac:.0%} around GT):')
+    if args.factors is not None:
+        factors      = np.array([float(f) for f in args.factors.split(',')])
+        p_n_values   = p_n_gt * factors
+        param_values = p_n_values * scale
+        print(f'\nParameter grid ({len(factors)} explicit factor(s)):')
+    else:
+        left_factors  = np.linspace(1.0 - args.range_frac, 1.0, args.N + 1)[:-1]
+        right_factors = np.linspace(1.0, 1.0 + args.range_frac, args.N + 1)[1:]
+        factors       = np.concatenate([left_factors, [1.0], right_factors])
+        p_n_values    = p_n_gt * factors
+        param_values  = p_n_values * scale
+        print(f'\nParameter grid ({len(factors)} points, ±{args.range_frac:.0%} around GT):')
     for f, pn, v in zip(factors, p_n_values, param_values):
         marker = ' ← GT' if f == 1.0 else ''
         print(f'  factor={f:.6f}  p_n={pn:.6f}  {args.param}={v:.6g}{marker}')
@@ -602,13 +622,13 @@ def main():
                       f'({100 * n_masked_px / n_total_px:.1f}%)')
             per_track_data.append((name, deposits, gt_arrays, weights, masks))
 
-        # Per-cutoff accumulators
-        if args.store_arrays:
+        # Per-cutoff accumulators (arrays skipped when save_per_factor — flushed per sweep pt)
+        if args.store_arrays and not args.save_per_factor:
             per_track_sim_arrays = {name: [] for name, *_ in per_track_data}
-        if args.store_per_pixel_loss_and_grad:
+        if args.store_per_pixel_loss_and_grad and not args.save_per_factor:
             per_track_pixel_loss = {name: [] for name, *_ in per_track_data}
             per_track_pixel_grad = {name: [] for name, *_ in per_track_data}
-        if args.store_per_plane_loss:
+        if args.store_per_plane_loss and not args.save_per_factor:
             per_plane_loss_values = {
                 name: {pname: [] for pname in plane_names_all}
                 for name, *_ in per_track_data
@@ -623,6 +643,13 @@ def main():
         for i, (factor, p_n, pval) in enumerate(zip(factors, p_n_values, param_values)):
             p_n_arr = jnp.array(float(p_n))
             t0      = time.time()
+
+            # Temporary per-factor storage (used only when save_per_factor)
+            fac_sim_arrays  = {} if (args.save_per_factor and args.store_arrays) else None
+            fac_pixel_loss  = {} if (args.save_per_factor and args.store_per_pixel_loss_and_grad) else None
+            fac_pixel_grad  = {} if (args.save_per_factor and args.store_per_pixel_loss_and_grad) else None
+            fac_plane_loss  = ({name: {pname: [] for pname in plane_names_all} for name, *_ in per_track_data}
+                               if (args.save_per_factor and args.store_per_plane_loss) else None)
 
             total_loss = 0.0
             total_grad = 0.0
@@ -639,26 +666,32 @@ def main():
                     fwd_out = simulator.forward(_make_params(p_n_arr), dep)
                     jax.block_until_ready(fwd_out)
                     if args.store_arrays:
-                        per_track_sim_arrays[tname].append(
-                            [np.array(a, dtype=np.float32) for a in fwd_out]
-                        )
+                        arrays_np = [np.array(a, dtype=np.float32) for a in fwd_out]
+                        if args.save_per_factor:
+                            fac_sim_arrays[tname] = arrays_np
+                        else:
+                            per_track_sim_arrays[tname].append(arrays_np)
                     if args.store_per_pixel_loss_and_grad:
                         pg = pixel_grad_fn(fwd_out, gt_arrays, weights, masks)
                         jax.block_until_ready(pg)
-                        per_track_pixel_grad[tname].append(
-                            [np.array(a, dtype=np.float32) for a in pg]
-                        )
-                        per_track_pixel_loss[tname].append(
-                            [np.array((np.array(s, dtype=np.float32) - np.array(g, dtype=np.float32))**2)
-                             for s, g in zip(fwd_out, gt_arrays)]
-                        )
+                        pg_np  = [np.array(a, dtype=np.float32) for a in pg]
+                        pl_np  = [np.array((np.array(s, dtype=np.float32) - np.array(g, dtype=np.float32))**2)
+                                  for s, g in zip(fwd_out, gt_arrays)]
+                        if args.save_per_factor:
+                            fac_pixel_grad[tname] = pg_np
+                            fac_pixel_loss[tname] = pl_np
+                        else:
+                            per_track_pixel_grad[tname].append(pg_np)
+                            per_track_pixel_loss[tname].append(pl_np)
                     if args.store_per_plane_loss:
                         for pi, pname in enumerate(plane_names_all):
                             sim_m = jnp.where(masks[pi], fwd_out[pi], 0.0)
                             gt_m  = jnp.where(masks[pi], gt_arrays[pi], 0.0)
-                            per_plane_loss_values[tname][pname].append(
-                                float(_plane_loss_jit(sim_m, gt_m, weights[pi]))
-                            )
+                            val   = float(_plane_loss_jit(sim_m, gt_m, weights[pi]))
+                            if args.save_per_factor:
+                                fac_plane_loss[tname][pname].append(val)
+                            else:
+                                per_plane_loss_values[tname][pname].append(val)
 
             elapsed = time.time() - t0
             total_loss_vals.append(total_loss)
@@ -670,6 +703,52 @@ def main():
                   f'p_n={p_n:.6f}  {args.param}={pval:.6g}  '
                   f'loss={total_loss:.4e}  grad={total_grad:+.4e}  '
                   f'({elapsed * 1e3:.0f} ms){marker}')
+
+            # Flush this factor to its own pkl immediately (frees array memory)
+            if args.save_per_factor:
+                fac_path = auto_output_path(args, loss_name, track_specs,
+                                            factor=float(factor))
+                os.makedirs(os.path.dirname(fac_path) or '.', exist_ok=True)
+                if os.path.exists(fac_path):
+                    print(f'    (exists, skip) {os.path.basename(fac_path)}')
+                else:
+                    fac_result = dict(
+                        param_name    = args.param,
+                        param_gt      = param_gt,
+                        scale         = scale,
+                        p_n_gt        = p_n_gt,
+                        param_values  = [float(pval)],
+                        p_n_values    = [float(p_n)],
+                        factors       = [float(factor)],
+                        loss_values   = [total_loss],
+                        grad_values   = [total_grad],
+                        grad_times_s  = [elapsed],
+                        per_track_loss_values = {t: [per_track_loss[t][-1]] for t in per_track_loss},
+                        per_track_grad_values = {t: [per_track_grad[t][-1]] for t in per_track_grad},
+                        loss_name     = loss_name,
+                        N             = args.N,
+                        range_frac    = args.range_frac,
+                        track_specs   = track_specs,
+                        noise_scale   = args.noise_scale,
+                        noise_seed    = args.noise_seed,
+                        adc_cutoff    = cutoff,
+                        sobolev_max_pad = args.sobolev_max_pad,
+                        fixed_param   = args.fixed_param,
+                        fixed_value   = args.fixed_value,
+                        plane_names   = plane_names_all,
+                    )
+                    if args.store_arrays:
+                        fac_result['per_track_gt_arrays']  = per_track_gt_arrays
+                        fac_result['per_track_sim_arrays'] = {t: [v] for t, v in fac_sim_arrays.items()}
+                    if args.store_per_pixel_loss_and_grad:
+                        fac_result['per_track_pixel_loss'] = {t: [v] for t, v in fac_pixel_loss.items()}
+                        fac_result['per_track_pixel_grad'] = {t: [v] for t, v in fac_pixel_grad.items()}
+                    if args.store_per_plane_loss:
+                        fac_result['per_plane_loss_values'] = fac_plane_loss
+                    with open(fac_path, 'wb') as f:
+                        pickle.dump(fac_result, f)
+                    sz = os.path.getsize(fac_path) / 1e6
+                    print(f'    → {os.path.basename(fac_path)}  ({sz:.1f} MB)')
 
         result = dict(
             param_name             = args.param,
@@ -696,18 +775,20 @@ def main():
             fixed_value            = args.fixed_value,
             plane_names            = plane_names_all,
         )
-        if args.store_arrays:
+        if args.store_arrays and not args.save_per_factor:
             result['per_track_gt_arrays']  = per_track_gt_arrays
             result['per_track_sim_arrays'] = per_track_sim_arrays
-        if args.store_per_pixel_loss_and_grad:
+        if args.store_per_pixel_loss_and_grad and not args.save_per_factor:
             result['per_track_pixel_loss'] = per_track_pixel_loss
             result['per_track_pixel_grad'] = per_track_pixel_grad
-        if args.store_per_plane_loss:
+        if args.store_per_plane_loss and not args.save_per_factor:
             result['per_plane_loss_values'] = per_plane_loss_values
 
         with open(output_path, 'wb') as f:
             pickle.dump(result, f)
-        print(f'Saved: {output_path}')
+        sz = os.path.getsize(output_path) / 1e6
+        suffix = ' (summary, arrays in per-factor pkls)' if args.save_per_factor else ''
+        print(f'Saved{suffix}: {output_path}  ({sz:.1f} MB)')
 
     print('\nDone.')
 

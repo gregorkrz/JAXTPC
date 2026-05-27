@@ -60,6 +60,8 @@ Available profiles
                                          ±10% spread, noise, debug 4-track, seeds 1000–1001.
   gradient_cutoff_sweep_15trk  1d-gradient landscape: 15 tracks, cutoffs 0–50, per-plane loss;
                                 32 commands (8 noisy seeds) in n_jobs=2 Slurm jobs
+  gradient_cutoff_sweep_20trk  Same as above but with all 20 tracks (adds 5 near-cathode 100 MeV);
+                                output sobolev_cutoff_20trk_all_planes/, 40 fraction-slice tracks
   gradient_signal_viewer_20trk  Signal-array run for all 20 tracks → cutoff_loss_landscape_20260526/;
                                 4 jobs (2 params × clean+noisy), N=5, --store-arrays, 128 GB RAM
 
@@ -244,6 +246,7 @@ def make_gradient_command(
     tracks,
     N=20,
     range_frac=0.75,
+    factors=None,
     noise_scale=0.0,
     noise_seed=42,
     adc_cutoff=0.0,
@@ -255,9 +258,12 @@ def make_gradient_command(
     store_per_plane_loss=False,
     store_per_pixel_loss_and_grad=False,
     store_arrays=False,
+    save_per_factor=False,
 ):
     """Return a 1d_gradients.py command string.
 
+    Pass factors as a list of floats to use --factors (specific sweep points, one per job).
+    Pass save_per_factor=True to flush one small pkl per sweep point within a single job.
     Pass adc_cutoffs as a list to use --adc-cutoffs (multi-cutoff sweep in one call).
     """
     parts = [
@@ -273,6 +279,8 @@ def make_gradient_command(
         f"--sobolev-max-pad {sobolev_max_pad}",
         f"--results-dir {results_dir}",
     ]
+    if factors is not None:
+        parts.append(f"--factors {','.join(f'{f:.10g}' for f in factors)}")
     if adc_cutoffs is not None:
         parts.append(f"--adc-cutoffs {','.join(str(c) for c in adc_cutoffs)}")
     else:
@@ -283,6 +291,8 @@ def make_gradient_command(
         parts.append("--store-per-pixel-loss-and-grad")
     if store_arrays:
         parts.append("--store-arrays")
+    if save_per_factor:
+        parts.append("--save-per-factor")
     return " ".join(parts)
 
 
@@ -4134,6 +4144,115 @@ def profile_Adam_NoiseCutoff25_DebugTracks_3k_CollectionOnly_3trk(
             )
 
 
+_TRACKS_V2 = (
+    "Muon1_1000MeV:-0.747872530,0.661463000,0.056154945:1000:2160.000,-1606.549,-214.333"
+    "+Muon2_500MeV:-0.641581737,0.275323919,-0.715939672:500:2160.000,1394.330,-244.451"
+    "+Muon3_500MeV:-0.483652826,0.868350593,-0.109759697:500:2160.000,568.790,1114.939"
+    "+Muon6_1000MeV:-0.624672693,-0.613017831,0.483728401:1000:2160.000,-1341.484,-1598.739"
+    "+Muon7_500MeV:-0.610394124,-0.747896572,0.260901765:500:2160.000,1437.170,865.145"
+    "+Muon8_1000MeV:0.773174642,0.198385012,0.602365637:1000:-2160.000,-486.093,-914.423"
+    "+Muon9_500MeV:-0.931562076,-0.204366326,-0.300710000:500:2160.000,1239.513,712.156"
+    "+Muon10_100MeV:0.754859526,-0.437194999,0.488924973:100:-2160.000,296.962,-1556.077"
+    "+Muon_diagCross_1000MeV:-0.577350269,-0.577350269,-0.577350269:1000:2000.000,2000.000,2000.000"
+    "+Muon_throughEw_skew02_1000MeV:0.934631179,-0.282614666,0.215855296:1000:-2100.000,750.000,-550.000"
+    "+Muon_throughWe_skew03_1000MeV:-0.938658230,0.268188066,-0.216785353:1000:2100.000,-620.000,480.000"
+    "+Muon13_100MeV:-0.194353283,-0.967595642,-0.161200106:100:102.344,2160.000,-1106.403"
+    "+Muon14_100MeV:-0.108495799,0.312632631,0.943657512:100:602.601,-1767.737,-2160.000"
+    "+Muon15_100MeV:0.290155194,0.467674594,-0.834919420:100:-738.504,-605.471,2160.000"
+    "+Muon16_100MeV:-0.362498911,-0.215251579,-0.906786247:100:-678.254,1635.218,2160.000"
+    "+Muon17_100MeV:0.348470036,0.919222376,-0.183299913:100:-768.051,-2160.000,-1358.605"
+)
+
+
+def profile_Adam_differentCutoffs_trans_and_long_collection_only_15tracks_v2(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+    skip_complete=False,
+    verbose=False,
+):
+
+    shared = dict(
+        tracks=_TRACKS_V2,
+        optimizer="adam",
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.001,
+        lr_schedule="cosine",
+        max_steps=3000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.25,
+        range_hi=1.75,
+        grad_clip=0.0,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=1.0,
+        max_num_deposits=5000,
+        batch_size=1,
+        effective_batch_size=1,
+        gt_step_size=1.0,
+        gt_max_deposits=5000,
+        adam_beta2=0.9,
+        log_interval=50,
+    )
+
+    param_sets = [
+        ("trans_and_long", "diffusion_trans_cm2_us,diffusion_long_cm2_us"),
+        ("all_params",     ",".join(PARAM_LIST)),
+    ]
+
+    plane_configs = [
+        ("collection_only", "Y1,Y2"),
+    ]
+
+    # Collect all pending commands in submission order, then assign to 2 lanes
+    # so at most 2 jobs run simultaneously.
+    pending = []
+    for cutoff in [5, 25, 50]:
+        cutoff_tag = f"cutoff{cutoff}"
+        for param_label, params in param_sets:
+            for plane_tag, planes in plane_configs:
+                profile_tag  = f"Adam_NoiseCutoff{cutoff}_{param_label}_{plane_tag}_15trksV2"
+                results_base = f"$RESULTS_DIR/opt/{profile_tag}"
+                for seed in [44, 45, 46, 47]:
+                    if verbose or skip_complete:
+                        is_done = _seed_is_complete(results_base, "noise", seed, verbose=verbose)
+                        if is_done and skip_complete:
+                            print(f"  SKIP complete: {profile_tag} seed={seed}")
+                            continue
+                        elif not is_done and verbose:
+                            print(f"  → will submit: {profile_tag} seed={seed}")
+                    command = make_opt_command(
+                        params=params,
+                        seed=seed,
+                        noise_scale=1.0,
+                        results_base=f"{results_base}/noise",
+                        planes=planes,
+                        wandb_tags=(wandb_tags or []) + [cutoff_tag, param_label, "noise", "15trksV2", plane_tag],
+                        sobolev_loss_cutoff=float(cutoff),
+                        **shared,
+                    )
+                    pending.append(command)
+
+    # Submit across 2 lanes: job i goes to lane i%2, depends on the previous job in that lane
+    prev = [None, None]
+    for i, command in enumerate(pending):
+        lane = i % 2
+        if not print_sbatch_only:
+            print(command)
+        prev[lane] = s3df_submit(
+            command,
+            time="01:05:00",
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+            dependency=prev[lane],
+        )
+
+
+
 def profile_Adam_NoiseCutoff50_DebugTracks_3k_3trk_BothPlanes(
     *,
     submit=True,
@@ -4767,6 +4886,94 @@ def profile_gradient_cutoff_sweep_15trk(
         )
 
 
+def profile_gradient_cutoff_sweep_20trk(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+    n_jobs=2,
+    time="20:00:00",
+):
+    """1d-gradient landscape sweep: 20 tracks + 40 fraction-slice tracks, 10 ADC cutoffs.
+
+    Same as gradient_cutoff_sweep_15trk but includes all 20 tracks (the original
+    15 plus the 5 near-cathode 100 MeV tracks Muon13–Muon17).
+
+    Params       : diffusion_trans_cm2_us, diffusion_long_cm2_us
+    Noise        : 0.0 (seed 42) and 1.0 (seeds 42, 0, 1, 2, 3, 4, 5, 6)
+    Cutoffs      : 0, 1, 2, 5, 10, 15, 20, 25, 30, 50  (ADC units)
+    N=20, ±75% range, step_size=1.0 mm, max_deposits=5000.
+    Flags        : --store-per-plane-loss --store-per-pixel-loss-and-grad
+    Output       : $RESULTS_DIR/1d_gradients/sobolev_cutoff_20trk_all_planes/
+
+    Structure: each 1d_gradients.py call covers all tracks (combined with '+')
+    AND all 10 cutoffs (--adc-cutoffs), so it compiles once and sweeps everything.
+    36 commands total: 2 sets (20 full tracks + 40 fraction tracks)
+                       × 2 params × (1 no-noise + 8 noisy seeds).
+    With n_jobs=2 (default) each job handles 18 invocations.
+    Increase n_jobs to distribute across more Slurm jobs.
+    """
+    results_dir      = "$RESULTS_DIR/1d_gradients/sobolev_cutoff_20trk_all_planes"
+    cutoffs          = [0.0, 1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 50.0]
+    params           = ["diffusion_trans_cm2_us", "diffusion_long_cm2_us"]
+    noise_seeds      = [42, 0, 1, 2, 3, 4, 5, 6]  # 8 seeds for the noisy (noise_scale=1.0) runs
+
+    all_tracks_arg      = "+".join(spec for _, spec in _GRADIENT_15_TRACKS)
+    fraction_tracks_arg = "+".join(spec for _, spec in _GRADIENT_FRACTION_TRACKS)
+
+    all_commands = []
+    for tracks_arg in [all_tracks_arg, fraction_tracks_arg]:
+        for param in params:
+            # no-noise run
+            all_commands.append(make_gradient_command(
+                param=param,
+                tracks=tracks_arg,
+                N=20,
+                range_frac=0.75,
+                noise_scale=0.0,
+                noise_seed=42,
+                adc_cutoffs=cutoffs,
+                results_dir=results_dir,
+                store_per_plane_loss=True,
+                store_per_pixel_loss_and_grad=True,
+            ))
+            # noisy runs — one per seed
+            for seed in noise_seeds:
+                all_commands.append(make_gradient_command(
+                    param=param,
+                    tracks=tracks_arg,
+                    N=20,
+                    range_frac=0.75,
+                    noise_scale=1.0,
+                    noise_seed=seed,
+                    adc_cutoffs=cutoffs,
+                    results_dir=results_dir,
+                    store_per_plane_loss=True,
+                    store_per_pixel_loss_and_grad=True,
+                ))
+
+    chunks = list(_chunks(all_commands, n_jobs))
+    n_total = len(all_commands)
+
+    print(
+        f"gradient_cutoff_sweep_20trk: {n_total} invocations "
+        f"(20 full + 40 fraction tracks, 10 cutoffs each) → {len(chunks)} Slurm jobs"
+    )
+
+    for job_idx, chunk in enumerate(chunks):
+        label = f"1d_grad_cutoff20_{job_idx:03d}"
+        if not print_sbatch_only:
+            print(f"  {label}: {len(chunk)} invocations")
+        s3df_submit_multi(
+            chunk,
+            job_label=label,
+            time=time,
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+        )
+
+
 # ── run_params.py helpers ─────────────────────────────────────────────────────
 
 def make_run_params_command(
@@ -4851,16 +5058,16 @@ def profile_gradient_signal_viewer_20trk(
     Params  : diffusion_trans_cm2_us, diffusion_long_cm2_us
     Noise   : 0.0 (seed 42) and 1.0 (seed 42)
     N=5, ±75% range, step_size=1.0 mm, max_deposits=5000, adc_cutoff=0.
-    Flags   : --store-arrays --store-per-plane-loss  (no cutoff sweep)
+    Flags   : --store-arrays --store-per-plane-loss --save-per-factor
     Output  : $RESULTS_DIR/1d_gradients/cutoff_loss_landscape_20260526/
 
-    N=5 (11 sweep points) is enough for the signal viewer and avoids the OOM
-    that N=20 causes: 41 points × 20 tracks × 6 planes fills >64 GB RAM.
-
     4 jobs total (2 params × 2 noise conditions), chained sequentially so each
-    has its own GPU allocation.  Feed results to generate_gradient_viewer.py to
-    produce viewer.html alongside the landscape_viewer.html from
-    plot_gradient_landscape_viewer.py (which uses sobolev_cutoff_15trk_all_planes).
+    has its own GPU allocation.  --save-per-factor keeps peak memory at ~1
+    sweep point at a time: each factor's arrays are written to their own small
+    pkl immediately after computation and not held in RAM.  A combined summary
+    pkl (loss/grad curves only, no arrays) is also written per job.
+    generate_gradient_viewer.py merges the per-factor pkls automatically when
+    scanning the output directory.
     """
     results_dir      = "$RESULTS_DIR/1d_gradients/cutoff_loss_landscape_20260526"
     params           = ["diffusion_trans_cm2_us", "diffusion_long_cm2_us"]
@@ -4882,6 +5089,7 @@ def profile_gradient_signal_viewer_20trk(
                 results_dir=results_dir,
                 store_per_plane_loss=True,
                 store_arrays=True,
+                save_per_factor=True,
             )
             if not print_sbatch_only:
                 print(cmd)
@@ -4889,7 +5097,7 @@ def profile_gradient_signal_viewer_20trk(
                 cmd,
                 time=time,
                 submit=submit,
-                mem_gb=128,
+                mem_gb=32,
                 print_sbatch_command=print_sbatch_only,
                 dependency=prev_job,
             )
@@ -4967,6 +5175,7 @@ PROFILES = {
     "Adam_NoiseCutoff25_DebugTracks_3k_TransLong_Chain": profile_Adam_NoiseCutoff25_DebugTracks_3k_TransLong_Chain,
     "Adam_NoiseCutoff25_DebugTracks_2phase": profile_Adam_NoiseCutoff25_DebugTracks_2phase,
     "gradient_cutoff_sweep_15trk": profile_gradient_cutoff_sweep_15trk,
+    "gradient_cutoff_sweep_20trk": profile_gradient_cutoff_sweep_20trk,
     "gradient_signal_viewer_20trk": profile_gradient_signal_viewer_20trk,
     "Adam_NoiseSeedSweep_3k_GT2_NoDiffLifetime": profile_15Trk_Adam_NoiseSeedSweep_3k_GT2_NoDiffLifetime,
     "Adam_NoiseSeedSweep_3k_GT3_NoDiff": profile_15Trk_Adam_NoiseSeedSweep_3k_GT3_NoDiff,
@@ -4975,6 +5184,7 @@ PROFILES = {
     "Adam_NoiseSeedSweep_3k_0p1mm_step_GT_and_sim": profile_15Trk_Adam_NoiseSeedSweep_3k_0p1mm_step_GT_and_sim,
     "Adam_NoiseSeedSweep_3k_Cont_Newton": profile_Adam_NoiseSeedSweep_3k_Cont_Newton,
     "1d_Grad_diffusion_debug": profile_1d_Grad_diffusion_debug,
+    "Adam_differentCutoffs_trans_and_long_collection_only_15tracks_v2": profile_Adam_differentCutoffs_trans_and_long_collection_only_15tracks_v2,
 }
 
 

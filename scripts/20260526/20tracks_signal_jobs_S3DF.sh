@@ -14,3 +14,4 @@ source .env
 /sdf/home/g/gregork/envs/base_env/bin/python src/jobs/submit_jobs.py \
     gradient_signal_viewer_20trk \
     --submit
+
