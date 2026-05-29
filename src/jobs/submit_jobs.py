@@ -64,6 +64,11 @@ Available profiles
                                 output sobolev_cutoff_20trk_all_planes/, 40 fraction-slice tracks
   gradient_signal_viewer_20trk  Signal-array run for all 20 tracks → cutoff_loss_landscape_20260526/;
                                 4 jobs (2 params × clean+noisy), N=5, --store-arrays, 128 GB RAM
+  gradient_signal_viewer_20trk_sobolev_exp_1  Same as above but with --sobolev-s 1 (milder roll-off)
+  gradient_signal_viewer_20trk_sobolev_exp_0  Same as above but with --sobolev-s 0 (flat/L2 spectrum)
+  Adam_diffusionCutoff_collection_only_15tracks_v2  Like Adam_differentCutoffs_trans_and_long…v2 but
+                                the ADC cutoff and collection-only planes are applied only to both
+                                diffusion params; all other params use all planes and no cutoff.
 
 Profile runs pass --wandb-tags <profile> to run_optimization.py (optional extras via
 --wandb-extra-tags comma,separated).
@@ -255,6 +260,7 @@ def make_gradient_command(
     step_size=1.0,
     max_deposits=5000,
     sobolev_max_pad=128,
+    sobolev_s=None,
     store_per_plane_loss=False,
     store_per_pixel_loss_and_grad=False,
     store_arrays=False,
@@ -265,6 +271,7 @@ def make_gradient_command(
     Pass factors as a list of floats to use --factors (specific sweep points, one per job).
     Pass save_per_factor=True to flush one small pkl per sweep point within a single job.
     Pass adc_cutoffs as a list to use --adc-cutoffs (multi-cutoff sweep in one call).
+    Pass sobolev_s to override the Sobolev spectral exponent (default 2.0).
     """
     parts = [
         "python src/analysis/1d_gradients.py",
@@ -279,6 +286,8 @@ def make_gradient_command(
         f"--sobolev-max-pad {sobolev_max_pad}",
         f"--results-dir {results_dir}",
     ]
+    if sobolev_s is not None:
+        parts.append(f"--sobolev-s {sobolev_s}")
     if factors is not None:
         parts.append(f"--factors {','.join(f'{f:.10g}' for f in factors)}")
     if adc_cutoffs is not None:
@@ -294,6 +303,50 @@ def make_gradient_command(
     if save_per_factor:
         parts.append("--save-per-factor")
     return " ".join(parts)
+
+
+def _find_failed_gradient_jobs(results_dir, params, noise_conditions):
+    """Scan results_dir for corrupt/truncated pkl files and return the
+    (param, noise_scale, noise_seed) tuples whose output needs to be rerun.
+
+    Noise is identified by the _noise<scale> tag in the filename (absent → 0.0).
+    """
+    import pickle as _pickle
+    from pathlib import Path as _Path
+
+    dir_path = _Path(os.path.expandvars(results_dir))
+    if not dir_path.exists():
+        print(f'[submit-failed] Results dir not found: {dir_path}', file=sys.stderr)
+        return []
+    pkls = sorted(dir_path.glob('*.pkl'))
+    if not pkls:
+        print(f'[submit-failed] No pkl files in {dir_path}', file=sys.stderr)
+        return []
+
+    failed: set = set()
+    for pkl_path in pkls:
+        try:
+            with open(pkl_path, 'rb') as f:
+                _pickle.load(f)
+        except Exception as exc:
+            print(f'[submit-failed] Corrupt: {pkl_path.name} ({exc})', file=sys.stderr)
+            stem = pkl_path.stem
+            for param in params:
+                if param not in stem:
+                    continue
+                for noise_scale, noise_seed in noise_conditions:
+                    if noise_scale > 0.0:
+                        tag = f'_noise{noise_scale:.3g}'.replace('.', 'p')
+                        if tag in stem:
+                            failed.add((param, noise_scale, noise_seed))
+                            break
+                    else:
+                        if '_noise' not in stem:
+                            failed.add((param, noise_scale, noise_seed))
+                            break
+                break
+
+    return list(failed)
 
 
 def _chunks(lst, n):
@@ -414,6 +467,46 @@ def _seed_is_complete(results_base: str, noise_tag: str, seed: int, verbose: boo
     return False
 
 
+def _patch_pkl_for_continuation(results_base: str, noise_tag: str, seed: int,
+                                new_max_steps: int) -> bool:
+    """If a completed result pkl has fewer steps than new_max_steps, patch it for continuation.
+
+    Clears ``trials`` and injects a ``live_checkpoint`` at step=0 with the last
+    known parameters.  run_optimization.py then resumes the same W&B run, starts
+    the optimizer from scratch (fresh momentum), but begins from a warm parameter
+    initialisation rather than a random one.
+
+    Returns True if the pkl was patched (job should be submitted), False otherwise.
+    """
+    resolved = results_base.replace("$RESULTS_DIR", _RESULTS_DIR)
+    base = os.path.join(resolved, noise_tag)
+    pattern = os.path.join(base, "**", f"result_{seed}.pkl")
+    matches = glob.glob(pattern, recursive=True)
+    for pkl_path in matches:
+        try:
+            with open(pkl_path, "rb") as f:
+                data = pickle.load(f)
+        except Exception:
+            continue
+        if _optimization_pickle_incomplete(data):
+            continue  # already incomplete, no patching needed
+        trials = data.get("trials") or []
+        if not trials:
+            continue
+        last_trial = trials[-1]
+        steps_run = last_trial.get("steps_run", 0)
+        if steps_run >= new_max_steps:
+            continue  # already has enough steps
+        last_p = last_trial["param_trajectory"][-1]
+        data["live_checkpoint"] = {"trial_idx": 0, "step": 0, "p": last_p, "opt_state": None}
+        data["trials"] = []
+        with open(pkl_path, "wb") as f:
+            pickle.dump(data, f)
+        print(f"  PATCHED for continuation (steps_run={steps_run} < {new_max_steps}): {pkl_path}")
+        return True
+    return False
+
+
 def _optimization_pickle_incomplete(data) -> bool:
     """True when this result pickle needs another Slurm/job run.
 
@@ -518,6 +611,8 @@ def make_opt_command(
     init_from_wandb_run=None,
     init_from_wandb_step=None,
     sobolev_loss_cutoff=None,
+    sobolev_loss_cutoff_per_param=None,
+    planes_per_param=None,
     start_position_mm=None,
     planes=None,
 ):
@@ -594,6 +689,10 @@ def make_opt_command(
         parts.append(f"--init-from-wandb-step {init_from_wandb_step}")
     if sobolev_loss_cutoff is not None and sobolev_loss_cutoff > 0.0:
         parts.append(f"--sobolev-loss-cutoff {sobolev_loss_cutoff}")
+    if sobolev_loss_cutoff_per_param is not None:
+        parts.append(f"--sobolev-loss-cutoff-per-param {sobolev_loss_cutoff_per_param}")
+    if planes_per_param is not None:
+        parts.append(f"--planes-per-param {planes_per_param}")
     if start_position_mm is not None:
         parts.append(f"--start-position-mm {start_position_mm}")
     if planes is not None:
@@ -4253,6 +4352,102 @@ def profile_Adam_differentCutoffs_trans_and_long_collection_only_15tracks_v2(
 
 
 
+def profile_Adam_diffusionCutoff_collection_only_15tracks_v2(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+    skip_complete=False,
+    verbose=False,
+):
+    """Like Adam_differentCutoffs_trans_and_long_collection_only_15tracks_v2, but per-param.
+
+    The ADC cutoff and collection-only planes (Y1,Y2) are applied only to both diffusion
+    parameters (diffusion_trans_cm2_us and diffusion_long_cm2_us).  All other parameters
+    use all planes and no ADC cutoff (global defaults).
+
+    Same sweep: cutoffs [5, 25, 50], param_sets [trans_and_long, all_params], noise, 4 seeds.
+    Same 2-lane submission as the reference profile.
+    """
+    shared = dict(
+        tracks=_TRACKS_V2,
+        optimizer="adam",
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.001,
+        lr_schedule="cosine",
+        max_steps=10000,
+        tol=1e-6,
+        patience=5000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        grad_clip=0.0,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=1.0,
+        max_num_deposits=5000,
+        batch_size=1,
+        effective_batch_size=1,
+        gt_step_size=1.0,
+        gt_max_deposits=5000,
+        adam_beta2=0.9,
+        log_interval=50,
+    )
+
+    param_sets = [
+        #("trans_and_long", "diffusion_trans_cm2_us,diffusion_long_cm2_us"),
+        ("all_params",     ",".join(PARAM_LIST)),
+    ]
+
+    # Per-param planes: diffusion params → Y1,Y2; others → all planes (global default).
+    # Uses '%' as outer separator (shell-safe; '|' would be interpreted as a pipe).
+    _diff_planes = "diffusion_trans_cm2_us:Y1,Y2%diffusion_long_cm2_us:Y1,Y2"
+
+    for cutoff in [5, 25, 50]:
+        cutoff_tag = f"cutoff{cutoff}"
+        # Per-param cutoff string: only the two diffusion params get the cutoff.
+        _diff_cutoff = (
+            f"diffusion_trans_cm2_us:{cutoff},"
+            f"diffusion_long_cm2_us:{cutoff}"
+        )
+        for param_label, params in param_sets:
+            profile_tag  = f"Adam_NoiseCutoff{cutoff}_{param_label}_diffCutoff_15trksV2_lower_range"
+            results_base = f"$RESULTS_DIR/opt/{profile_tag}"
+            prev = None
+            for seed in [44, 45, 46, 47]:
+                _patch_pkl_for_continuation(
+                    results_base, "noise", seed, new_max_steps=shared["max_steps"])
+                if verbose or skip_complete:
+                    is_done = _seed_is_complete(results_base, "noise", seed, verbose=verbose)
+                    if is_done and skip_complete:
+                        print(f"  SKIP complete: {profile_tag} seed={seed}")
+                        continue
+                    elif not is_done and verbose:
+                        print(f"  → will submit: {profile_tag} seed={seed}")
+                command = make_opt_command(
+                    params=params,
+                    seed=seed,
+                    noise_scale=1.0,
+                    results_base=f"{results_base}/noise",
+                    sobolev_loss_cutoff_per_param=_diff_cutoff,
+                    planes_per_param=_diff_planes,
+                    wandb_tags=(wandb_tags or []) + [cutoff_tag + "(lower_range)", param_label,
+                                                     "noise", "15trksV2",
+                                                     "diffusion_cutoff", "collection_only"],
+                    **shared,
+                )
+                if not print_sbatch_only:
+                    print(command)
+                prev = s3df_submit(
+                    command,
+                    time="01:05:00",
+                    submit=submit,
+                    mem_gb=64,
+                    print_sbatch_command=print_sbatch_only,
+                    dependency=prev,
+                )
+
+
 def profile_Adam_NoiseCutoff50_DebugTracks_3k_3trk_BothPlanes(
     *,
     submit=True,
@@ -5046,12 +5241,64 @@ def profile_run_params_diffusion_sweep_pixel(
     )
 
 
+
+def profile_gradient_signal_viewer_20trk_small(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+    time="00:15:00",
+):
+    """Lightweight signal-array run: 3 factors (0.75, 1.0, 1.25) × 2 params × 2 noise.
+
+    Params  : diffusion_trans_cm2_us, diffusion_long_cm2_us
+    Noise   : 0.0 (seed 42) and 1.0 (seed 42)
+    Factors : 0.75, 1.0, 1.25 only (3 sweep points instead of the full N=5 ±75% grid)
+    Output  : $RESULTS_DIR/1d_gradients/cutoff_loss_landscape_20260526_small/
+
+    4 jobs, chained sequentially.
+    """
+    results_dir      = "$RESULTS_DIR/1d_gradients/cutoff_loss_landscape_20260526_small"
+    params           = ["diffusion_trans_cm2_us", "diffusion_long_cm2_us"]
+    noise_conditions = [(0.0, 42), (1.0, 42)]
+    factors          = [0.75, 1.0, 1.25]
+
+    all_tracks_arg = "+".join(spec for _, spec in _GRADIENT_15_TRACKS)
+
+    prev_job = None
+    for param in params:
+        for noise_scale, noise_seed in noise_conditions:
+            cmd = make_gradient_command(
+                param=param,
+                tracks=all_tracks_arg,
+                factors=factors,
+                noise_scale=noise_scale,
+                noise_seed=noise_seed,
+                adc_cutoff=0.0,
+                results_dir=results_dir,
+                store_per_plane_loss=True,
+                store_arrays=True,
+                store_per_pixel_loss_and_grad=True,
+                save_per_factor=True,
+            )
+            if not print_sbatch_only:
+                print(cmd)
+            prev_job = s3df_submit(
+                cmd,
+                time=time,
+                submit=submit,
+                mem_gb=32,
+                print_sbatch_command=print_sbatch_only,
+                dependency=prev_job,
+            )
+
 def profile_gradient_signal_viewer_20trk(
     *,
     submit=True,
     print_sbatch_only=False,
     wandb_tags=None,
     time="00:30:00",
+    submit_failed=False,
 ):
     """Signal-array 1d-gradient run for all 20 tracks → cutoff_loss_landscape_20260526/.
 
@@ -5075,9 +5322,17 @@ def profile_gradient_signal_viewer_20trk(
 
     all_tracks_arg = "+".join(spec for _, spec in _GRADIENT_15_TRACKS)
 
+    if submit_failed:
+        failed_set = set(_find_failed_gradient_jobs(results_dir, params, noise_conditions))
+        if not failed_set:
+            print('[submit-failed] No corrupt pkl files found — nothing to resubmit.', file=sys.stderr)
+            return
+
     prev_job = None
     for param in params:
         for noise_scale, noise_seed in noise_conditions:
+            if submit_failed and (param, noise_scale, noise_seed) not in failed_set:
+                continue
             cmd = make_gradient_command(
                 param=param,
                 tracks=all_tracks_arg,
@@ -5088,7 +5343,127 @@ def profile_gradient_signal_viewer_20trk(
                 adc_cutoff=0.0,
                 results_dir=results_dir,
                 store_per_plane_loss=True,
-                store_arrays=True,
+                save_per_factor=True,
+            )
+            if not print_sbatch_only:
+                print(cmd)
+            prev_job = s3df_submit(
+                cmd,
+                time=time,
+                submit=submit,
+                mem_gb=32,
+                print_sbatch_command=print_sbatch_only,
+                dependency=prev_job,
+            )
+
+
+def profile_gradient_signal_viewer_20trk_sobolev_exp_1(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+    time="00:30:00",
+    submit_failed=False,
+):
+    """Signal-array 1d-gradient run with Sobolev spectral exponent s=1.
+
+    Same as profile_gradient_signal_viewer_20trk but with --sobolev-s 1,
+    which gives a milder spectral roll-off (W(f) ∝ 1/|f|^2 instead of 1/|f|^4).
+
+    Params  : diffusion_trans_cm2_us, diffusion_long_cm2_us
+    Noise   : 0.0 (seed 42) and 1.0 (seed 42)
+    N=5, ±75% range, step_size=1.0 mm, max_deposits=5000, adc_cutoff=0, s=1.
+    Output  : $RESULTS_DIR/1d_gradients/cutoff_loss_landscape_20260526_exp_1/
+    """
+    results_dir      = "$RESULTS_DIR/1d_gradients/cutoff_loss_landscape_20260526_exp_1"
+    params           = ["diffusion_trans_cm2_us", "diffusion_long_cm2_us"]
+    noise_conditions = [(0.0, 42), (1.0, 42)]
+
+    all_tracks_arg = "+".join(spec for _, spec in _GRADIENT_15_TRACKS)
+
+    if submit_failed:
+        failed_set = set(_find_failed_gradient_jobs(results_dir, params, noise_conditions))
+        if not failed_set:
+            print('[submit-failed] No corrupt pkl files found — nothing to resubmit.', file=sys.stderr)
+            return
+
+    prev_job = None
+    for param in params:
+        for noise_scale, noise_seed in noise_conditions:
+            if submit_failed and (param, noise_scale, noise_seed) not in failed_set:
+                continue
+            cmd = make_gradient_command(
+                param=param,
+                tracks=all_tracks_arg,
+                N=5,
+                range_frac=0.75,
+                noise_scale=noise_scale,
+                noise_seed=noise_seed,
+                adc_cutoff=0.0,
+                sobolev_s=1,
+                results_dir=results_dir,
+                store_per_plane_loss=True,
+                save_per_factor=True,
+            )
+            if not print_sbatch_only:
+                print(cmd)
+            prev_job = s3df_submit(
+                cmd,
+                time=time,
+                submit=submit,
+                mem_gb=32,
+                print_sbatch_command=print_sbatch_only,
+                dependency=prev_job,
+            )
+
+
+def profile_gradient_signal_viewer_20trk_sobolev_exp_0(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+    time="00:30:00",
+    submit_failed=False,
+):
+    """Signal-array 1d-gradient run with Sobolev spectral exponent s=0.
+
+    Same as profile_gradient_signal_viewer_20trk but with --sobolev-s 0,
+    which gives a flat spectral weight (W(f) ∝ 1, i.e. no frequency roll-off —
+    equivalent to a plain L2 loss in the frequency domain).
+
+    Params  : diffusion_trans_cm2_us, diffusion_long_cm2_us
+    Noise   : 0.0 (seed 42) and 1.0 (seed 42)
+    N=5, ±75% range, step_size=1.0 mm, max_deposits=5000, adc_cutoff=0, s=0.
+    Output  : $RESULTS_DIR/1d_gradients/cutoff_loss_landscape_20260526_exp_0/
+    """
+    results_dir      = "$RESULTS_DIR/1d_gradients/cutoff_loss_landscape_20260526_exp_0"
+    params           = ["diffusion_trans_cm2_us", "diffusion_long_cm2_us"]
+    noise_conditions = [(0.0, 42), (1.0, 42)]
+
+    all_tracks_arg = "+".join(spec for _, spec in _GRADIENT_15_TRACKS)
+
+    if submit_failed:
+        failed_set = set(_find_failed_gradient_jobs(results_dir, params, noise_conditions))
+        if not failed_set:
+            print('[submit-failed] No corrupt pkl files found — nothing to resubmit.', file=sys.stderr)
+            return
+
+    prev_job = None
+    for param in params:
+        for noise_scale, noise_seed in noise_conditions:
+            if submit_failed and (param, noise_scale, noise_seed) not in failed_set:
+                continue
+            cmd = make_gradient_command(
+                param=param,
+                tracks=all_tracks_arg,
+                N=5,
+                range_frac=0.75,
+                noise_scale=noise_scale,
+                noise_seed=noise_seed,
+                adc_cutoff=0.0,
+                sobolev_s=0,
+                results_dir=results_dir,
+                store_per_plane_loss=True,
                 save_per_factor=True,
             )
             if not print_sbatch_only:
@@ -5177,6 +5552,10 @@ PROFILES = {
     "gradient_cutoff_sweep_15trk": profile_gradient_cutoff_sweep_15trk,
     "gradient_cutoff_sweep_20trk": profile_gradient_cutoff_sweep_20trk,
     "gradient_signal_viewer_20trk": profile_gradient_signal_viewer_20trk,
+    "gradient_signal_viewer_20trk_sobolev_exp_1": profile_gradient_signal_viewer_20trk_sobolev_exp_1,
+    "gradient_signal_viewer_20trk_sobolev_exp_0": profile_gradient_signal_viewer_20trk_sobolev_exp_0,
+        "gradient_signal_viewer_20trk_small": profile_gradient_signal_viewer_20trk_small,
+
     "Adam_NoiseSeedSweep_3k_GT2_NoDiffLifetime": profile_15Trk_Adam_NoiseSeedSweep_3k_GT2_NoDiffLifetime,
     "Adam_NoiseSeedSweep_3k_GT3_NoDiff": profile_15Trk_Adam_NoiseSeedSweep_3k_GT3_NoDiff,
     "Adam_NoiseSeedSweep_3k_GT3_NoDiffLifetime": profile_15Trk_Adam_NoiseSeedSweep_3k_GT3_NoDiffLifetime,
@@ -5185,6 +5564,7 @@ PROFILES = {
     "Adam_NoiseSeedSweep_3k_Cont_Newton": profile_Adam_NoiseSeedSweep_3k_Cont_Newton,
     "1d_Grad_diffusion_debug": profile_1d_Grad_diffusion_debug,
     "Adam_differentCutoffs_trans_and_long_collection_only_15tracks_v2": profile_Adam_differentCutoffs_trans_and_long_collection_only_15tracks_v2,
+    "Adam_diffusionCutoff_collection_only_15tracks_v2": profile_Adam_diffusionCutoff_collection_only_15tracks_v2,
 }
 
 
@@ -5240,6 +5620,12 @@ if __name__ == "__main__":
              "--skip-complete to also suppress already-done jobs.",
     )
     parser.add_argument(
+        "--submit-failed",
+        action="store_true",
+        help="Re-submit only jobs whose output pkls are corrupt or truncated "
+             "(profiles that support it; scans $RESULTS_DIR on the current machine).",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Delete existing output pkl files before submitting (profiles that support it).",
@@ -5282,6 +5668,8 @@ if __name__ == "__main__":
             extra["verbose"] = args.verbose
         if "overwrite" in _inspect.signature(profile_fn).parameters:
             extra["overwrite"] = args.overwrite
+        if "submit_failed" in _inspect.signature(profile_fn).parameters:
+            extra["submit_failed"] = args.submit_failed
         profile_fn(
             submit=not args.print_commands,
             print_sbatch_only=args.print_commands,

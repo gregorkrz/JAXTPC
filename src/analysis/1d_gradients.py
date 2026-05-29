@@ -60,6 +60,12 @@ With --store-arrays:
 With --store-per-pixel-loss-and-grad:
     per_track_pixel_loss  -- (sim-gt)^2 arrays per sweep point, per track, per plane
     per_track_pixel_grad  -- ∂loss/∂sim[w,t] arrays; same shape as sim arrays
+    per_track_fourier_C       -- fftshift(C(f)), downsampled NxN; C sums to sobolev_loss_single
+    per_track_fourier_power   -- fftshift(|D_hat|^2/N), unweighted residual power, NxN
+    per_track_fourier_sim_fft -- fftshift(|FFT2(sim)|^2/N), sim signal power spectrum, NxN
+    per_track_fourier_W       -- fftshift(W(f)) downsampled NxN, same for all sweep pts
+    per_track_fourier_gt_fft  -- fftshift(|FFT2(gt)|^2/N), GT signal power spectrum, NxN (fixed)
+    fourier_map_resolution    -- N (from --fourier-map-resolution)
 """
 import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
@@ -79,9 +85,11 @@ from tools.geometry import generate_detector
 from tools.loader import build_deposit_data
 from tools.losses import (
     make_sobolev_weight,
+    sobolev_fourier_map_single,
     sobolev_loss,
     sobolev_loss_geomean_log1p,
     sobolev_loss_single,
+    sobolev_signal_fft_power,
 )
 
 # JIT-compiled per-plane loss; reuses one compiled kernel per distinct array shape.
@@ -164,17 +172,30 @@ def parse_args():
                    help='RNG seed for noise (default: 42)')
     p.add_argument('--sobolev-max-pad', type=int, default=128,
                    help='Max padding for Sobolev weight construction (default: 128)')
+    p.add_argument('--sobolev-s', default=None,
+                   help='Comma-separated Sobolev exponent s values to sweep '
+                        '(e.g. "0.25,0.5,0.75"). Default: 2.0.')
     p.add_argument('--adc-cutoff', type=float, default=0.0,
                    help='Zero out pixels where |GT| < cutoff before loss (default: 0 = off)')
     p.add_argument('--adc-cutoffs', default=None,
                    help='Comma-separated list of ADC cutoffs to sweep in one invocation. '
                         'Each cutoff writes its own output file. '
                         'Overrides --adc-cutoff; cannot be combined with --output.')
+    p.add_argument('--fourier-cutoff', type=float, default=0.0,
+                   help='Zero Fourier bins where |FFT(gt_padded)|^2/N < cutoff before loss '
+                        '(equivalent to Fourier-filtering both signals at that power level). '
+                        'Default: 0 = off.')
+    p.add_argument('--fourier-cutoffs', default=None,
+                   help='Comma-separated list of Fourier cutoffs to sweep in one invocation '
+                        '(like --adc-cutoffs). Overrides --fourier-cutoff; cannot be combined with --output.')
     p.add_argument('--store-arrays', action='store_true',
                    help='Store full 2D signal arrays (all planes) at each sweep point per track')
     p.add_argument('--store-per-pixel-loss-and-grad', action='store_true',
                    help='Store per-pixel (sim-gt)^2 loss and ∂loss/∂sim[w,t] sensitivity maps '
                         'at each sweep point')
+    p.add_argument('--fourier-map-resolution', type=int, default=128,
+                   help='Output resolution N for NxN Fourier loss maps stored with '
+                        '--store-per-pixel-loss-and-grad (default: 128)')
     p.add_argument('--store-per-plane-loss', action='store_true',
                    help='Store sobolev_loss_single for each wire plane at every sweep point')
     p.add_argument('--output', default=None,
@@ -295,6 +316,21 @@ def apply_noise(gt_arrays, simulator, noise_scale, noise_key):
     return tuple(noisy)
 
 
+# ── Fourier mask helper ────────────────────────────────────────────────────────
+
+def compute_fourier_masked_weight(weight, gt_array, max_pad, fourier_cutoff):
+    """Return spectral weight with bins zeroed where |FFT(padded_gt)|^2/N < fourier_cutoff.
+
+    Mathematically equivalent to Fourier-filtering both sim and gt signals at the
+    cutoff before computing the loss (FFT linearity makes the two operations identical).
+    """
+    gt_pad = jnp.pad(gt_array, ((max_pad, max_pad), (max_pad, max_pad)))
+    gt_fft = jnp.fft.fft2(gt_pad)
+    N = gt_pad.shape[0] * gt_pad.shape[1]
+    fft_power = (gt_fft.real ** 2 + gt_fft.imag ** 2) / N
+    return jnp.where(fft_power >= fourier_cutoff, weight, 0.0)
+
+
 # ── Loss builder ───────────────────────────────────────────────────────────────
 
 def build_value_and_grad(loss_name, simulator, make_params, n_planes):
@@ -371,6 +407,31 @@ def build_pixel_grad_fn(loss_name, n_planes):
     return jax.jit(jax.grad(fn))  # grad w.r.t. first arg (sim_arrays tuple)
 
 
+def build_fourier_map_fn(n_planes, out_size):
+    """Return a JIT-compiled fn(sim_arrays, gt_arrays, weights, masks).
+
+    Returns (C_maps, power_maps, sim_fft_maps, gt_fft_maps), each a tuple of
+    n_planes arrays of shape out_size:
+      C_maps     — fftshift(C(f)); sums to sobolev_loss_single per plane
+      power_maps — fftshift(|D_hat|^2/N); unweighted residual power
+      sim_fft_maps — fftshift(|FFT2(pad(sim))|^2/N)
+      gt_fft_maps  — fftshift(|FFT2(pad(gt))|^2/N)
+    """
+    def fn(sim_arrays, gt_arrays, weights, masks):
+        Cs, pwrs, sim_ffts, gt_ffts = [], [], [], []
+        for pi in range(n_planes):
+            A = jnp.where(masks[pi], sim_arrays[pi], 0.0)
+            B = jnp.where(masks[pi], gt_arrays[pi], 0.0)
+            C, pwr = sobolev_fourier_map_single(A, B, weights[pi], out_size=out_size)
+            Cs.append(C)
+            pwrs.append(pwr)
+            sim_ffts.append(sobolev_signal_fft_power(A, weights[pi], out_size=out_size))
+            gt_ffts.append(sobolev_signal_fft_power(B, weights[pi], out_size=out_size))
+        return tuple(Cs), tuple(pwrs), tuple(sim_ffts), tuple(gt_ffts)
+
+    return jax.jit(fn)
+
+
 # ── Output path ────────────────────────────────────────────────────────────────
 
 def auto_output_path(args, loss_name, track_specs, factor=None):
@@ -382,6 +443,9 @@ def auto_output_path(args, loss_name, track_specs, factor=None):
     else:
         noise_tag = ''
     cutoff_tag  = f'_cutoff{args.adc_cutoff:.3g}'.replace('.', 'p') if args.adc_cutoff > 0.0 else ''
+    _cur_s = float(args.sobolev_s) if isinstance(args.sobolev_s, (int, float)) else 2.0
+    sobolev_s_tag = f'_s{_cur_s:.3g}'.replace('.', 'p') if _cur_s != 2.0 else ''
+    fourier_tag = f'_fcutoff{args.fourier_cutoff:.3g}'.replace('.', 'p') if args.fourier_cutoff > 0.0 else ''
     fixed_tag   = f'_fixed_{args.fixed_param}{args.fixed_value}' if args.fixed_param else ''
     range_tag   = f'_range{args.range_frac:.3g}'.replace('.', 'p')
     perplane_tag = '_perplane' if args.store_per_plane_loss else ''
@@ -393,7 +457,7 @@ def auto_output_path(args, loss_name, track_specs, factor=None):
         if len(facs) == 1:
             factor_tag = f'_fac{facs[0]:.7g}'.replace('.', 'p').replace('-', 'm')
     name = (f'{loss_name}_N{args.N}{range_tag}_{args.param}'
-            f'_{tracks_tag}{noise_tag}{cutoff_tag}{factor_tag}{perplane_tag}{fixed_tag}.pkl')
+            f'_{tracks_tag}{noise_tag}{cutoff_tag}{sobolev_s_tag}{fourier_tag}{factor_tag}{perplane_tag}{fixed_tag}.pkl')
     return os.path.join(args.results_dir, name)
 
 
@@ -408,13 +472,21 @@ def main():
     loss_name   = LOSS_ALIAS.get(args.loss, args.loss)
     track_specs = parse_tracks(args.tracks)
 
-    # ── Resolve cutoff list ────────────────────────────────────────────────────
+    # ── Resolve sweep lists ───────────────────────────────────────────────────
+    sobolev_s_list = ([float(x.strip()) for x in args.sobolev_s.split(',')]
+                      if args.sobolev_s is not None else [2.0])
     if args.adc_cutoffs is not None:
         if args.output is not None:
             raise ValueError('--output cannot be combined with --adc-cutoffs')
         cutoffs_list = [float(x.strip()) for x in args.adc_cutoffs.split(',')]
     else:
         cutoffs_list = [args.adc_cutoff]
+    if args.fourier_cutoffs is not None:
+        if args.output is not None:
+            raise ValueError('--output cannot be combined with --fourier-cutoffs')
+        fourier_cutoffs_list = [float(x.strip()) for x in args.fourier_cutoffs.split(',')]
+    else:
+        fourier_cutoffs_list = [args.fourier_cutoff]
 
     print(f'JAX devices   : {jax.devices()}')
     print(f'Parameter     : {args.param}')
@@ -425,33 +497,39 @@ def main():
     print(f'Step size     : {args.step_size} mm  max deposits={args.max_deposits:,}')
     print(f'Noise scale   : {args.noise_scale}')
     print(f'Sobolev pad   : {args.sobolev_max_pad}')
+    print(f'Sobolev s     : {sobolev_s_list}')
     print(f'ADC cutoffs   : {cutoffs_list}')
+    print(f'Fourier cutoffs: {fourier_cutoffs_list}')
     print(f'Per-plane loss: {args.store_per_plane_loss}')
     if args.fixed_param:
         print(f'Fixed param   : {args.fixed_param} = {args.fixed_value}')
 
-    # ── Skip already-computed cutoffs ─────────────────────────────────────────
+    # ── Build all (sobolev_s, adc_cutoff, fourier_cutoff) triples; skip done ──
+    all_triples = [(s, ac, fc)
+                   for s in sobolev_s_list
+                   for ac in cutoffs_list
+                   for fc in fourier_cutoffs_list]
     if args.output is not None:
-        # Single explicit output path; existence check done once.
         if os.path.exists(args.output):
             print(f'Output already exists, skipping: {args.output}')
             return
-        pending_cutoffs = cutoffs_list
+        pending_triples = all_triples
     else:
-        pending_cutoffs = []
-        for cutoff in cutoffs_list:
-            args.adc_cutoff = cutoff
+        pending_triples = []
+        for s, ac, fc in all_triples:
+            args.sobolev_s      = s
+            args.adc_cutoff     = ac
+            args.fourier_cutoff = fc
             p = auto_output_path(args, loss_name, track_specs)
             if os.path.exists(p):
-                print(f'  exists, skip cutoff={cutoff}: {p}')
+                print(f'  exists, skip s={s} adc={ac} fourier={fc}: {p}')
             else:
-                pending_cutoffs.append(cutoff)
-        if not pending_cutoffs:
-            print('All cutoffs already computed.')
+                pending_triples.append((s, ac, fc))
+        if not pending_triples:
+            print('All combinations already computed.')
             return
-        if len(pending_cutoffs) < len(cutoffs_list):
-            print(f'  {len(pending_cutoffs)}/{len(cutoffs_list)} cutoffs pending.')
-    cutoffs_list = pending_cutoffs
+        if len(pending_triples) < len(all_triples):
+            print(f'  {len(pending_triples)}/{len(all_triples)} combinations pending.')
 
     # ── Simulator ─────────────────────────────────────────────────────────────
     print('\nBuilding differentiable simulator...')
@@ -532,14 +610,10 @@ def main():
             track_noise_key = jax.random.fold_in(noise_base_key, track_idx)
             gt_arrays = apply_noise(gt_arrays, simulator, args.noise_scale, track_noise_key)
 
-        weights = tuple(
-            make_sobolev_weight(a.shape[0], a.shape[1], max_pad=args.sobolev_max_pad)
-            for a in gt_arrays
-        )
         all_abs = jnp.concatenate([jnp.abs(a).ravel() for a in gt_arrays])
         print(f'    Signal ADC: max={float(all_abs.max()):.3g}  '
               f'mean={float(all_abs.mean()):.3g}')
-        per_track_base.append((ts['name'], deposits, gt_arrays, weights))
+        per_track_base.append((ts['name'], deposits, gt_arrays))
 
     # ── Plane name list (U1, V1, Y1, U2, V2, Y2) ─────────────────────────────
     cfg = simulator.config
@@ -552,7 +626,7 @@ def main():
     if args.store_arrays:
         per_track_gt_arrays = {
             name: [np.array(a, dtype=np.float32) for a in gt_arrs]
-            for name, _, gt_arrs, _ in per_track_base
+            for name, _, gt_arrs in per_track_base
         }
 
     # ── Parameter grid ────────────────────────────────────────────────────────
@@ -572,62 +646,119 @@ def main():
         marker = ' ← GT' if f == 1.0 else ''
         print(f'  factor={f:.6f}  p_n={pn:.6f}  {args.param}={v:.6g}{marker}')
 
-    # ── Compile once (mask values are dynamic — no retrace per cutoff) ────────
+    # ── Compile once (mask/weight values are dynamic — no retrace per combination) ─
     n_planes = len(per_track_base[0][2])
     vag_fn   = build_value_and_grad(loss_name, simulator, _make_params, n_planes)
 
-    print('\nCompiling value_and_grad (once for all tracks and cutoffs)...')
+    print('\nCompiling value_and_grad (once for all tracks and combinations)...')
     t0 = time.time()
-    _, _dep0, _gt0, _wt0 = per_track_base[0]
+    _, _dep0, _gt0 = per_track_base[0]
+    _wt0_compile = tuple(
+        make_sobolev_weight(a.shape[0], a.shape[1], max_pad=args.sobolev_max_pad, s=sobolev_s_list[0])
+        for a in _gt0
+    )
     _allmask0 = tuple(jnp.ones(a.shape, dtype=bool) for a in _gt0)
-    _ = vag_fn(jnp.array(p_n_values[0]), _dep0, _gt0, _wt0, _allmask0)
+    _ = vag_fn(jnp.array(p_n_values[0]), _dep0, _gt0, _wt0_compile, _allmask0)
     jax.block_until_ready(_)
-    _ = vag_fn(jnp.array(p_n_values[0]), _dep0, _gt0, _wt0, _allmask0)
+    _ = vag_fn(jnp.array(p_n_values[0]), _dep0, _gt0, _wt0_compile, _allmask0)
     jax.block_until_ready(_)
     print(f'Done ({time.time() - t0:.1f} s)')
 
+    fourier_map_fn = None
+    _fourier_out_size = None
     if args.store_per_pixel_loss_and_grad:
         pixel_grad_fn = build_pixel_grad_fn(loss_name, n_planes)
         print('\nCompiling pixel_grad_fn...')
         t0 = time.time()
         _fwd0 = simulator.forward(_make_params(jnp.array(p_n_values[0])), _dep0)
-        _ = pixel_grad_fn(_fwd0, _gt0, _wt0, _allmask0)
+        _ = pixel_grad_fn(_fwd0, _gt0, _wt0_compile, _allmask0)
         jax.block_until_ready(_)
-        _ = pixel_grad_fn(_fwd0, _gt0, _wt0, _allmask0)
+        _ = pixel_grad_fn(_fwd0, _gt0, _wt0_compile, _allmask0)
         jax.block_until_ready(_)
         print(f'Done ({time.time() - t0:.1f} s)')
 
-    # ── Loop over cutoffs ─────────────────────────────────────────────────────
-    for cutoff in cutoffs_list:
-        print(f'\n{"─" * 60}')
-        print(f'ADC cutoff = {cutoff}  ({len(factors)} param points × {len(per_track_base)} tracks)')
+        N_res = args.fourier_map_resolution
+        _fourier_out_size = (N_res, N_res)
+        fourier_map_fn = build_fourier_map_fn(n_planes, _fourier_out_size)
+        print('\nCompiling fourier_map_fn...')
+        t0 = time.time()
+        _ = fourier_map_fn(_fwd0, _gt0, _wt0_compile, _allmask0)
+        jax.block_until_ready(_)
+        _ = fourier_map_fn(_fwd0, _gt0, _wt0_compile, _allmask0)
+        jax.block_until_ready(_)
+        print(f'Done ({time.time() - t0:.1f} s)')
 
-        # Output path for this cutoff
-        args.adc_cutoff = cutoff
+    # ── Loop over (sobolev_s, adc_cutoff, fourier_cutoff) combinations ───────
+    for sobolev_s, adc_cutoff, fourier_cutoff in pending_triples:
+        print(f'\n{"─" * 60}')
+        print(f'sobolev_s={sobolev_s}  ADC cutoff={adc_cutoff}  Fourier cutoff={fourier_cutoff}  '
+              f'({len(factors)} param points × {len(per_track_base)} tracks)')
+
+        # Output path for this combination
+        args.sobolev_s      = sobolev_s
+        args.adc_cutoff     = adc_cutoff
+        args.fourier_cutoff = fourier_cutoff
         output_path = args.output or auto_output_path(args, loss_name, track_specs)
         os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
 
-        # Build masks for this cutoff and attach to per_track_data
+        # Build per_track_data: sobolev weights, ADC masks, Fourier mask
         per_track_data = []
-        for name, deposits, gt_arrays, weights in per_track_base:
-            masks = tuple(
-                jnp.ones(a.shape, dtype=bool) if cutoff == 0.0
-                else (jnp.abs(a) >= cutoff)
+        for name, deposits, gt_arrays in per_track_base:
+            weights = tuple(
+                make_sobolev_weight(a.shape[0], a.shape[1], max_pad=args.sobolev_max_pad, s=sobolev_s)
                 for a in gt_arrays
             )
-            if cutoff > 0.0:
+            masks = tuple(
+                jnp.ones(a.shape, dtype=bool) if adc_cutoff == 0.0
+                else (jnp.abs(a) >= adc_cutoff)
+                for a in gt_arrays
+            )
+            if adc_cutoff > 0.0:
                 n_total_px  = sum(m.size for m in masks)
                 n_masked_px = sum(int(jnp.sum(~m)) for m in masks)
                 print(f'  {name}: {n_masked_px:,}/{n_total_px:,} pixels zeroed '
                       f'({100 * n_masked_px / n_total_px:.1f}%)')
-            per_track_data.append((name, deposits, gt_arrays, weights, masks))
+            if fourier_cutoff > 0.0:
+                eff_weights = tuple(
+                    compute_fourier_masked_weight(w, a, args.sobolev_max_pad, fourier_cutoff)
+                    for w, a in zip(weights, gt_arrays)
+                )
+                n_total_freq  = sum(w.size for w in eff_weights)
+                n_masked_freq = sum(int(jnp.sum(ew == 0.0)) for ew in eff_weights)
+                print(f'  {name}: Fourier cutoff {fourier_cutoff}: '
+                      f'{n_masked_freq:,}/{n_total_freq:,} freq bins zeroed '
+                      f'({100 * n_masked_freq / n_total_freq:.1f}%)')
+            else:
+                eff_weights = weights
+            per_track_data.append((name, deposits, gt_arrays, eff_weights, masks))
 
         # Per-cutoff accumulators (arrays skipped when save_per_factor — flushed per sweep pt)
         if args.store_arrays and not args.save_per_factor:
             per_track_sim_arrays = {name: [] for name, *_ in per_track_data}
         if args.store_per_pixel_loss_and_grad and not args.save_per_factor:
-            per_track_pixel_loss = {name: [] for name, *_ in per_track_data}
-            per_track_pixel_grad = {name: [] for name, *_ in per_track_data}
+            per_track_pixel_loss      = {name: [] for name, *_ in per_track_data}
+            per_track_pixel_grad      = {name: [] for name, *_ in per_track_data}
+            per_track_fourier_C       = {name: [] for name, *_ in per_track_data}
+            per_track_fourier_power   = {name: [] for name, *_ in per_track_data}
+            per_track_fourier_sim_fft = {name: [] for name, *_ in per_track_data}
+        if fourier_map_fn is not None:
+            per_track_fourier_W = {
+                tname: [
+                    np.array(jax.image.resize(jnp.fft.fftshift(w), _fourier_out_size, method='bilinear'),
+                             dtype=np.float32)
+                    for w in weights
+                ]
+                for tname, _, _, weights, _ in per_track_data
+            }
+            # GT signal FFT is fixed per cutoff — compute once per track
+            per_track_fourier_gt_fft = {}
+            for tname, _, gt_arrays, weights, masks in per_track_data:
+                per_track_fourier_gt_fft[tname] = [
+                    np.array(sobolev_signal_fft_power(
+                        jnp.where(masks[pi], jnp.array(gt_arrays[pi]), 0.0),
+                        weights[pi], out_size=_fourier_out_size), dtype=np.float32)
+                    for pi in range(n_planes)
+                ]
         if args.store_per_plane_loss and not args.save_per_factor:
             per_plane_loss_values = {
                 name: {pname: [] for pname in plane_names_all}
@@ -646,8 +777,11 @@ def main():
 
             # Temporary per-factor storage (used only when save_per_factor)
             fac_sim_arrays  = {} if (args.save_per_factor and args.store_arrays) else None
-            fac_pixel_loss  = {} if (args.save_per_factor and args.store_per_pixel_loss_and_grad) else None
-            fac_pixel_grad  = {} if (args.save_per_factor and args.store_per_pixel_loss_and_grad) else None
+            fac_pixel_loss    = {} if (args.save_per_factor and args.store_per_pixel_loss_and_grad) else None
+            fac_pixel_grad    = {} if (args.save_per_factor and args.store_per_pixel_loss_and_grad) else None
+            fac_fourier_C       = {} if (args.save_per_factor and fourier_map_fn is not None) else None
+            fac_fourier_power   = {} if (args.save_per_factor and fourier_map_fn is not None) else None
+            fac_fourier_sim_fft = {} if (args.save_per_factor and fourier_map_fn is not None) else None
             fac_plane_loss  = ({name: {pname: [] for pname in plane_names_all} for name, *_ in per_track_data}
                                if (args.save_per_factor and args.store_per_plane_loss) else None)
 
@@ -683,6 +817,19 @@ def main():
                         else:
                             per_track_pixel_grad[tname].append(pg_np)
                             per_track_pixel_loss[tname].append(pl_np)
+                        fC, fpwr, fsim, _fgt = fourier_map_fn(fwd_out, gt_arrays, weights, masks)
+                        jax.block_until_ready((fC, fpwr, fsim))
+                        fC_np    = [np.array(a, dtype=np.float32) for a in fC]
+                        fpwr_np  = [np.array(a, dtype=np.float32) for a in fpwr]
+                        fsim_np  = [np.array(a, dtype=np.float32) for a in fsim]
+                        if args.save_per_factor:
+                            fac_fourier_C[tname]       = fC_np
+                            fac_fourier_power[tname]   = fpwr_np
+                            fac_fourier_sim_fft[tname] = fsim_np
+                        else:
+                            per_track_fourier_C[tname].append(fC_np)
+                            per_track_fourier_power[tname].append(fpwr_np)
+                            per_track_fourier_sim_fft[tname].append(fsim_np)
                     if args.store_per_plane_loss:
                         for pi, pname in enumerate(plane_names_all):
                             sim_m = jnp.where(masks[pi], fwd_out[pi], 0.0)
@@ -731,8 +878,10 @@ def main():
                         track_specs   = track_specs,
                         noise_scale   = args.noise_scale,
                         noise_seed    = args.noise_seed,
-                        adc_cutoff    = cutoff,
+                        adc_cutoff      = adc_cutoff,
                         sobolev_max_pad = args.sobolev_max_pad,
+                        sobolev_s       = sobolev_s,
+                        fourier_cutoff  = fourier_cutoff,
                         fixed_param   = args.fixed_param,
                         fixed_value   = args.fixed_value,
                         plane_names   = plane_names_all,
@@ -743,6 +892,12 @@ def main():
                     if args.store_per_pixel_loss_and_grad:
                         fac_result['per_track_pixel_loss'] = {t: [v] for t, v in fac_pixel_loss.items()}
                         fac_result['per_track_pixel_grad'] = {t: [v] for t, v in fac_pixel_grad.items()}
+                        fac_result['per_track_fourier_C']       = {t: [v] for t, v in fac_fourier_C.items()}
+                        fac_result['per_track_fourier_power']   = {t: [v] for t, v in fac_fourier_power.items()}
+                        fac_result['per_track_fourier_sim_fft'] = {t: [v] for t, v in fac_fourier_sim_fft.items()}
+                        fac_result['per_track_fourier_W']       = per_track_fourier_W
+                        fac_result['per_track_fourier_gt_fft']  = per_track_fourier_gt_fft
+                        fac_result['fourier_map_resolution']    = args.fourier_map_resolution
                     if args.store_per_plane_loss:
                         fac_result['per_plane_loss_values'] = fac_plane_loss
                     with open(fac_path, 'wb') as f:
@@ -769,8 +924,10 @@ def main():
             track_specs            = track_specs,
             noise_scale            = args.noise_scale,
             noise_seed             = args.noise_seed,
-            adc_cutoff             = cutoff,
+            adc_cutoff             = adc_cutoff,
             sobolev_max_pad        = args.sobolev_max_pad,
+            sobolev_s              = sobolev_s,
+            fourier_cutoff         = fourier_cutoff,
             fixed_param            = args.fixed_param,
             fixed_value            = args.fixed_value,
             plane_names            = plane_names_all,
@@ -779,8 +936,14 @@ def main():
             result['per_track_gt_arrays']  = per_track_gt_arrays
             result['per_track_sim_arrays'] = per_track_sim_arrays
         if args.store_per_pixel_loss_and_grad and not args.save_per_factor:
-            result['per_track_pixel_loss'] = per_track_pixel_loss
-            result['per_track_pixel_grad'] = per_track_pixel_grad
+            result['per_track_pixel_loss']      = per_track_pixel_loss
+            result['per_track_pixel_grad']      = per_track_pixel_grad
+            result['per_track_fourier_C']       = per_track_fourier_C
+            result['per_track_fourier_power']   = per_track_fourier_power
+            result['per_track_fourier_sim_fft'] = per_track_fourier_sim_fft
+            result['per_track_fourier_W']       = per_track_fourier_W
+            result['per_track_fourier_gt_fft']  = per_track_fourier_gt_fft
+            result['fourier_map_resolution']    = args.fourier_map_resolution
         if args.store_per_plane_loss and not args.save_per_factor:
             result['per_plane_loss_values'] = per_plane_loss_values
 

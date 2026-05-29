@@ -962,6 +962,9 @@ function _decState(s) {
 }
 
 function saveState() {
+  const mfct = mfInited ? DATA.all_tracks.filter(t => {
+    const e = document.getElementById('mf-ck-' + sid(t)); return e && e.checked;
+  }) : null;
   const state = {
     v:1, qty, xax, ys:yscale, bm:bandMode, rt:rightTab,
     fp:fParam, fn:fNoise, fs:fSeed, fc:fCutoff,
@@ -970,7 +973,10 @@ function saveState() {
     ser:series.map(s=>({
       p:s.spec.param, n:s.spec.noise, sd:s.spec.seed,
       c:s.spec.cutoff, t:s.spec.tracks, pl:s.spec.planes, clr:s.color
-    }))
+    })),
+    mfn:mfNoise, mfsd:mfSeed, mfas:mfAllSeeds, mfpg:mfPlaneGroup,
+    mfcpg:document.getElementById('mf-custom-plane-sel')?.value || 'all',
+    mfct
   };
   const enc = _encState(state);
   if (enc) window.location.hash = enc;
@@ -1051,6 +1057,15 @@ function loadState() {
       colorIdx++;
     });
   }
+
+  // Restore minfactor tab state (applied lazily when the tab is initialised)
+  if (st.mfn  !== undefined) mfNoise    = st.mfn;
+  if (st.mfsd !== undefined) mfSeed     = st.mfsd;
+  if (st.mfas !== undefined) mfAllSeeds = st.mfas;
+  if (st.mfpg)               mfPlaneGroup = st.mfpg;
+  if (st.mfcpg)              _savedMfCustomPlane  = st.mfcpg;
+  if (st.mfct)               _savedMfCustomTracks = st.mfct;
+
   return true;
 }
 
@@ -1184,6 +1199,7 @@ function renderSeedsPlot() {
 
 /* ─────────────────────────────── Min-factor vs Cutoff tab ─────────────────────────────── */
 let mfNoise = 1.0, mfSeed = 42, mfPlaneGroup = 'all', mfAllSeeds = false, mfInited = false;
+let _savedMfCustomPlane = null, _savedMfCustomTracks = null;
 const _mfDivs = new Set();
 
 // Six predefined track groups
@@ -1369,8 +1385,15 @@ function buildMfNoiseSel() {
     const o = document.createElement('option'); o.value = i; o.textContent = opt.label;
     sel.appendChild(o);
   });
-  let idx = mfOpts.findIndex(o => o.noise > 0 && o.seed !== '__all__' && Math.abs(o.seed - mfSeed) < 1e-9);
-  if (idx < 0) idx = mfOpts.findIndex(o => o.noise > 0 && o.seed !== '__all__');
+  let idx;
+  if (mfAllSeeds) {
+    idx = mfOpts.findIndex(o => o.seed === '__all__');
+  } else {
+    idx = mfOpts.findIndex(o =>
+      Math.abs(o.noise - mfNoise) < 1e-9 && o.seed !== '__all__' &&
+      (o.seed === null || Math.abs(o.seed - mfSeed) < 1e-9));
+    if (idx < 0) idx = mfOpts.findIndex(o => o.noise > 0 && o.seed !== '__all__');
+  }
   if (idx < 0) idx = 0;
   sel.value = idx;
   const initOpt = mfOpts[idx];
@@ -1398,6 +1421,13 @@ function buildMfCheckboxes() {
     lbl.appendChild(cb); lbl.appendChild(document.createTextNode(' ' + t));
     el.appendChild(lbl);
   });
+  if (_savedMfCustomTracks !== null) {
+    DATA.all_tracks.forEach(t => {
+      const e = document.getElementById('mf-ck-' + sid(t));
+      if (e) e.checked = _savedMfCustomTracks.includes(t);
+    });
+    _savedMfCustomTracks = null;
+  }
 }
 
 function mfSelAll()  { DATA.all_tracks.forEach(t=>{const e=document.getElementById('mf-ck-'+sid(t));if(e)e.checked=true; }); renderMfCustom(); }
@@ -1416,6 +1446,15 @@ function mfSelGroup(group) {
 function initMfTab() {
   buildMfNoiseSel();
   buildMfCheckboxes();
+  // Sync plane group button active states from restored state
+  document.querySelectorAll('#mf-plane-tabs .tab').forEach(b =>
+    b.classList.toggle('active', b.dataset.pg === mfPlaneGroup));
+  // Apply saved custom plane selection
+  if (_savedMfCustomPlane !== null) {
+    const cps = document.getElementById('mf-custom-plane-sel');
+    if (cps) cps.value = _savedMfCustomPlane;
+    _savedMfCustomPlane = null;
+  }
   _mfRenderFixed();
   renderMfCustom();
   mfInited = true;

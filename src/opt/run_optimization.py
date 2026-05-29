@@ -300,6 +300,17 @@ def parse_args():
     p.add_argument('--sobolev-loss-cutoff', type=float, default=0.0,
                    help='ADC cutoff: zero out pixels where |gt| < cutoff before computing loss '
                         '(default: 0.0, no cutoff). Applied to both sim and gt signals.')
+    p.add_argument('--sobolev-loss-cutoff-per-param', default=None,
+                   help='Per-parameter ADC cutoff: "param1:cutoff1,param2:cutoff2". '
+                        'Params not listed use --sobolev-loss-cutoff (default 0.0). '
+                        'Each param\'s gradient is computed from a loss masked with its own cutoff. '
+                        'Not compatible with --optimizer newton.')
+    p.add_argument('--planes-per-param', default=None,
+                   help='Per-parameter active planes: "param1:Y1,Y2%%param2:U1,V1". '
+                        'Uses "%%" as outer separator (between param entries) and ":" between '
+                        'param name and plane spec. Planes spec uses the same format as --planes. '
+                        'Params not listed use --planes (default: all planes). '
+                        'Not compatible with --optimizer newton.')
     p.add_argument('--start-position-mm', default='0,0,0',
                    help='Track start position as "x,y,z" in mm, applied to all tracks '
                         '(default: 0,0,0)')
@@ -829,6 +840,57 @@ def parse_lr_multipliers(spec, param_names):
             raise ValueError(f'--lr-multipliers: unknown param {name!r}. Known: {param_names}')
         scales[param_names.index(name)] = float(factor)
     return scales
+
+
+def parse_cutoff_per_param(spec, param_names, default_cutoff=0.0):
+    """Parse 'name:cutoff,...' into a per-parameter cutoff list (length = len(param_names)).
+
+    Unlisted parameters default to default_cutoff.
+    """
+    cutoffs = [default_cutoff] * len(param_names)
+    if not spec:
+        return cutoffs
+    for item in spec.split(','):
+        item = item.strip()
+        if not item:
+            continue
+        parts = item.split(':')
+        if len(parts) != 2:
+            raise ValueError(
+                f'--sobolev-loss-cutoff-per-param: bad spec {item!r} (expected name:cutoff)')
+        name, val = parts[0].strip(), parts[1].strip()
+        if name not in param_names:
+            raise ValueError(
+                f'--sobolev-loss-cutoff-per-param: unknown param {name!r}. Known: {param_names}')
+        cutoffs[param_names.index(name)] = float(val)
+    return cutoffs
+
+
+def parse_planes_per_param(spec, param_names, n_planes=6, default_planes=None):
+    """Parse 'param1:Y1,Y2%param2:U1,V1' into per-parameter active_planes tuples.
+
+    Uses '%' as outer separator (between param entries) and ':' between name and plane spec.
+    The plane spec itself uses ',' (same format as --planes).
+    Params not listed default to default_planes (None = all planes).
+    Returns a list of (sorted tuple of int) or None, one entry per param.
+    """
+    result = [default_planes] * len(param_names)
+    if not spec:
+        return result
+    for entry in spec.split('%'):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if ':' not in entry:
+            raise ValueError(
+                f'--planes-per-param: bad entry {entry!r} (expected param_name:plane_spec)')
+        name, planes_str = entry.split(':', 1)
+        name = name.strip()
+        if name not in param_names:
+            raise ValueError(
+                f'--planes-per-param: unknown param {name!r}. Known: {param_names}')
+        result[param_names.index(name)] = parse_planes(planes_str.strip(), n_planes=n_planes)
+    return result
 
 
 def parse_schedule(args):
@@ -1472,12 +1534,44 @@ def main():
         raise SystemExit(2)
 
     param_names = parse_params(args.params)
+
+    # Per-parameter ADC cutoffs + planes: build a list of (cutoff, planes_tuple, [param_indices])
+    # groups. Params sharing the same (cutoff, planes) share one compiled phase-fn set.
+    _param_groups = None  # None → use single global cutoff + planes (standard path)
+    if args.sobolev_loss_cutoff_per_param or args.planes_per_param:
+        if is_newton:
+            print('error: per-parameter cutoff/planes are not compatible with --optimizer newton.',
+                  file=sys.stderr)
+            raise SystemExit(2)
+        _cutoff_per_param = parse_cutoff_per_param(
+            args.sobolev_loss_cutoff_per_param or '', param_names, args.sobolev_loss_cutoff)
+        # planes_per_param parsed after active_planes is resolved (need n_planes from simulator).
+        # Store the raw spec for later; resolution happens below after active_planes is set.
+        _planes_per_param_spec = args.planes_per_param
+
     track_specs = parse_tracks(args.tracks)
     range_lo, range_hi = getattr(args, 'range')
     _spm = [float(v) for v in args.start_position_mm.split(',')]
     track_start_mm = tuple(_spm)
     schedule     = parse_schedule(args)
     active_planes = parse_planes(args.planes) if args.planes else None
+
+    # Resolve per-param groups now that active_planes is known.
+    if _param_groups is None and (args.sobolev_loss_cutoff_per_param or args.planes_per_param):
+        _planes_per_param = parse_planes_per_param(
+            _planes_per_param_spec or '', param_names, default_planes=active_planes)
+        # Group params by (cutoff, planes_tuple)
+        group_key_to_indices: dict = {}
+        for i, (c, pl) in enumerate(zip(_cutoff_per_param, _planes_per_param)):
+            key = (c, pl)
+            group_key_to_indices.setdefault(key, []).append(i)
+        # Sort groups for determinism: by cutoff first, then by planes string repr
+        _param_groups = [
+            (c, pl, indices)
+            for (c, pl), indices in sorted(
+                group_key_to_indices.items(), key=lambda kv: (kv[0][0], str(kv[0][1]))
+            )
+        ]
 
     # ── Seeding ───────────────────────────────────────────────────────────────
     # SeedSequence(None) draws entropy from the OS; spawn gives independent
@@ -1566,9 +1660,14 @@ def main():
     print(f'N            : {args.N}')
     print(f'Seed         : {effective_seed}')
     print(f'Noise scale  : {args.noise_scale}')
-    if args.sobolev_loss_cutoff > 0.0:
+    if _param_groups is not None and len(_param_groups) > 1:
+        for c, pl, idxs in _param_groups:
+            names_str = ', '.join(param_names[i] for i in idxs)
+            pl_str = str(pl) if pl is not None else 'all'
+            print(f'ADC cutoff   : {c}  planes={pl_str}  → {names_str}')
+    elif args.sobolev_loss_cutoff > 0.0:
         print(f'ADC cutoff   : {args.sobolev_loss_cutoff}')
-    if active_planes is not None:
+    if active_planes is not None and _param_groups is None:
         print(f'Active planes: {active_planes} (of 6 total)')
     print(f'Num buckets  : {args.num_buckets:,}')
     print(f'Eff batch    : {args.effective_batch_size}')
@@ -1824,17 +1923,64 @@ def main():
                           f'batch_size={phase["batch_size"]})  compiling...',
                           flush=True)
                     t0 = time.time()
-                    fns = build_phase_fns(
-                        args.loss, sim_ph, setter, batches,
-                        return_per_track_loss=log_track_losses_wandb,
-                        return_hessian=is_newton,
-                        adc_cutoff=args.sobolev_loss_cutoff,
-                        active_planes=active_planes)
-                    for fn in fns:
-                        out = fn(p)
-                        jax.block_until_ready(out)
-                        out = fn(p)
-                        jax.block_until_ready(out)
+
+                    if _param_groups is not None and len(_param_groups) > 1:
+                        # Per-parameter cutoff/planes: build one fn set per group, then wrap.
+                        # Per-track loss and Hessian are not supported with per-param groups.
+                        n_params_local = len(param_names)
+                        all_group_fns = []
+                        for cutoff_g, planes_g, indices_g in _param_groups:
+                            fns_g = build_phase_fns(
+                                args.loss, sim_ph, setter, batches,
+                                return_per_track_loss=False,
+                                return_hessian=False,
+                                adc_cutoff=cutoff_g,
+                                active_planes=planes_g)
+                            for fn in fns_g:
+                                out = fn(p); jax.block_until_ready(out)
+                                out = fn(p); jax.block_until_ready(out)
+                            all_group_fns.append(fns_g)
+
+                        # Build boolean masks for gradient assembly: mask[k][i] is True
+                        # when param i belongs to group k.
+                        group_masks = []
+                        for _, _, indices_g in _param_groups:
+                            m = np.zeros(n_params_local, dtype=bool)
+                            m[list(indices_g)] = True
+                            group_masks.append(jnp.array(m))
+
+                        n_batches = len(all_group_fns[0])
+                        fns = []
+                        for bi in range(n_batches):
+                            def _make_wrapped(bi=bi, gfns=all_group_fns, masks=group_masks):
+                                def wfn(p):
+                                    losses = []
+                                    grads = []
+                                    for fns_k in gfns:
+                                        lv, gv, _ = _unpack_batch_fn_ret(fns_k[bi](p))
+                                        losses.append(lv)
+                                        grads.append(gv)
+                                    # Assemble gradient: for each group k, override the
+                                    # gradient entries belonging to group k.
+                                    assembled = grads[0]
+                                    for k in range(1, len(grads)):
+                                        assembled = jnp.where(masks[k], grads[k], assembled)
+                                    return sum(losses) / len(losses), assembled
+                                return wfn
+                            fns.append(_make_wrapped())
+                    else:
+                        fns = build_phase_fns(
+                            args.loss, sim_ph, setter, batches,
+                            return_per_track_loss=log_track_losses_wandb,
+                            return_hessian=is_newton,
+                            adc_cutoff=args.sobolev_loss_cutoff,
+                            active_planes=active_planes)
+                        for fn in fns:
+                            out = fn(p)
+                            jax.block_until_ready(out)
+                            out = fn(p)
+                            jax.block_until_ready(out)
+
                     print(f'  done ({time.time() - t0:.1f} s) — {len(fns)} batches',
                           flush=True)
                     _phase_fns_store[ph_idx] = fns

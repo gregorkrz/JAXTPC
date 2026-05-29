@@ -226,6 +226,66 @@ def sobolev_loss_single(A, B, spectral_weight):
     return jnp.sum(power * spectral_weight) / N
 
 
+def sobolev_fourier_map_single(A, B, spectral_weight, out_size=None):
+    """Per-frequency Sobolev loss contribution C(f) for one plane.
+
+    C(f) = (1/N) * |FFT2(zero_pad(D))(f)|^2 * W(f),  where D = (A-B)/||B||_1.
+    Satisfies: sum_f C(f) == sobolev_loss_single(A, B, spectral_weight).
+
+    Parameters
+    ----------
+    A, B : jnp.ndarray  shape (H, W)
+    spectral_weight : jnp.ndarray  shape (H_pad, W_pad) from make_sobolev_weight()
+    out_size : optional (h, w) — bilinear-resize both outputs before returning
+
+    Returns
+    -------
+    C_shift : jnp.ndarray  fftshift(C), low frequencies centred
+    power_shift : jnp.ndarray  fftshift(|D_hat|^2/N), unweighted power spectrum
+    """
+    pad_h = (spectral_weight.shape[0] - A.shape[0]) // 2
+    pad_w = (spectral_weight.shape[1] - A.shape[1]) // 2
+    norm = jnp.sum(jnp.abs(B)) + 1e-12
+    diff = (A - B) / norm
+    diff_pad = jnp.pad(diff, ((pad_h, pad_h), (pad_w, pad_w)))
+    diff_fft = jnp.fft.fft2(diff_pad)
+    power = diff_fft.real ** 2 + diff_fft.imag ** 2
+    N = diff_pad.shape[0] * diff_pad.shape[1]
+    C_shift   = jnp.fft.fftshift(power * spectral_weight / N)
+    pwr_shift = jnp.fft.fftshift(power / N)
+    if out_size is not None:
+        C_shift   = jax.image.resize(C_shift,   out_size, method='bilinear')
+        pwr_shift = jax.image.resize(pwr_shift, out_size, method='bilinear')
+    return C_shift, pwr_shift
+
+
+def sobolev_signal_fft_power(X, spectral_weight, out_size=None):
+    """Normalized FFT power spectrum of a single signal plane.
+
+    Returns fftshift(|FFT2(zero_pad(X))|² / N), using the same padding as
+    sobolev_loss_single so frequency axes match sobolev_fourier_map_single outputs.
+
+    Parameters
+    ----------
+    X : jnp.ndarray  shape (H, W)
+    spectral_weight : jnp.ndarray  shape (H_pad, W_pad) from make_sobolev_weight()
+    out_size : optional (h, w) — bilinear-resize before returning
+
+    Returns
+    -------
+    jnp.ndarray  fftshift(|FFT2(padded X)|² / N)
+    """
+    pad_h = (spectral_weight.shape[0] - X.shape[0]) // 2
+    pad_w = (spectral_weight.shape[1] - X.shape[1]) // 2
+    X_pad = jnp.pad(X, ((pad_h, pad_h), (pad_w, pad_w)))
+    X_fft = jnp.fft.fft2(X_pad)
+    N = X_pad.shape[0] * X_pad.shape[1]
+    result = jnp.fft.fftshift((X_fft.real ** 2 + X_fft.imag ** 2) / N)
+    if out_size is not None:
+        result = jax.image.resize(result, out_size, method='bilinear')
+    return result
+
+
 @partial(jax.jit, static_argnums=(3,))
 def sobolev_loss(signals_a, signals_b, spectral_weights, planes=(0, 1, 2, 3, 4, 5)):
     """Sobolev H^{-1} loss summed over wire planes.
