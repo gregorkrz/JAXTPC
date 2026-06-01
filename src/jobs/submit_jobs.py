@@ -256,6 +256,7 @@ def make_gradient_command(
     noise_seed=42,
     adc_cutoff=0.0,
     adc_cutoffs=None,
+    fourier_cutoffs=None,
     results_dir="$RESULTS_DIR/1d_gradients",
     step_size=1.0,
     max_deposits=5000,
@@ -271,6 +272,7 @@ def make_gradient_command(
     Pass factors as a list of floats to use --factors (specific sweep points, one per job).
     Pass save_per_factor=True to flush one small pkl per sweep point within a single job.
     Pass adc_cutoffs as a list to use --adc-cutoffs (multi-cutoff sweep in one call).
+    Pass fourier_cutoffs as a list to use --fourier-cutoffs (Fourier-domain signal masking).
     Pass sobolev_s to override the Sobolev spectral exponent (default 2.0).
     """
     parts = [
@@ -294,6 +296,8 @@ def make_gradient_command(
         parts.append(f"--adc-cutoffs {','.join(str(c) for c in adc_cutoffs)}")
     else:
         parts.append(f"--adc-cutoff {adc_cutoff}")
+    if fourier_cutoffs is not None:
+        parts.append(f"--fourier-cutoffs {','.join(str(c) for c in fourier_cutoffs)}")
     if store_per_plane_loss:
         parts.append("--store-per-plane-loss")
     if store_per_pixel_loss_and_grad:
@@ -5297,7 +5301,7 @@ def profile_gradient_signal_viewer_20trk(
     submit=True,
     print_sbatch_only=False,
     wandb_tags=None,
-    time="00:30:00",
+    time="00:45:00",
     submit_failed=False,
 ):
     """Signal-array 1d-gradient run for all 20 tracks → cutoff_loss_landscape_20260526/.
@@ -5318,7 +5322,7 @@ def profile_gradient_signal_viewer_20trk(
     """
     results_dir      = "$RESULTS_DIR/1d_gradients/cutoff_loss_landscape_20260526"
     params           = ["diffusion_trans_cm2_us", "diffusion_long_cm2_us"]
-    noise_conditions = [(0.0, 42), (1.0, 42)]
+    noise_conditions = [(1.0, s) for s in range(8)]
 
     all_tracks_arg = "+".join(spec for _, spec in _GRADIENT_15_TRACKS)
 
@@ -5340,7 +5344,8 @@ def profile_gradient_signal_viewer_20trk(
                 range_frac=0.75,
                 noise_scale=noise_scale,
                 noise_seed=noise_seed,
-                adc_cutoff=0.0,
+                adc_cutoffs=[0, 5, 10, 15, 20, 25, 30, 50],
+                fourier_cutoffs=[1, 10, 100],
                 results_dir=results_dir,
                 store_per_plane_loss=True,
                 save_per_factor=True,
@@ -5362,7 +5367,7 @@ def profile_gradient_signal_viewer_20trk_sobolev_exp_1(
     submit=True,
     print_sbatch_only=False,
     wandb_tags=None,
-    time="00:30:00",
+    time="00:45:00",
     submit_failed=False,
 ):
     """Signal-array 1d-gradient run with Sobolev spectral exponent s=1.
@@ -5377,7 +5382,7 @@ def profile_gradient_signal_viewer_20trk_sobolev_exp_1(
     """
     results_dir      = "$RESULTS_DIR/1d_gradients/cutoff_loss_landscape_20260526_exp_1"
     params           = ["diffusion_trans_cm2_us", "diffusion_long_cm2_us"]
-    noise_conditions = [(0.0, 42), (1.0, 42)]
+    noise_conditions = [(1.0, s) for s in range(8)]
 
     all_tracks_arg = "+".join(spec for _, spec in _GRADIENT_15_TRACKS)
 
@@ -5399,7 +5404,8 @@ def profile_gradient_signal_viewer_20trk_sobolev_exp_1(
                 range_frac=0.75,
                 noise_scale=noise_scale,
                 noise_seed=noise_seed,
-                adc_cutoff=0.0,
+                adc_cutoffs=[0, 5, 10, 15, 20, 25, 30, 50],
+                fourier_cutoffs=[1, 10, 100],
                 sobolev_s=1,
                 results_dir=results_dir,
                 store_per_plane_loss=True,
@@ -5422,7 +5428,7 @@ def profile_gradient_signal_viewer_20trk_sobolev_exp_0(
     submit=True,
     print_sbatch_only=False,
     wandb_tags=None,
-    time="00:30:00",
+    time="00:45:00",
     submit_failed=False,
 ):
     """Signal-array 1d-gradient run with Sobolev spectral exponent s=0.
@@ -5438,7 +5444,7 @@ def profile_gradient_signal_viewer_20trk_sobolev_exp_0(
     """
     results_dir      = "$RESULTS_DIR/1d_gradients/cutoff_loss_landscape_20260526_exp_0"
     params           = ["diffusion_trans_cm2_us", "diffusion_long_cm2_us"]
-    noise_conditions = [(0.0, 42), (1.0, 42)]
+    noise_conditions = [(1.0, s) for s in range(8)]
 
     all_tracks_arg = "+".join(spec for _, spec in _GRADIENT_15_TRACKS)
 
@@ -5460,7 +5466,8 @@ def profile_gradient_signal_viewer_20trk_sobolev_exp_0(
                 range_frac=0.75,
                 noise_scale=noise_scale,
                 noise_seed=noise_seed,
-                adc_cutoff=0.0,
+                adc_cutoffs=[0, 5, 10, 15, 20, 25, 30, 50],
+                fourier_cutoffs=[1, 10, 100],
                 sobolev_s=0,
                 results_dir=results_dir,
                 store_per_plane_loss=True,

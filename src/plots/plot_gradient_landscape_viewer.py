@@ -77,79 +77,130 @@ def _round(vals, ndigits=6):
 
 
 def load_and_group(results_dir: str) -> dict:
-    """Load all pkls, merge tracks by (param, noise, seed, cutoff), return data dict."""
+    """Load all pkls, merge by (param, noise, seed, cutoff), return data dict.
+
+    Handles both multi-factor pkls (one file per param/noise combo) and
+    per-factor pkls produced by --save-per-factor (one file per sweep point).
+    In the per-factor case the factor axis is reconstructed by concatenating
+    across pkls, sorted by factor value.
+    """
     paths = sorted(glob.glob(os.path.join(results_dir, '*.pkl')))
     if not paths:
         raise FileNotFoundError(f'No .pkl files in {results_dir!r}')
 
-    # key → merged group dict
-    groups: dict = {}
+    # key → list of raw pkl dicts (accumulated, merged below)
+    raw_groups: dict = defaultdict(list)
 
     for path in paths:
         fname = os.path.basename(path)
         with open(path, 'rb') as f:
             r = pickle.load(f)
 
-        param_name  = r.get('param_name', 'unknown')
-        noise_scale = float(r.get('noise_scale', 0.0))
-        noise_seed  = int(r.get('noise_seed', 42))
-        adc_cutoff  = float(r.get('adc_cutoff', 0.0))
-        key         = (param_name, noise_scale, noise_seed, adc_cutoff)
+        param_name     = r.get('param_name', 'unknown')
+        noise_scale    = float(r.get('noise_scale', 0.0))
+        noise_seed     = int(r.get('noise_seed', 42))
+        adc_cutoff     = float(r.get('adc_cutoff', 0.0))
+        fourier_cutoff = float(r.get('fourier_cutoff', 0.0))
+        key            = (param_name, noise_scale, noise_seed, adc_cutoff, fourier_cutoff)
+        raw_groups[key].append(r)
 
-        track_specs  = r.get('track_specs', [])
-        track_names  = [ts['name'] for ts in track_specs]
-        plane_names  = r.get('plane_names', [])
-        per_tl       = r.get('per_track_loss_values', {})
-        per_tg       = r.get('per_track_grad_values', {})
-        per_pl       = r.get('per_plane_loss_values', None)
-
-        if key not in groups:
-            groups[key] = {
-                'param_name':   param_name,
-                'param_label':  PARAM_LABELS.get(param_name, param_name),
-                'param_gt':     float(r.get('param_gt', 0.0)),
-                'param_values': _round(r.get('param_values', [])),
-                'factors':      _round(r.get('factors', [])),
-                'noise_scale':  noise_scale,
-                'noise_seed':   noise_seed,
-                'adc_cutoff':   adc_cutoff,
-                'loss_name':    r.get('loss_name', ''),
-                'track_names':  [],
-                'per_track_loss': {},
-                'per_track_grad': {},
-                'per_plane_loss': {},
-                'plane_names':  plane_names,
-                '_has_plane':   False,
-            }
-
-        grp = groups[key]
-
-        for tname in track_names:
-            if tname not in grp['track_names']:
-                grp['track_names'].append(tname)
-            if tname in per_tl:
-                grp['per_track_loss'][tname] = _round(per_tl[tname])
-            if tname in per_tg:
-                grp['per_track_grad'][tname] = _round(per_tg[tname])
-            if per_pl and tname in per_pl:
-                grp['_has_plane'] = True
-                if tname not in grp['per_plane_loss']:
-                    grp['per_plane_loss'][tname] = {}
-                for pname, vals in per_pl[tname].items():
-                    grp['per_plane_loss'][tname][pname] = _round(vals)
-
+        track_specs = r.get('track_specs', [])
+        per_pl      = r.get('per_plane_loss_values', None)
         print(f'  {fname}: param={param_name}  noise={noise_scale:.3g}'
-              f'  seed={noise_seed}  cutoff={adc_cutoff:.3g}'
-              f'  tracks={len(track_names)}  per_plane={per_pl is not None}')
+              f'  seed={noise_seed}  cutoff={adc_cutoff:.3g}  fcutoff={fourier_cutoff:.3g}'
+              f'  tracks={len(track_specs)}  factors={len(r.get("factors", []))}  per_plane={per_pl is not None}')
 
-    print(f'Loaded {len(paths)} file(s) → {len(groups)} group(s)')
+    print(f'Loaded {len(paths)} file(s) → {len(raw_groups)} group(s)')
 
-    runs = []
-    for grp in groups.values():
-        has_plane = grp.pop('_has_plane')
-        if not has_plane:
-            grp['per_plane_loss'] = None
-        runs.append(grp)
+    groups: dict = {}
+    for key, raws in raw_groups.items():
+        param_name, noise_scale, noise_seed, adc_cutoff, fourier_cutoff = key
+
+        # Sort per-factor pkls by their first (and usually only) factor value.
+        raws.sort(key=lambda r: r.get('factors', [0.0])[0])
+
+        # Collect all track names in encounter order.
+        seen: set = set()
+        all_track_names: list = []
+        for r in raws:
+            for ts in r.get('track_specs', []):
+                t = ts['name']
+                if t not in seen:
+                    seen.add(t)
+                    all_track_names.append(t)
+
+        # Concatenate factor axis across pkls; merge track data per factor slice.
+        all_factors:       list = []
+        all_param_values:  list = []
+        tl_parts: dict = defaultdict(list)
+        tg_parts: dict = defaultdict(list)
+        pl_parts: dict = defaultdict(lambda: defaultdict(list))
+        plane_names: list = []
+        has_plane = False
+
+        for r in raws:
+            all_factors.extend(r.get('factors', []))
+            all_param_values.extend(r.get('param_values', []))
+            if not plane_names and r.get('plane_names'):
+                plane_names = r['plane_names']
+            r_tracks   = {ts['name'] for ts in r.get('track_specs', [])}
+            per_tl     = r.get('per_track_loss_values', {})
+            per_tg     = r.get('per_track_grad_values', {})
+            per_pl     = r.get('per_plane_loss_values', None)
+            for tname in all_track_names:
+                if tname not in r_tracks:
+                    continue
+                if tname in per_tl:
+                    tl_parts[tname].extend(list(per_tl[tname]))
+                if tname in per_tg:
+                    tg_parts[tname].extend(list(per_tg[tname]))
+                if per_pl and tname in per_pl:
+                    has_plane = True
+                    for pname, vals in per_pl[tname].items():
+                        pl_parts[tname][pname].extend(list(vals))
+
+        # Sort all arrays by factor value so plots draw left-to-right.
+        # Only safe when every track has data for every factor (the --save-per-factor
+        # case); skip if any track is missing from some pkls (different track sets).
+        n = len(all_factors)
+        _lengths_ok = (
+            all(len(v) == n for v in tl_parts.values()) and
+            all(len(v) == n for v in tg_parts.values()) and
+            all(len(v) == n for td in pl_parts.values() for v in td.values())
+        )
+        if _lengths_ok and n > 1:
+            ord_ = sorted(range(n), key=lambda i: all_factors[i])
+            all_factors      = [all_factors[i]      for i in ord_]
+            all_param_values = [all_param_values[i] for i in ord_]
+            for tname in list(tl_parts.keys()):
+                tl_parts[tname] = [tl_parts[tname][i] for i in ord_]
+            for tname in list(tg_parts.keys()):
+                tg_parts[tname] = [tg_parts[tname][i] for i in ord_]
+            for tname in list(pl_parts.keys()):
+                for pname in list(pl_parts[tname].keys()):
+                    pl_parts[tname][pname] = [pl_parts[tname][pname][i] for i in ord_]
+
+        first = raws[0]
+        groups[key] = {
+            'param_name':     param_name,
+            'param_label':    PARAM_LABELS.get(param_name, param_name),
+            'param_gt':       float(first.get('param_gt', 0.0)),
+            'factors':        _round(all_factors),
+            'param_values':   _round(all_param_values),
+            'noise_scale':    noise_scale,
+            'noise_seed':     noise_seed,
+            'adc_cutoff':     adc_cutoff,
+            'fourier_cutoff': fourier_cutoff,
+            'loss_name':      first.get('loss_name', ''),
+            'track_names':    all_track_names,
+            'per_track_loss': {t: _round(v) for t, v in tl_parts.items()},
+            'per_track_grad': {t: _round(v) for t, v in tg_parts.items()},
+            'per_plane_loss': ({t: {p: _round(v) for p, v in pd.items()}
+                                for t, pd in pl_parts.items()} if has_plane else None),
+            'plane_names':    plane_names,
+        }
+
+    runs = list(groups.values())
 
     runs.sort(key=lambda r: (r['param_name'], r['noise_scale'], r['noise_seed'], r['adc_cutoff']))
 
@@ -162,18 +213,20 @@ def load_and_group(results_dir: str) -> dict:
     params         = sorted({r['param_name'] for r in runs})
     noise_options  = sorted({r['noise_scale'] for r in runs})
     seed_options   = sorted({r['noise_seed']  for r in runs if r['noise_scale'] > 0})
-    cutoff_options = sorted({r['adc_cutoff']  for r in runs})
-    has_per_plane  = bool(all_planes)
+    cutoff_options         = sorted({r['adc_cutoff']     for r in runs})
+    fourier_cutoff_options = sorted({r['fourier_cutoff'] for r in runs})
+    has_per_plane          = bool(all_planes)
 
     return {
-        'runs':           runs,
-        'params':         params,
-        'all_tracks':     all_tracks,
-        'all_planes':     all_planes,
-        'has_per_plane':  has_per_plane,
-        'noise_options':  noise_options,
-        'seed_options':   seed_options,
-        'cutoff_options': cutoff_options,
+        'runs':                   runs,
+        'params':                 params,
+        'all_tracks':             all_tracks,
+        'all_planes':             all_planes,
+        'has_per_plane':          has_per_plane,
+        'noise_options':          noise_options,
+        'seed_options':           seed_options,
+        'cutoff_options':         cutoff_options,
+        'fourier_cutoff_options': fourier_cutoff_options,
     }
 
 
@@ -276,6 +329,10 @@ button{padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:1
     <div style="font-size:11px;color:#888;margin-bottom:2px">ADC cutoff</div>
     <select id="sel-cutoff"></select>
 
+    <div style="font-size:11px;color:#888;margin-bottom:2px;margin-top:6px">Fourier cutoff</div>
+    <select id="sel-fourier-cutoff"></select>
+
+    <div id="n-points-info" style="font-size:11px;color:#555;margin-top:2px;padding:2px 0"></div>
     <div id="no-run-warn" class="warn">⚠ No data matches this filter combination.</div>
   </div>
 
@@ -287,6 +344,7 @@ button{padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:1
       <button class="btn-sm quick-btn"      onclick="selTrackGroup('FirstQuarter')">1st¼</button>
       <button class="btn-sm quick-btn"      onclick="selTrackGroup('LastQuarter')">Last¼</button>
       <button class="btn-sm quick-btn"      onclick="selTrackGroup('original')">Orig</button>
+      <button class="btn-sm quick-btn"      onclick="selTrackGroup('nice')">Nice</button>
     </div>
     <div id="track-checks" class="scrollable"></div>
   </div>
@@ -382,10 +440,22 @@ button{padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:1
         <button class="tab" data-pg="Y"   onclick="setMfPlaneGroup('Y')">Y</button>
       </div>
     </div>
+    <!-- sub-tab bar -->
+    <div style="display:flex;background:#fff;border-bottom:1px solid #ddd;padding:0 4px;flex-shrink:0">
+      <button id="mfst-adc" class="rtab active" onclick="setMfSubTab('adc')">vs ADC cutoff</button>
+      <button id="mfst-fc"  class="rtab"        onclick="setMfSubTab('fc')">vs Fourier cutoff</button>
+    </div>
+    <!-- axis picker bar -->
+    <div class="mf-bar">
+      <span class="bar-lbl" id="mf-axis-lbl">Fourier cutoff:</span>
+      <select id="mf-fc-sel"  style="width:auto;min-width:120px;margin:0"></select>
+      <select id="mf-adc-sel" style="width:auto;min-width:140px;margin:0;display:none"></select>
+    </div>
     <!-- fixed groups section -->
     <div class="mf-section">
-      <div class="mf-section-hdr">Track groups — factor at loss minimum vs ADC cutoff</div>
-      <div id="mf-fixed-row" class="mf-row"></div>
+      <div class="mf-section-hdr" id="mf-fixed-hdr">Track groups — min-factor vs ADC cutoff</div>
+      <div id="mf-fixed-row"    class="mf-row"></div>
+      <div id="mf-fixed-fc-row" class="mf-row" style="display:none"></div>
     </div>
     <hr style="margin:0 12px">
     <!-- custom section -->
@@ -393,7 +463,7 @@ button{padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:1
       <div style="width:210px;flex-shrink:0">
         <div class="mf-section-hdr">Custom selection</div>
         <div style="font-size:11px;color:#888;margin-bottom:3px">Wire planes</div>
-        <select id="mf-custom-plane-sel" style="width:100%;margin-bottom:8px" onchange="renderMfCustom()">
+        <select id="mf-custom-plane-sel" style="width:100%;margin-bottom:8px" onchange="renderMfCustom();renderMfCustomFourier()">
           <option value="all">All</option>
           <option value="U">U (U1+U2)</option>
           <option value="V">V (V1+V2)</option>
@@ -406,12 +476,14 @@ button{padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:1
           <button class="btn-sm quick-btn" onclick="mfSelGroup('FirstQuarter')">1st¼</button>
           <button class="btn-sm quick-btn" onclick="mfSelGroup('LastQuarter')">Last¼</button>
           <button class="btn-sm quick-btn" onclick="mfSelGroup('original')">Orig</button>
+          <button class="btn-sm quick-btn" onclick="mfSelGroup('nice')">Nice</button>
         </div>
         <div id="mf-track-checks" class="scrollable" style="max-height:320px"></div>
       </div>
       <div style="flex:1;min-width:0">
-        <div class="mf-section-hdr">Custom tracks — factor at loss minimum vs ADC cutoff</div>
-        <div id="mf-custom-row" class="mf-row"></div>
+        <div class="mf-section-hdr" id="mf-custom-hdr">Custom tracks — min-factor vs ADC cutoff</div>
+        <div id="mf-custom-row"    class="mf-row"></div>
+        <div id="mf-custom-fc-row" class="mf-row" style="display:none"></div>
       </div>
     </div>
   </div>
@@ -448,6 +520,7 @@ let fParam   = DATA.params[0];
 let fNoise   = DATA.noise_options[0] || 0.0;
 let fSeed    = DATA.seed_options[0]  || 42;
 let fCutoff  = DATA.cutoff_options[0] || 0.0;
+let fFourier = DATA.fourier_cutoff_options[0] || 0.0;
 
 let series   = [];
 let colorIdx = 0;
@@ -462,12 +535,13 @@ function nextColor() { return PALETTE[colorIdx++ % PALETTE.length]; }
 /* ─────────────────────────────── helpers ─────────────────────────────── */
 function sid(raw) { return String(raw).replace(/[^a-zA-Z0-9]/g, '_'); }
 
-function getRun(param, noise, seed, cutoff) {
+function getRun(param, noise, seed, cutoff, fourier) {
   return DATA.runs.find(r =>
     r.param_name === param &&
     Math.abs(r.noise_scale - noise) < 1e-9 &&
     (noise < 1e-9 || r.noise_seed === seed) &&
-    Math.abs(r.adc_cutoff - cutoff) < 1e-9
+    Math.abs(r.adc_cutoff - cutoff) < 1e-9 &&
+    Math.abs(r.fourier_cutoff - fourier) < 1e-9
   ) || null;
 }
 
@@ -522,7 +596,9 @@ function computeVals(run, tracks, planes) {
 function buildLabel(run, tracks, planes) {
   const noise  = run.noise_scale > 0
                ? `σ=${run.noise_scale} s${run.noise_seed}` : 'clean';
-  const cut    = `cut=${run.adc_cutoff}`;
+  const cut    = run.fourier_cutoff > 0
+               ? `cut=${run.adc_cutoff} fc=${run.fourier_cutoff}`
+               : `cut=${run.adc_cutoff}`;
   const nT     = tracks.length;
   const tStr   = nT === DATA.all_tracks.length ? 'all trk'
                : nT === 1 ? tracks[0] : `${nT} trk`;
@@ -581,6 +657,17 @@ function buildFilters() {
   });
   sc.value = fCutoff;
   sc.onchange = () => { fCutoff = parseFloat(sc.value); onFilt(); };
+
+  /* fourier cutoff */
+  const sfc = document.getElementById('sel-fourier-cutoff');
+  sfc.innerHTML = '';
+  DATA.fourier_cutoff_options.forEach(c => {
+    const o = document.createElement('option'); o.value = c;
+    o.textContent = c === 0 ? 'fc = 0 (none)' : `fc = ${c}`;
+    sfc.appendChild(o);
+  });
+  sfc.value = fFourier;
+  sfc.onchange = () => { fFourier = parseFloat(sfc.value); onFilt(); };
 }
 
 function buildCheckboxes() {
@@ -621,13 +708,17 @@ function selNone(kind) {
   items.forEach(x => { const el = document.getElementById(prefix + sid(x)); if (el) el.checked = false; });
   renderLivePlot(); if (rightTab === 'seeds') renderSeedsPlot(); saveState();
 }
+const _UGLY_TRACKS = ['Muon4_100MeV','Muon5_100MeV','Muon10_100MeV','Muon12_100MeV','Muon13_100MeV'];
+function _isNice(t) { return !_UGLY_TRACKS.some(u => t.includes(u)); }
+
 function selTrackGroup(group) {
   DATA.all_tracks.forEach(t => {
     const el = document.getElementById('ck-t-' + sid(t));
     if (!el) return;
-    if (group === 'FirstQuarter')  el.checked = t.includes('FirstQuarter');
+    if (group === 'FirstQuarter')     el.checked = t.includes('FirstQuarter');
     else if (group === 'LastQuarter') el.checked = t.includes('LastQuarter');
-    else /* original */            el.checked = !t.includes('Quarter');
+    else if (group === 'nice')        el.checked = _isNice(t);
+    else /* original */               el.checked = !t.includes('Quarter');
   });
   renderLivePlot(); if (rightTab === 'seeds') renderSeedsPlot(); saveState();
 }
@@ -640,8 +731,10 @@ function updateResourceLinks() {
 }
 
 function onFilt() {
-  const run = getRun(fParam, fNoise, fSeed, fCutoff);
+  const run = getRun(fParam, fNoise, fSeed, fCutoff, fFourier);
   document.getElementById('no-run-warn').style.display = run ? 'none' : '';
+  const nPts = document.getElementById('n-points-info');
+  if (nPts) nPts.textContent = run ? `${run.factors.length} sweep points` : '';
   if      (rightTab === 'plots') renderLivePlot();
   else if (rightTab === 'seeds') renderSeedsPlot();
   else if (rightTab === 'table') renderMinTable();
@@ -677,7 +770,7 @@ function _argmin(arr) {
 
 function renderMinTable() {
   const el  = document.getElementById('table-view');
-  const run = getRun(fParam, fNoise, fSeed, fCutoff);
+  const run = getRun(fParam, fNoise, fSeed, fCutoff, fFourier);
 
   if (!run) {
     el.innerHTML = '<p style="padding:20px;color:#e65100">⚠ No data for current filter selection.</p>';
@@ -755,7 +848,7 @@ function renderMinTable() {
 
 /* ─────────────────────────────── series ─────────────────────────────── */
 function addSeries() {
-  const run = getRun(fParam, fNoise, fSeed, fCutoff);
+  const run = getRun(fParam, fNoise, fSeed, fCutoff, fFourier);
   if (!run) { alert('No data matches the current filter combination.'); return; }
 
   const tracks = getSelectedTracks();
@@ -767,7 +860,7 @@ function addSeries() {
   const color  = nextColor();
 
   series.push({ id: colorIdx - 1, label, color, vals,
-                spec: { param: fParam, noise: fNoise, seed: fSeed, cutoff: fCutoff, tracks, planes } });
+                spec: { param: fParam, noise: fNoise, seed: fSeed, cutoff: fCutoff, fourier: fFourier, tracks, planes } });
   renderSeriesList();
   renderCanvas();
   saveState();
@@ -834,7 +927,7 @@ function renderLivePlot() {
   const layout = _baseLayout(yTitle, xTitle);
   const cfg    = { responsive: true };
 
-  const run    = getRun(fParam, fNoise, fSeed, fCutoff);
+  const run    = getRun(fParam, fNoise, fSeed, fCutoff, fFourier);
   const tracks = getSelectedTracks();
   let traces   = [];
 
@@ -967,14 +1060,15 @@ function saveState() {
   }) : null;
   const state = {
     v:1, qty, xax, ys:yscale, bm:bandMode, rt:rightTab,
-    fp:fParam, fn:fNoise, fs:fSeed, fc:fCutoff,
+    fp:fParam, fn:fNoise, fs:fSeed, fc:fCutoff, ff:fFourier,
     trk:getSelectedTracks(),
     pln:getSelectedPlanes(),
     ser:series.map(s=>({
       p:s.spec.param, n:s.spec.noise, sd:s.spec.seed,
-      c:s.spec.cutoff, t:s.spec.tracks, pl:s.spec.planes, clr:s.color
+      c:s.spec.cutoff, ff:s.spec.fourier, t:s.spec.tracks, pl:s.spec.planes, clr:s.color
     })),
-    mfn:mfNoise, mfsd:mfSeed, mfas:mfAllSeeds, mfpg:mfPlaneGroup,
+    mfn:mfNoise, mfsd:mfSeed, mfas:mfAllSeeds, mfpg:mfPlaneGroup, mfst:mfSubTab,
+    mffc:mfFourierCutoff, mfac:mfAdcCutoff,
     mfcpg:document.getElementById('mf-custom-plane-sel')?.value || 'all',
     mfct
   };
@@ -996,7 +1090,8 @@ function loadState() {
   if (st.fp)  fParam = st.fp;
   if (st.fn !== undefined) fNoise  = st.fn;
   if (st.fs !== undefined) fSeed   = st.fs;
-  if (st.fc !== undefined) fCutoff = st.fc;
+  if (st.fc !== undefined) fCutoff  = st.fc;
+  if (st.ff !== undefined) fFourier = st.ff;
 
   // Sync filter selects
   const sp = document.getElementById('sel-param');
@@ -1009,6 +1104,8 @@ function loadState() {
   }
   const sc = document.getElementById('sel-cutoff');
   if (sc) sc.value = fCutoff;
+  const sfc = document.getElementById('sel-fourier-cutoff');
+  if (sfc) sfc.value = fFourier;
 
   // Sync track checkboxes
   if (st.trk) {
@@ -1045,7 +1142,7 @@ function loadState() {
   if (st.ser && st.ser.length > 0) {
     series = []; colorIdx = 0;
     st.ser.forEach(ss => {
-      const run = getRun(ss.p, ss.n, ss.sd, ss.c);
+      const run = getRun(ss.p, ss.n, ss.sd, ss.c, ss.ff || 0.0);
       if (!run) return;
       const tracks = ss.t || [];
       const planes = ss.pl || [];
@@ -1053,16 +1150,19 @@ function loadState() {
       const label  = buildLabel(run, tracks, planes);
       series.push({ id: colorIdx, label, color: ss.clr, vals,
                     spec: { param: ss.p, noise: ss.n, seed: ss.sd,
-                            cutoff: ss.c, tracks, planes } });
+                            cutoff: ss.c, fourier: ss.ff || 0.0, tracks, planes } });
       colorIdx++;
     });
   }
 
   // Restore minfactor tab state (applied lazily when the tab is initialised)
-  if (st.mfn  !== undefined) mfNoise    = st.mfn;
-  if (st.mfsd !== undefined) mfSeed     = st.mfsd;
-  if (st.mfas !== undefined) mfAllSeeds = st.mfas;
-  if (st.mfpg)               mfPlaneGroup = st.mfpg;
+  if (st.mfn  !== undefined) mfNoise        = st.mfn;
+  if (st.mfsd !== undefined) mfSeed         = st.mfsd;
+  if (st.mfas !== undefined) mfAllSeeds     = st.mfas;
+  if (st.mfpg)               mfPlaneGroup   = st.mfpg;
+  if (st.mfst)               mfSubTab       = st.mfst;
+  if (st.mffc !== undefined) mfFourierCutoff = st.mffc;
+  if (st.mfac !== undefined) mfAdcCutoff    = st.mfac;
   if (st.mfcpg)              _savedMfCustomPlane  = st.mfcpg;
   if (st.mfct)               _savedMfCustomTracks = st.mfct;
 
@@ -1093,11 +1193,12 @@ function renderSeedsPlot() {
   const layout = _baseLayout(yTitle, xTitle);
   const cfg    = { responsive: true };
 
-  // All runs for current (param, noise_scale, cutoff) regardless of seed
+  // All runs for current (param, noise_scale, cutoff, fourier_cutoff) regardless of seed
   const matchRuns = DATA.runs.filter(r =>
     r.param_name === fParam &&
-    Math.abs(r.noise_scale - fNoise) < 1e-9 &&
-    Math.abs(r.adc_cutoff  - fCutoff) < 1e-9
+    Math.abs(r.noise_scale    - fNoise)   < 1e-9 &&
+    Math.abs(r.adc_cutoff     - fCutoff)  < 1e-9 &&
+    Math.abs(r.fourier_cutoff - fFourier) < 1e-9
   ).sort((a, b) => a.noise_seed - b.noise_seed);
 
   const tracks = getSelectedTracks();
@@ -1199,6 +1300,9 @@ function renderSeedsPlot() {
 
 /* ─────────────────────────────── Min-factor vs Cutoff tab ─────────────────────────────── */
 let mfNoise = 1.0, mfSeed = 42, mfPlaneGroup = 'all', mfAllSeeds = false, mfInited = false;
+let mfSubTab = 'adc';
+let mfFourierCutoff = DATA.fourier_cutoff_options[0] || 0.0;
+let mfAdcCutoff     = DATA.cutoff_options[0]         || 0.0;
 let _savedMfCustomPlane = null, _savedMfCustomTracks = null;
 const _mfDivs = new Set();
 
@@ -1252,17 +1356,39 @@ function mfMinFactor(run, tracks, planes) {
 function mfRunsByCutoff(param, noise, seed) {
   return DATA.runs.filter(r =>
     r.param_name === param &&
-    Math.abs(r.noise_scale - noise) < 1e-9 &&
+    Math.abs(r.noise_scale    - noise)           < 1e-9 &&
+    Math.abs(r.fourier_cutoff - mfFourierCutoff) < 1e-9 &&
     (noise < 1e-9 || r.noise_seed === seed)
   ).sort((a,b) => a.adc_cutoff - b.adc_cutoff);
 }
-// Returns [{cutoff, runs[]}] across ALL seeds for a given (param, noise)
 function mfAllSeedsByCutoff(param, noise) {
   const noisy = DATA.runs.filter(r =>
-    r.param_name === param && Math.abs(r.noise_scale - noise) < 1e-9 && noise > 1e-9
+    r.param_name === param &&
+    Math.abs(r.noise_scale    - noise)           < 1e-9 &&
+    Math.abs(r.fourier_cutoff - mfFourierCutoff) < 1e-9 &&
+    noise > 1e-9
   );
   const map = {};
   noisy.forEach(r => { (map[r.adc_cutoff] = map[r.adc_cutoff] || []).push(r); });
+  return Object.keys(map).map(Number).sort((a,b)=>a-b).map(c=>({cutoff:c, runs:map[c]}));
+}
+function mfRunsByFCutoff(param, noise, seed) {
+  return DATA.runs.filter(r =>
+    r.param_name === param &&
+    Math.abs(r.noise_scale - noise)       < 1e-9 &&
+    Math.abs(r.adc_cutoff  - mfAdcCutoff) < 1e-9 &&
+    (noise < 1e-9 || r.noise_seed === seed)
+  ).sort((a,b) => a.fourier_cutoff - b.fourier_cutoff);
+}
+function mfAllSeedsByFCutoff(param, noise) {
+  const noisy = DATA.runs.filter(r =>
+    r.param_name === param &&
+    Math.abs(r.noise_scale - noise)       < 1e-9 &&
+    Math.abs(r.adc_cutoff  - mfAdcCutoff) < 1e-9 &&
+    noise > 1e-9
+  );
+  const map = {};
+  noisy.forEach(r => { (map[r.fourier_cutoff] = map[r.fourier_cutoff] || []).push(r); });
   return Object.keys(map).map(Number).sort((a,b)=>a-b).map(c=>({cutoff:c, runs:map[c]}));
 }
 
@@ -1276,6 +1402,19 @@ function _mfLayout(title) {
   return {
     title: { text:title, font:{size:13} },
     xaxis: { title:'ADC cutoff', gridcolor:'#eee', zeroline:false },
+    yaxis: { title:'Factor at min loss (param/GT)', gridcolor:'#eee', zeroline:false },
+    shapes: [{ type:'line', x0:0, x1:1, y0:1, y1:1, xref:'paper', yref:'y',
+               line:{ color:'#555', width:1.5, dash:'dot' } }],
+    legend: { font:{size:11} },
+    margin: { t:40, b:52, l:76, r:16 },
+    paper_bgcolor:'#fff', plot_bgcolor:'#fcfcfc',
+    hovermode:'x unified',
+  };
+}
+function _mfFCLayout(title) {
+  return {
+    title: { text:title, font:{size:13} },
+    xaxis: { title:'Fourier cutoff', gridcolor:'#eee', zeroline:false },
     yaxis: { title:'Factor at min loss (param/GT)', gridcolor:'#eee', zeroline:false },
     shapes: [{ type:'line', x0:0, x1:1, y0:1, y1:1, xref:'paper', yref:'y',
                line:{ color:'#555', width:1.5, dash:'dot' } }],
@@ -1365,11 +1504,87 @@ function renderMfCustom() {
   });
 }
 
+function _mfRenderFixedFourier() {
+  _mfEnsureRow('mf-fixed-fc-row', 'mf-ff-');
+  const planes = mfGetPlanes(mfPlaneGroup);
+  DATA.params.forEach(p => {
+    let traces;
+    if (mfAllSeeds) {
+      const groups = mfAllSeedsByFCutoff(p, mfNoise);
+      traces = MF_GROUPS.map(g =>
+        _mfMeanErrTrace(groups, DATA.all_tracks.filter(g.fn), planes, g.label, g.color));
+    } else {
+      const runs = mfRunsByFCutoff(p, mfNoise, mfSeed);
+      const xs   = runs.map(r => r.fourier_cutoff);
+      traces = MF_GROUPS.map(g => ({
+        x: xs,
+        y: runs.map(r => mfMinFactor(r, DATA.all_tracks.filter(g.fn), planes)),
+        name: g.label, type:'scatter', mode:'lines+markers', connectgaps:true,
+        line:{ color:g.color, width:2 }, marker:{ color:g.color, size:6 },
+      }));
+    }
+    const lbl = DATA.runs.find(r => r.param_name === p)?.param_label || p;
+    _mfDo('mf-ff-' + sid(p), traces, _mfFCLayout(lbl));
+  });
+}
+
+function renderMfCustomFourier() {
+  _mfEnsureRow('mf-custom-fc-row', 'mf-cf-');
+  const tracks = DATA.all_tracks.filter(t => {
+    const e = document.getElementById('mf-ck-' + sid(t)); return e && e.checked;
+  });
+  const pg     = document.getElementById('mf-custom-plane-sel')?.value || 'all';
+  const planes = mfGetPlanes(pg);
+  const color  = '#1565C0';
+  DATA.params.forEach(p => {
+    let traces;
+    if (mfAllSeeds) {
+      const groups = mfAllSeedsByFCutoff(p, mfNoise);
+      traces = tracks.length
+        ? [_mfMeanErrTrace(groups, tracks, planes, `${tracks.length} tracks [${pg}]`, color)]
+        : [];
+    } else {
+      const runs = mfRunsByFCutoff(p, mfNoise, mfSeed);
+      const xs   = runs.map(r => r.fourier_cutoff);
+      const ys   = runs.map(r => mfMinFactor(r, tracks, planes));
+      traces = tracks.length ? [{ x:xs, y:ys,
+        name:`${tracks.length} tracks [${pg}]`, type:'scatter', mode:'lines+markers', connectgaps:true,
+        line:{color, width:2.5}, marker:{color, size:7} }] : [];
+    }
+    const lbl = DATA.runs.find(r => r.param_name === p)?.param_label || p;
+    _mfDo('mf-cf-' + sid(p), traces, _mfFCLayout(lbl));
+  });
+}
+
+function setMfSubTab(tab) {
+  mfSubTab = tab;
+  const isAdc = tab === 'adc';
+  document.getElementById('mfst-adc').classList.toggle('active', isAdc);
+  document.getElementById('mfst-fc').classList.toggle('active', !isAdc);
+  document.getElementById('mf-fixed-row').style.display    = isAdc ? '' : 'none';
+  document.getElementById('mf-fixed-fc-row').style.display = isAdc ? 'none' : '';
+  document.getElementById('mf-custom-row').style.display    = isAdc ? '' : 'none';
+  document.getElementById('mf-custom-fc-row').style.display = isAdc ? 'none' : '';
+  document.getElementById('mf-fc-sel').style.display  = isAdc ? '' : 'none';
+  document.getElementById('mf-adc-sel').style.display = isAdc ? 'none' : '';
+  document.getElementById('mf-axis-lbl').textContent  = isAdc ? 'Fourier cutoff:' : 'ADC cutoff:';
+  document.getElementById('mf-fixed-hdr').textContent  = isAdc
+    ? 'Track groups — min-factor vs ADC cutoff'
+    : 'Track groups — min-factor vs Fourier cutoff';
+  document.getElementById('mf-custom-hdr').textContent = isAdc
+    ? 'Custom tracks — min-factor vs ADC cutoff'
+    : 'Custom tracks — min-factor vs Fourier cutoff';
+  if (isAdc) { _mfRenderFixed(); renderMfCustom(); }
+  else        { _mfRenderFixedFourier(); renderMfCustomFourier(); }
+  saveState();
+}
+
 function setMfPlaneGroup(g) {
   mfPlaneGroup = g;
   document.querySelectorAll('#mf-plane-tabs .tab').forEach(b =>
     b.classList.toggle('active', b.dataset.pg === g));
-  _mfRenderFixed();
+  if (mfSubTab === 'adc') { _mfRenderFixed(); }
+  else { _mfRenderFixedFourier(); }
 }
 
 function buildMfNoiseSel() {
@@ -1405,7 +1620,7 @@ function buildMfNoiseSel() {
     const opt = mfOpts[+sel.value];
     mfNoise = opt.noise; mfAllSeeds = opt.seed === '__all__';
     if (!mfAllSeeds && opt.seed !== null) mfSeed = opt.seed;
-    _mfRenderFixed(); renderMfCustom();
+    _mfRenderFixed(); renderMfCustom(); _mfRenderFixedFourier(); renderMfCustomFourier();
   };
 }
 
@@ -1417,7 +1632,7 @@ function buildMfCheckboxes() {
     const lbl = document.createElement('label'); lbl.className = 'ck';
     const cb  = document.createElement('input'); cb.type = 'checkbox';
     cb.id = 'mf-ck-' + sid(t); cb.checked = true;
-    cb.onchange = renderMfCustom;
+    cb.onchange = () => { renderMfCustom(); renderMfCustomFourier(); };
     lbl.appendChild(cb); lbl.appendChild(document.createTextNode(' ' + t));
     el.appendChild(lbl);
   });
@@ -1430,33 +1645,62 @@ function buildMfCheckboxes() {
   }
 }
 
-function mfSelAll()  { DATA.all_tracks.forEach(t=>{const e=document.getElementById('mf-ck-'+sid(t));if(e)e.checked=true; }); renderMfCustom(); }
-function mfSelNone() { DATA.all_tracks.forEach(t=>{const e=document.getElementById('mf-ck-'+sid(t));if(e)e.checked=false;}); renderMfCustom(); }
+function mfSelAll()  { DATA.all_tracks.forEach(t=>{const e=document.getElementById('mf-ck-'+sid(t));if(e)e.checked=true; }); renderMfCustom(); renderMfCustomFourier(); }
+function mfSelNone() { DATA.all_tracks.forEach(t=>{const e=document.getElementById('mf-ck-'+sid(t));if(e)e.checked=false;}); renderMfCustom(); renderMfCustomFourier(); }
 function mfSelGroup(group) {
   DATA.all_tracks.forEach(t => {
     const e = document.getElementById('mf-ck-' + sid(t));
     if (!e) return;
     if (group === 'FirstQuarter')     e.checked = t.includes('FirstQuarter');
     else if (group === 'LastQuarter') e.checked = t.includes('LastQuarter');
+    else if (group === 'nice')        e.checked = _isNice(t);
     else                              e.checked = !t.includes('Quarter');
   });
-  renderMfCustom();
+  renderMfCustom(); renderMfCustomFourier();
+}
+
+function buildMfFCutoffSel() {
+  const sel = document.getElementById('mf-fc-sel');
+  if (!sel) return;
+  sel.innerHTML = '';
+  DATA.fourier_cutoff_options.forEach(fc => {
+    const o = document.createElement('option'); o.value = fc;
+    o.textContent = fc === 0 ? 'fc = 0 (none)' : `fc = ${fc}`;
+    sel.appendChild(o);
+  });
+  sel.value = mfFourierCutoff;
+  sel.onchange = () => { mfFourierCutoff = parseFloat(sel.value); _mfRenderFixed(); renderMfCustom(); saveState(); };
+}
+
+function buildMfAdcCutoffSel() {
+  const sel = document.getElementById('mf-adc-sel');
+  if (!sel) return;
+  sel.innerHTML = '';
+  DATA.cutoff_options.forEach(c => {
+    const o = document.createElement('option'); o.value = c;
+    o.textContent = c === 0 ? 'cutoff = 0 (none)' : `cutoff = ${c} ADC`;
+    sel.appendChild(o);
+  });
+  sel.value = mfAdcCutoff;
+  sel.onchange = () => { mfAdcCutoff = parseFloat(sel.value); _mfRenderFixedFourier(); renderMfCustomFourier(); saveState(); };
 }
 
 function initMfTab() {
   buildMfNoiseSel();
+  buildMfFCutoffSel();
+  buildMfAdcCutoffSel();
   buildMfCheckboxes();
   // Sync plane group button active states from restored state
   document.querySelectorAll('#mf-plane-tabs .tab').forEach(b =>
     b.classList.toggle('active', b.dataset.pg === mfPlaneGroup));
+  // Sync sub-tab state
+  setMfSubTab(mfSubTab);
   // Apply saved custom plane selection
   if (_savedMfCustomPlane !== null) {
     const cps = document.getElementById('mf-custom-plane-sel');
     if (cps) cps.value = _savedMfCustomPlane;
     _savedMfCustomPlane = null;
   }
-  _mfRenderFixed();
-  renderMfCustom();
   mfInited = true;
 }
 
@@ -1509,6 +1753,7 @@ def main():
     print(f'Noise opts  : {data["noise_options"]}')
     print(f'Seeds       : {data["seed_options"]}')
     print(f'Cutoffs     : {data["cutoff_options"]}')
+    print(f'FFT cutoffs : {data["fourier_cutoff_options"]}')
     print(f'Runs total  : {len(data["runs"])}')
 
     data_json = json.dumps(data, cls=_NpEncoder, separators=(',', ':'))
