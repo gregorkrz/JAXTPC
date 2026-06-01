@@ -423,6 +423,11 @@ tr.sel:hover td{background:#BBDEFB}
         <input type="number" id="signal-fourier-cutoff" min="0" step="0.001" value="0">
         <span class="hint">|FFT|²/N &nbsp;(0 = show all; filters the displayed signal in-place)</span>
       </div>
+      <div class="row" style="margin-top:4px">
+        <span class="lbl">ADC cut:</span>
+        <input type="number" id="signal-adc-cutoff" min="0" step="0.1" value="0">
+        <span class="hint">ADC &nbsp;(0 = show all; zeros pixels where |value| &lt; cutoff)</span>
+      </div>
       <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;align-items:start;margin-top:6px">
         <div id="evd-plot" style="cursor:crosshair"></div>
         <div id="evd-pixel-loss"></div>
@@ -882,8 +887,10 @@ function _drawEvd() {
 
   if (!z.length) return;  // value not yet loaded — skip until VALUE_DATA_READY fires
 
-  const _sfCutoff = parseFloat(document.getElementById('signal-fourier-cutoff')?.value || '0') || 0;
-  if (_sfCutoff > 0) z = _applyFourierCutoff2d(z, _sfCutoff);
+  const _sfCutoff  = parseFloat(document.getElementById('signal-fourier-cutoff')?.value || '0') || 0;
+  const _adcCutoff = parseFloat(document.getElementById('signal-adc-cutoff')?.value   || '0') || 0;
+  if (_sfCutoff  > 0) z = _applyFourierCutoff2d(z, _sfCutoff);
+  if (_adcCutoff > 0) z = z.map(row => row.map(v => (v !== null && Math.abs(v) < _adcCutoff) ? 0 : v));
 
   let absmax = 0;
   z.forEach(row => row.forEach(v => { if (Math.abs(v) > absmax) absmax = Math.abs(v); }));
@@ -1869,6 +1876,7 @@ window.addEventListener('load', async () => {
   });
   document.getElementById('pixel-mask-thresh').addEventListener('input', () => { _drawPixelMaps(); _saveState(); });
   document.getElementById('signal-fourier-cutoff').addEventListener('input', () => { _drawEvd(); _saveState(); });
+  document.getElementById('signal-adc-cutoff').addEventListener('input',     () => { _drawEvd(); _saveState(); });
 
   // Action buttons
   document.getElementById('btn-add').addEventListener('click', _addTrace);

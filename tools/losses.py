@@ -203,6 +203,19 @@ def make_sobolev_weight(H, W, max_pad=1024, s=2.0, freq_cutoff=None):
     return w
 
 
+def apply_fourier_power_mask(weight, gt_array, max_pad, power_cutoff):
+    """Zero spectral bins where |FFT(padded_gt)|^2/N < power_cutoff (ADC^2).
+
+    Equivalent to Fourier-filtering both sim and gt at the cutoff before computing
+    the loss (FFT linearity makes the two operations identical).
+    Same convention as fourier_cutoff in 1d_gradients.py.
+    """
+    gt_pad = jnp.pad(gt_array, ((max_pad, max_pad), (max_pad, max_pad)))
+    hat = jnp.fft.fft2(gt_pad)
+    fft_power = (hat.real ** 2 + hat.imag ** 2) / hat.size
+    return jnp.where(fft_power >= power_cutoff, weight, 0.0)
+
+
 def sobolev_loss_single(A, B, spectral_weight):
     """Sobolev H^{-1} loss for a single plane.
 

@@ -947,11 +947,16 @@ def main():
         if args.store_per_plane_loss and not args.save_per_factor:
             result['per_plane_loss_values'] = per_plane_loss_values
 
-        with open(output_path, 'wb') as f:
-            pickle.dump(result, f)
-        sz = os.path.getsize(output_path) / 1e6
-        suffix = ' (summary, arrays in per-factor pkls)' if args.save_per_factor else ''
-        print(f'Saved{suffix}: {output_path}  ({sz:.1f} MB)')
+        if args.save_per_factor:
+            # Per-factor pkls already contain all data; a summary pkl would be
+            # loaded alongside them by the viewer and cause duplicate factor
+            # entries and per_plane_loss index misalignment.
+            print(f'(save_per_factor: skipping summary pkl, all data in per-factor files)')
+        else:
+            with open(output_path, 'wb') as f:
+                pickle.dump(result, f)
+            sz = os.path.getsize(output_path) / 1e6
+            print(f'Saved: {output_path}  ({sz:.1f} MB)')
 
     print('\nDone.')
 

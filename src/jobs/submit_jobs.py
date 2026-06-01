@@ -66,6 +66,17 @@ Available profiles
                                 4 jobs (2 params × clean+noisy), N=5, --store-arrays, 128 GB RAM
   gradient_signal_viewer_20trk_sobolev_exp_1  Same as above but with --sobolev-s 1 (milder roll-off)
   gradient_signal_viewer_20trk_sobolev_exp_0  Same as above but with --sobolev-s 0 (flat/L2 spectrum)
+  gradient_signal_viewer_20trk_denser          Same as gradient_signal_viewer_20trk but 20 linspace
+                                               factors in [0.8, 1.2] → cutoff_loss_landscape_20260526_denser/
+  gradient_signal_viewer_20trk_sobolev_exp_1_denser  Same with --sobolev-s 1, denser [0.8, 1.2] range
+  gradient_signal_viewer_20trk_sobolev_exp_0_denser  Same with --sobolev-s 0, denser [0.8, 1.2] range
+  Adam_20260601                16 tracks (11 nice boundary + 5 extra near-cathode 100 MeV);
+                               ADC cutoff=5, Fourier power cutoff=1 ADC², Sobolev exp=1, noisy GT.
+                               trans_and_long + all_params × 5 seeds = 10 jobs.
+  Adam_20260601_diff_adc20_ft100_sob2  Same 16 tracks; ADC cutoff=20, FT cutoff=100 ADC²,
+                               Sobolev exp=2, noisy GT. trans+long diffusion only × 5 seeds = 5 jobs.
+  Adam_20260601_diff_adc20_sob2        Same but no FT cutoff.
+  Adam_20260601_diff_adc20_sob2_rot5   Same; --rotate-noise-seeds 5 (noise seed cycles every 5 steps).
   Adam_diffusionCutoff_collection_only_15tracks_v2  Like Adam_differentCutoffs_trans_and_long…v2 but
                                 the ADC cutoff and collection-only planes are applied only to both
                                 diffusion params; all other params use all planes and no cutoff.
@@ -163,6 +174,32 @@ TRACKS_15_BOUNDARY = (
     "+Muon_diagCross_1000MeV:-0.577350269,-0.577350269,-0.577350269:1000"
     "+Muon_throughEw_skew02_1000MeV:0.934631179,-0.282614666,0.215855296:1000"
     "+Muon_throughWe_skew03_1000MeV:-0.938658230,0.268188066,-0.216785353:1000"
+)
+
+# TRACKS_15_BOUNDARY minus "ugly" tracks (Muon4/5/10/12_100MeV have poor gradients).
+# Ugly set matches _UGLY_TRACKS in plot_gradient_landscape_viewer.py.
+TRACKS_11_NICE = (
+    "Muon1_1000MeV:-0.747872530,0.661463000,0.056154945:1000"
+    "+Muon2_500MeV:-0.641581737,0.275323919,-0.715939672:500"
+    "+Muon3_500MeV:-0.483652826,0.868350593,-0.109759697:500"
+    "+Muon6_1000MeV:-0.624672693,-0.613017831,0.483728401:1000"
+    "+Muon7_500MeV:-0.610394124,-0.747896572,0.260901765:500"
+    "+Muon8_1000MeV:0.773174642,0.198385012,0.602365637:1000"
+    "+Muon9_500MeV:-0.931562076,-0.204366326,-0.300710000:500"
+    "+Muon11_1000MeV:-0.482051010,0.584842086,0.652369955:1000"
+    "+Muon_diagCross_1000MeV:-0.577350269,-0.577350269,-0.577350269:1000"
+    "+Muon_throughEw_skew02_1000MeV:0.934631179,-0.282614666,0.215855296:1000"
+    "+Muon_throughWe_skew03_1000MeV:-0.938658230,0.268188066,-0.216785353:1000"
+)
+
+# TRACKS_11_NICE plus the 5 extra near-cathode 100 MeV tracks (with start positions).
+TRACKS_16_NICE_EXT = (
+    TRACKS_11_NICE
+    + "+Muon13_100MeV:-0.194353283,-0.967595642,-0.161200106:100:102.344,2160.000,-1106.403"
+    + "+Muon14_100MeV:-0.108495799,0.312632631,0.943657512:100:602.601,-1767.737,-2160.000"
+    + "+Muon15_100MeV:0.290155194,0.467674594,-0.834919420:100:-738.504,-605.471,2160.000"
+    + "+Muon16_100MeV:-0.362498911,-0.215251579,-0.906786247:100:-678.254,1635.218,2160.000"
+    + "+Muon17_100MeV:0.348470036,0.919222376,-0.183299913:100:-768.051,-2160.000,-1358.605"
 )
 
 # 15-track ensemble for 1d_gradients.py landscape sweeps.
@@ -662,6 +699,9 @@ def make_opt_command(
     planes_per_param=None,
     start_position_mm=None,
     planes=None,
+    sobolev_exponent=None,
+    fourier_cutoff=None,
+    rotate_noise_seeds=None,
 ):
     """Return a run_optimization.py command string with the given settings."""
     parts = [
@@ -744,6 +784,12 @@ def make_opt_command(
         parts.append(f"--start-position-mm {start_position_mm}")
     if planes is not None:
         parts.append(f"--planes {planes}")
+    if sobolev_exponent is not None:
+        parts.append(f"--sobolev-exponent {sobolev_exponent}")
+    if fourier_cutoff is not None and fourier_cutoff > 0.0:
+        parts.append(f"--fourier-cutoff {fourier_cutoff}")
+    if rotate_noise_seeds is not None and rotate_noise_seeds > 0:
+        parts.append(f"--rotate-noise-seeds {rotate_noise_seeds}")
     return " ".join(parts)
 
 
@@ -5552,6 +5598,467 @@ def profile_gradient_signal_viewer_20trk_sobolev_exp_0(
             )
 
 
+def profile_gradient_signal_viewer_20trk_denser(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+    time="00:45:00",
+    submit_failed=False,
+    skip_complete=False,
+):
+    """Signal-array 1d-gradient run: 20 densely-sampled points in [0.8, 1.2].
+
+    Same as profile_gradient_signal_viewer_20trk but uses --factors to place 20
+    linspace points between 0.8 and 1.2 (param/GT) instead of the coarse N=5
+    ±75% sweep.
+
+    Params  : diffusion_trans_cm2_us, diffusion_long_cm2_us
+    Noise   : 1.0 (seeds 0–7)
+    20 explicit factors in [0.8, 1.2], step_size=1.0 mm, max_deposits=5000.
+    Output  : $RESULTS_DIR/1d_gradients/cutoff_loss_landscape_20260526_denser/
+    """
+    results_dir      = "$RESULTS_DIR/1d_gradients/cutoff_loss_landscape_20260526_denser"
+    params           = ["diffusion_trans_cm2_us", "diffusion_long_cm2_us"]
+    noise_conditions = [(1.0, s) for s in range(8)]
+    adc_cutoffs      = [0, 5, 10, 15, 20, 25, 30, 50]
+    fourier_cutoffs  = [1, 10, 100]
+    factors          = [0.8 + i * (0.4 / 19) for i in range(20)]
+
+    all_tracks_arg = "+".join(spec for _, spec in _GRADIENT_15_TRACKS)
+
+    if submit_failed:
+        failed_set = set(_find_failed_gradient_jobs(results_dir, params, noise_conditions))
+        if not failed_set:
+            print('[submit-failed] No corrupt pkl files found — nothing to resubmit.', file=sys.stderr)
+            return
+
+    prev_job = None
+    for param in params:
+        for noise_scale, noise_seed in noise_conditions:
+            if submit_failed and (param, noise_scale, noise_seed) not in failed_set:
+                continue
+            if skip_complete and _all_gradient_summaries_done(
+                    results_dir, param, noise_scale, noise_seed,
+                    adc_cutoffs, fourier_cutoffs, N=20, range_frac=0.2, n_tracks=20):
+                print(f'  [skip-complete] {param} noise={noise_scale} seed={noise_seed}: all done')
+                continue
+            cmd = make_gradient_command(
+                param=param,
+                tracks=all_tracks_arg,
+                N=20,
+                range_frac=0.2,
+                factors=factors,
+                noise_scale=noise_scale,
+                noise_seed=noise_seed,
+                adc_cutoffs=adc_cutoffs,
+                fourier_cutoffs=fourier_cutoffs,
+                results_dir=results_dir,
+                store_per_plane_loss=True,
+                save_per_factor=True,
+            )
+            if not print_sbatch_only:
+                print(cmd)
+            prev_job = s3df_submit(
+                cmd,
+                time=time,
+                submit=submit,
+                mem_gb=32,
+                print_sbatch_command=print_sbatch_only,
+                dependency=prev_job,
+            )
+
+
+def profile_gradient_signal_viewer_20trk_sobolev_exp_1_denser(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+    time="00:45:00",
+    submit_failed=False,
+    skip_complete=False,
+):
+    """Signal-array 1d-gradient run with s=1 and 20 densely-sampled points in [0.8, 1.2].
+
+    Same as profile_gradient_signal_viewer_20trk_sobolev_exp_1 but uses --factors
+    to place 20 linspace points between 0.8 and 1.2 (param/GT).
+
+    Params  : diffusion_trans_cm2_us, diffusion_long_cm2_us
+    Noise   : 1.0 (seeds 0–7)
+    20 explicit factors in [0.8, 1.2], step_size=1.0 mm, max_deposits=5000, s=1.
+    Output  : $RESULTS_DIR/1d_gradients/cutoff_loss_landscape_20260526_exp_1_denser/
+    """
+    results_dir      = "$RESULTS_DIR/1d_gradients/cutoff_loss_landscape_20260526_exp_1_denser"
+    params           = ["diffusion_trans_cm2_us", "diffusion_long_cm2_us"]
+    noise_conditions = [(1.0, s) for s in range(8)]
+    adc_cutoffs      = [0, 5, 10, 15, 20, 25, 30, 50]
+    fourier_cutoffs  = [1, 10, 100]
+    factors          = [0.8 + i * (0.4 / 19) for i in range(20)]
+
+    all_tracks_arg = "+".join(spec for _, spec in _GRADIENT_15_TRACKS)
+
+    if submit_failed:
+        failed_set = set(_find_failed_gradient_jobs(results_dir, params, noise_conditions))
+        if not failed_set:
+            print('[submit-failed] No corrupt pkl files found — nothing to resubmit.', file=sys.stderr)
+            return
+
+    prev_job = None
+    for param in params:
+        for noise_scale, noise_seed in noise_conditions:
+            if submit_failed and (param, noise_scale, noise_seed) not in failed_set:
+                continue
+            if skip_complete and _all_gradient_summaries_done(
+                    results_dir, param, noise_scale, noise_seed,
+                    adc_cutoffs, fourier_cutoffs, sobolev_s=1, N=20, range_frac=0.2, n_tracks=20):
+                print(f'  [skip-complete] {param} noise={noise_scale} seed={noise_seed}: all done')
+                continue
+            cmd = make_gradient_command(
+                param=param,
+                tracks=all_tracks_arg,
+                N=20,
+                range_frac=0.2,
+                factors=factors,
+                noise_scale=noise_scale,
+                noise_seed=noise_seed,
+                adc_cutoffs=adc_cutoffs,
+                fourier_cutoffs=fourier_cutoffs,
+                sobolev_s=1,
+                results_dir=results_dir,
+                store_per_plane_loss=True,
+                save_per_factor=True,
+            )
+            if not print_sbatch_only:
+                print(cmd)
+            prev_job = s3df_submit(
+                cmd,
+                time=time,
+                submit=submit,
+                mem_gb=32,
+                print_sbatch_command=print_sbatch_only,
+                dependency=prev_job,
+            )
+
+
+def profile_gradient_signal_viewer_20trk_sobolev_exp_0_denser(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    wandb_tags=None,
+    time="00:45:00",
+    submit_failed=False,
+    skip_complete=False,
+):
+    """Signal-array 1d-gradient run with s=0 and 20 densely-sampled points in [0.8, 1.2].
+
+    Same as profile_gradient_signal_viewer_20trk_sobolev_exp_0 but uses --factors
+    to place 20 linspace points between 0.8 and 1.2 (param/GT).
+
+    Params  : diffusion_trans_cm2_us, diffusion_long_cm2_us
+    Noise   : 1.0 (seeds 0–7)
+    20 explicit factors in [0.8, 1.2], step_size=1.0 mm, max_deposits=5000, s=0.
+    Output  : $RESULTS_DIR/1d_gradients/cutoff_loss_landscape_20260526_exp_0_denser/
+    """
+    results_dir      = "$RESULTS_DIR/1d_gradients/cutoff_loss_landscape_20260526_exp_0_denser"
+    params           = ["diffusion_trans_cm2_us", "diffusion_long_cm2_us"]
+    noise_conditions = [(1.0, s) for s in range(8)]
+    adc_cutoffs      = [0, 5, 10, 15, 20, 25, 30, 50]
+    fourier_cutoffs  = [1, 10, 100]
+    factors          = [0.8 + i * (0.4 / 19) for i in range(20)]
+
+    all_tracks_arg = "+".join(spec for _, spec in _GRADIENT_15_TRACKS)
+
+    if submit_failed:
+        failed_set = set(_find_failed_gradient_jobs(results_dir, params, noise_conditions))
+        if not failed_set:
+            print('[submit-failed] No corrupt pkl files found — nothing to resubmit.', file=sys.stderr)
+            return
+
+    prev_job = None
+    for param in params:
+        for noise_scale, noise_seed in noise_conditions:
+            if submit_failed and (param, noise_scale, noise_seed) not in failed_set:
+                continue
+            if skip_complete and _all_gradient_summaries_done(
+                    results_dir, param, noise_scale, noise_seed,
+                    adc_cutoffs, fourier_cutoffs, sobolev_s=0, N=20, range_frac=0.2, n_tracks=20):
+                print(f'  [skip-complete] {param} noise={noise_scale} seed={noise_seed}: all done')
+                continue
+            cmd = make_gradient_command(
+                param=param,
+                tracks=all_tracks_arg,
+                N=20,
+                range_frac=0.2,
+                factors=factors,
+                noise_scale=noise_scale,
+                noise_seed=noise_seed,
+                adc_cutoffs=adc_cutoffs,
+                fourier_cutoffs=fourier_cutoffs,
+                sobolev_s=0,
+                results_dir=results_dir,
+                store_per_plane_loss=True,
+                save_per_factor=True,
+            )
+            if not print_sbatch_only:
+                print(cmd)
+            prev_job = s3df_submit(
+                cmd,
+                time=time,
+                submit=submit,
+                mem_gb=32,
+                print_sbatch_command=print_sbatch_only,
+                dependency=prev_job,
+            )
+
+
+def profile_Adam_20260601(*, submit=True, print_sbatch_only=False, wandb_tags=None):
+    """16 tracks: 11 "Nice" boundary tracks + 5 extra near-cathode 100 MeV, all wireplanes.
+
+    ADC cutoff=5, Fourier power cutoff=1 ADC², Sobolev exponent=1, noisy GT (noise_scale=1).
+    Two param sets × 5 seeds = 10 jobs.
+
+    trans_and_long  diffusion_trans_cm2_us + diffusion_long_cm2_us
+    all_params      all 7 EMB params (ALL_PARAMS)
+    """
+    shared = dict(
+        tracks=TRACKS_16_NICE_EXT,
+        optimizer="adam",
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.001,
+        lr_schedule="cosine",
+        max_steps=3000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        grad_clip=0.0,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=1.0,
+        max_num_deposits=5000,
+        batch_size=1,
+        effective_batch_size=1,
+        gt_step_size=1.0,
+        gt_max_deposits=5000,
+        adam_beta2=0.9,
+        log_interval=50,
+        noise_scale=1.0,
+        sobolev_loss_cutoff=5.0,
+        fourier_cutoff=1.0,
+        sobolev_exponent=1.0,
+    )
+
+    param_sets = [
+        ("trans_and_long", "diffusion_trans_cm2_us,diffusion_long_cm2_us"),
+        ("all_params",     ALL_PARAMS),
+    ]
+
+    for param_label, params in param_sets:
+        results_base = f"$RESULTS_DIR/opt/Adam_20260601_{param_label}"
+        for seed in [44, 45, 46, 47, 48]:
+            command = make_opt_command(
+                params=params,
+                seed=seed,
+                results_base=f"{results_base}/noise",
+                wandb_tags=(wandb_tags or []) + ["Adam_20260601", param_label, "noise",
+                                                  "16trks_nice", "adc5", "ft1", "sob_exp1"],
+                **shared,
+            )
+            if not print_sbatch_only:
+                print(command)
+            s3df_submit(
+                command,
+                time="01:30:00",
+                submit=submit,
+                mem_gb=64,
+                print_sbatch_command=print_sbatch_only,
+            )
+
+
+def profile_Adam_20260601_diff_adc20_ft100_sob2(*, submit=True, print_sbatch_only=False, wandb_tags=None):
+    """16 tracks: 11 "Nice" boundary tracks + 5 extra near-cathode 100 MeV, all wireplanes.
+
+    ADC cutoff=20, Fourier power cutoff=100 ADC², Sobolev exponent=2, noisy GT (noise_scale=1).
+    Only diffusion params (trans + long) × 5 seeds = 5 jobs.
+    """
+    shared = dict(
+        tracks=TRACKS_16_NICE_EXT,
+        optimizer="adam",
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.001,
+        lr_schedule="cosine",
+        max_steps=3000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        grad_clip=0.0,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=1.0,
+        max_num_deposits=5000,
+        batch_size=1,
+        effective_batch_size=1,
+        gt_step_size=1.0,
+        gt_max_deposits=5000,
+        adam_beta2=0.9,
+        log_interval=50,
+        noise_scale=1.0,
+        sobolev_loss_cutoff=20.0,
+        fourier_cutoff=100.0,
+        sobolev_exponent=2.0,
+    )
+
+    params = "diffusion_trans_cm2_us,diffusion_long_cm2_us"
+    param_label = "trans_and_long"
+    results_base = f"$RESULTS_DIR/opt/Adam_20260601_diff_adc20_ft100_sob2_{param_label}"
+
+    for seed in [44, 45, 46, 47, 48]:
+        command = make_opt_command(
+            params=params,
+            seed=seed,
+            results_base=f"{results_base}/noise",
+            wandb_tags=(wandb_tags or []) + [
+                "Adam_20260601_diff_adc20_ft100_sob2", param_label, "noise",
+                "16trks_nice", "adc20", "ft100", "sob_exp2",
+            ],
+            **shared,
+        )
+        if not print_sbatch_only:
+            print(command)
+        s3df_submit(
+            command,
+            time="01:30:00",
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+        )
+
+
+def profile_Adam_20260601_diff_adc20_sob2(*, submit=True, print_sbatch_only=False, wandb_tags=None):
+    """16 tracks: 11 "Nice" boundary tracks + 5 extra near-cathode 100 MeV, all wireplanes.
+
+    ADC cutoff=20, no Fourier cutoff, Sobolev exponent=2, noisy GT (noise_scale=1).
+    Only diffusion params (trans + long) × 5 seeds = 5 jobs.
+    """
+    shared = dict(
+        tracks=TRACKS_16_NICE_EXT,
+        optimizer="adam",
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.001,
+        lr_schedule="cosine",
+        max_steps=3000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        grad_clip=0.0,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=1.0,
+        max_num_deposits=5000,
+        batch_size=1,
+        effective_batch_size=1,
+        gt_step_size=1.0,
+        gt_max_deposits=5000,
+        adam_beta2=0.9,
+        log_interval=50,
+        noise_scale=1.0,
+        sobolev_loss_cutoff=20.0,
+        sobolev_exponent=2.0,
+    )
+
+    params = "diffusion_trans_cm2_us,diffusion_long_cm2_us"
+    param_label = "trans_and_long"
+    results_base = f"$RESULTS_DIR/opt/Adam_20260601_diff_adc20_sob2_{param_label}"
+
+    for seed in [44, 45, 46, 47, 48]:
+        command = make_opt_command(
+            params=params,
+            seed=seed,
+            results_base=f"{results_base}/noise",
+            wandb_tags=(wandb_tags or []) + [
+                "Adam_20260601_diff_adc20_sob2", param_label, "noise",
+                "16trks_nice", "adc20", "sob_exp2",
+            ],
+            **shared,
+        )
+        if not print_sbatch_only:
+            print(command)
+        s3df_submit(
+            command,
+            time="01:30:00",
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+        )
+
+
+def profile_Adam_20260601_diff_adc20_sob2_rot5(*, submit=True, print_sbatch_only=False, wandb_tags=None):
+    """Like Adam_20260601_diff_adc20_sob2 but with --rotate-noise-seeds 5.
+
+    16 tracks, ADC cutoff=20, no FT cutoff, Sobolev exp=2, noisy GT (noise_scale=1).
+    Noise seed cycles through 5 realisations (seed index = step % 5).
+    trans+long diffusion only × 5 seeds = 5 jobs.
+    """
+    shared = dict(
+        tracks=TRACKS_16_NICE_EXT,
+        optimizer="adam",
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.001,
+        lr_schedule="cosine",
+        max_steps=3000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        grad_clip=0.0,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=1.0,
+        max_num_deposits=5000,
+        batch_size=1,
+        effective_batch_size=1,
+        gt_step_size=1.0,
+        gt_max_deposits=5000,
+        adam_beta2=0.9,
+        log_interval=50,
+        noise_scale=1.0,
+        sobolev_loss_cutoff=20.0,
+        sobolev_exponent=2.0,
+        rotate_noise_seeds=5,
+    )
+
+    params = "diffusion_trans_cm2_us,diffusion_long_cm2_us"
+    param_label = "trans_and_long"
+    results_base = f"$RESULTS_DIR/opt/Adam_20260601_diff_adc20_sob2_rot5_{param_label}"
+
+    for seed in [44, 45, 46, 47, 48]:
+        command = make_opt_command(
+            params=params,
+            seed=seed,
+            results_base=f"{results_base}/noise",
+            wandb_tags=(wandb_tags or []) + [
+                "Adam_20260601_diff_adc20_sob2_rot5", param_label, "noise",
+                "16trks_nice", "adc20", "sob_exp2", "rot5",
+            ],
+            **shared,
+        )
+        if not print_sbatch_only:
+            print(command)
+        s3df_submit(
+            command,
+            time="01:30:00",
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+        )
+
+
 PROFILES = {
     "3_part_schedule": profile_3_part_schedule,
     "2_part_schedule": profile_2_part_schedule,
@@ -5628,6 +6135,9 @@ PROFILES = {
     "gradient_signal_viewer_20trk": profile_gradient_signal_viewer_20trk,
     "gradient_signal_viewer_20trk_sobolev_exp_1": profile_gradient_signal_viewer_20trk_sobolev_exp_1,
     "gradient_signal_viewer_20trk_sobolev_exp_0": profile_gradient_signal_viewer_20trk_sobolev_exp_0,
+    "gradient_signal_viewer_20trk_denser": profile_gradient_signal_viewer_20trk_denser,
+    "gradient_signal_viewer_20trk_sobolev_exp_1_denser": profile_gradient_signal_viewer_20trk_sobolev_exp_1_denser,
+    "gradient_signal_viewer_20trk_sobolev_exp_0_denser": profile_gradient_signal_viewer_20trk_sobolev_exp_0_denser,
         "gradient_signal_viewer_20trk_small": profile_gradient_signal_viewer_20trk_small,
 
     "Adam_NoiseSeedSweep_3k_GT2_NoDiffLifetime": profile_15Trk_Adam_NoiseSeedSweep_3k_GT2_NoDiffLifetime,
@@ -5639,6 +6149,10 @@ PROFILES = {
     "1d_Grad_diffusion_debug": profile_1d_Grad_diffusion_debug,
     "Adam_differentCutoffs_trans_and_long_collection_only_15tracks_v2": profile_Adam_differentCutoffs_trans_and_long_collection_only_15tracks_v2,
     "Adam_diffusionCutoff_collection_only_15tracks_v2": profile_Adam_diffusionCutoff_collection_only_15tracks_v2,
+    "Adam_20260601": profile_Adam_20260601,
+    "Adam_20260601_diff_adc20_ft100_sob2": profile_Adam_20260601_diff_adc20_ft100_sob2,
+    "Adam_20260601_diff_adc20_sob2": profile_Adam_20260601_diff_adc20_sob2,
+    "Adam_20260601_diff_adc20_sob2_rot5": profile_Adam_20260601_diff_adc20_sob2_rot5,
 }
 
 

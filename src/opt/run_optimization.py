@@ -89,6 +89,7 @@ from tools.geometry import generate_detector
 from tools.loader import build_deposit_data
 from tools.losses import (
     make_sobolev_weight,
+    apply_fourier_power_mask,
     sobolev_loss,
     sobolev_loss_geomean_log1p,
     mse_loss,
@@ -220,6 +221,12 @@ def parse_args():
                         '(MicroBooNE model, converted to signal units via electrons_per_adc). '
                         '0.0 = no noise (default), 1.0 = realistic noise. '
                         'Signal and noise RMS are printed at startup for reference.')
+    p.add_argument('--rotate-noise-seeds', type=int, default=-1,
+                   metavar='N',
+                   help='Cycle through N distinct noise realisations across optimizer steps. '
+                        'At step s the noise seed index is s %% N, so each seed recurs every '
+                        'N steps. -1 (default) disables rotation (same seed every step). '
+                        'Has no effect when --noise-scale 0.')
     p.add_argument('--warmup-steps', type=int, default=100,
                    help='Linear LR warmup from 0 to --lr over this many steps '
                         '(default: 100, set to 0 to disable).')
@@ -307,6 +314,14 @@ def parse_args():
     p.add_argument('--freq-cutoff-per-param', default=None,
                    help='Per-parameter freq cutoff: "param1:cutoff1,param2:cutoff2". '
                         'Params not listed use --freq-cutoff (default None = no cutoff). '
+                        'Not compatible with --optimizer newton.')
+    p.add_argument('--fourier-cutoff', type=float, default=0.0,
+                   help='Signal-power Fourier cutoff (ADC²): zero spectral bins where '
+                        '|FFT(gt)|^2/N < cutoff. Same convention as 1d_gradients.py. '
+                        '0 disables (default).')
+    p.add_argument('--fourier-cutoff-per-param', default=None,
+                   help='Per-parameter Fourier power cutoff: "param1:cutoff1,param2:cutoff2". '
+                        'Params not listed use --fourier-cutoff (default 0 = no cutoff). '
                         'Not compatible with --optimizer newton.')
     p.add_argument('--sobolev-loss-cutoff', type=float, default=0.0,
                    help='ADC cutoff: zero out pixels where |gt| < cutoff before computing loss '
@@ -1112,7 +1127,8 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
               initial_frozen_mask=None,
               effective_batch_size=1,
               newton_damping=None,
-              clip_grad_norm=0.0):
+              clip_grad_norm=0.0,
+              rotating_phase_schedules=None):
     """Run one optimization trial from starting p_n vector p0 (any length).
 
     phase_schedule: list of (until_step, build_fn) sorted by until_step.
@@ -1182,17 +1198,20 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
     t_start    = time.time()
     multi_phase = len(phase_schedule) > 1
 
-    # Local cache of built fns per phase index; build_fn itself is the persistent cache.
-    _cur_ph_idx  = [-1]
-    _cur_fns     = [None]
+    # Local cache of built fns per (phase, rotation) key; build_fn is the persistent cache.
+    _cur_key  = [(-1, -1)]  # (ph_idx, rot_idx)
+    _cur_fns  = [None]
+    _n_rotations = len(rotating_phase_schedules) if rotating_phase_schedules is not None else 1
 
-    def _get_fns(ph_idx, p):
-        if ph_idx != _cur_ph_idx[0]:
-            # Release the previous phase's fns before building the new one so
+    def _get_fns(ph_idx, rot_idx, p):
+        key = (ph_idx, rot_idx)
+        if key != _cur_key[0]:
+            # Release the previous fns before building the new ones so
             # that the builder can free its store entry without a dangling ref here.
-            _cur_fns[0]    = None
-            _cur_ph_idx[0] = ph_idx
-            _, build_fn = phase_schedule[ph_idx]
+            _cur_fns[0] = None
+            _cur_key[0] = key
+            sched = rotating_phase_schedules[rot_idx] if rotating_phase_schedules is not None else phase_schedule
+            _, build_fn = sched[ph_idx]
             _cur_fns[0] = build_fn(p)
         return _cur_fns[0]
 
@@ -1205,7 +1224,8 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
 
     def _phase_at(step, p):
         ph_idx = _phase_index_at(step)
-        return ph_idx, _get_fns(ph_idx, p)
+        rot_idx = step % _n_rotations
+        return ph_idx, _get_fns(ph_idx, rot_idx, p)
 
     # Representative loss/grad at loop entry: phase 0 on a fresh trial; on resume,
     # only the active phase is compiled (avoids loading phase 0 before a phase-1 resume).
@@ -1217,7 +1237,7 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
         ph_init_groups = wandb_track_batch_groups[ph_idx_init]
     else:
         ph_init_groups = None
-    for batch_idx, fn in enumerate(_get_fns(ph_idx_init, p)):
+    for batch_idx, fn in enumerate(_get_fns(ph_idx_init, start_step % _n_rotations, p)):
         lv, gv, pt = _unpack_batch_fn_ret(fn(p))
         jax.block_until_ready((lv, gv))
         lv_init += float(lv)
@@ -1549,8 +1569,13 @@ def main():
     # Per-parameter ADC cutoffs + planes: build a list of (cutoff, planes_tuple, [param_indices])
     # groups. Params sharing the same (cutoff, planes) share one compiled phase-fn set.
     _param_groups = None  # None → use single global cutoff + planes (standard path)
-    # _param_groups entries are 4-tuples: (adc_cutoff, planes, freq_cutoff, indices)
-    if args.sobolev_loss_cutoff_per_param or args.planes_per_param or args.freq_cutoff_per_param:
+    # _param_groups entries are 5-tuples:
+    #   (adc_cutoff, planes, freq_cutoff, fourier_cutoff, indices)
+    _need_per_param = (
+        args.sobolev_loss_cutoff_per_param or args.planes_per_param
+        or args.freq_cutoff_per_param or args.fourier_cutoff_per_param
+    )
+    if _need_per_param:
         if is_newton:
             print('error: per-parameter cutoff/planes are not compatible with --optimizer newton.',
                   file=sys.stderr)
@@ -1559,6 +1584,8 @@ def main():
             args.sobolev_loss_cutoff_per_param or '', param_names, args.sobolev_loss_cutoff)
         _freq_cutoff_per_param_list = parse_cutoff_per_param(
             args.freq_cutoff_per_param or '', param_names, args.freq_cutoff)
+        _fourier_cutoff_per_param_list = parse_cutoff_per_param(
+            args.fourier_cutoff_per_param or '', param_names, args.fourier_cutoff)
         # planes_per_param parsed after active_planes is resolved (need n_planes from simulator).
         # Store the raw spec for later; resolution happens below after active_planes is set.
         _planes_per_param_spec = args.planes_per_param
@@ -1571,22 +1598,22 @@ def main():
     active_planes = parse_planes(args.planes) if args.planes else None
 
     # Resolve per-param groups now that active_planes is known.
-    if _param_groups is None and (
-            args.sobolev_loss_cutoff_per_param or args.planes_per_param or args.freq_cutoff_per_param):
+    if _param_groups is None and _need_per_param:
         _planes_per_param = parse_planes_per_param(
             _planes_per_param_spec or '', param_names, default_planes=active_planes)
-        # Group params by (adc_cutoff, planes_tuple, freq_cutoff)
+        # Group params by (adc_cutoff, planes_tuple, freq_cutoff, fourier_cutoff)
         group_key_to_indices: dict = {}
-        for i, (c, pl, fc) in enumerate(
-                zip(_cutoff_per_param, _planes_per_param, _freq_cutoff_per_param_list)):
-            key = (c, pl, fc)
+        for i, (c, pl, fc_mag, fc_pwr) in enumerate(zip(
+                _cutoff_per_param, _planes_per_param,
+                _freq_cutoff_per_param_list, _fourier_cutoff_per_param_list)):
+            key = (c, pl, fc_mag, fc_pwr)
             group_key_to_indices.setdefault(key, []).append(i)
-        # Sort groups for determinism: by cutoff first, then by planes string repr, then fc
+        # Sort groups for determinism
         _param_groups = [
-            (c, pl, fc, indices)
-            for (c, pl, fc), indices in sorted(
+            (c, pl, fc_mag, fc_pwr, indices)
+            for (c, pl, fc_mag, fc_pwr), indices in sorted(
                 group_key_to_indices.items(),
-                key=lambda kv: (kv[0][0], str(kv[0][1]), str(kv[0][2]))
+                key=lambda kv: (kv[0][0], str(kv[0][1]), str(kv[0][2]), str(kv[0][3]))
             )
         ]
 
@@ -1678,17 +1705,20 @@ def main():
     print(f'Seed         : {effective_seed}')
     print(f'Noise scale  : {args.noise_scale}')
     if _param_groups is not None and len(_param_groups) > 1:
-        for c, pl, fc, idxs in _param_groups:
+        for c, pl, fc_mag, fc_pwr, idxs in _param_groups:
             names_str = ', '.join(param_names[i] for i in idxs)
             pl_str = str(pl) if pl is not None else 'all'
-            fc_str = f'  freq_cutoff={fc}' if fc is not None else ''
-            print(f'ADC cutoff   : {c}  planes={pl_str}{fc_str}  → {names_str}')
+            fc_str = f'  freq_cutoff={fc_mag}' if fc_mag is not None else ''
+            fp_str = f'  fourier_cutoff={fc_pwr}' if fc_pwr and fc_pwr > 0.0 else ''
+            print(f'ADC cutoff   : {c}  planes={pl_str}{fc_str}{fp_str}  → {names_str}')
     elif args.sobolev_loss_cutoff > 0.0:
         print(f'ADC cutoff   : {args.sobolev_loss_cutoff}')
     if args.sobolev_exponent != 2.0:
         print(f'Sobolev s    : {args.sobolev_exponent}')
     if args.freq_cutoff is not None and _param_groups is None:
         print(f'Freq cutoff  : {args.freq_cutoff}')
+    if args.fourier_cutoff > 0.0 and _param_groups is None:
+        print(f'Fourier cut  : {args.fourier_cutoff} ADC²')
     if active_planes is not None and _param_groups is None:
         print(f'Active planes: {active_planes} (of 6 total)')
     print(f'Num buckets  : {args.num_buckets:,}')
@@ -1817,16 +1847,17 @@ def main():
           f'(step_size={args.gt_step_size}mm  max_deposits={args.gt_max_deposits:,})...')
     t0 = time.time()
     gt_signals_per_track = []
+    gt_signals_clean_per_track = []  # clean (no noise) GT arrays, used for rotation
     gt_weights_per_track = []   # weights for the global/simple path
     sig_rms_acc = []
     noi_rms_acc = []
-    # For per-param freq_cutoff: dict {fc_value -> list[tuple[np.array,...]]}
-    _unique_fcs_per_param = (
-        list({fc for _, _, fc, _ in _param_groups})
+    # For per-param weight keys: dict {(fc_mag, fc_pwr) -> list[tuple[np.array,...]]}
+    _unique_wt_keys = (
+        list({(fc_mag, fc_pwr) for _, _, fc_mag, fc_pwr, _ in _param_groups})
         if _param_groups is not None and len(_param_groups) > 1
         else []
     )
-    gt_weights_per_track_per_fc: dict = {fc: [] for fc in _unique_fcs_per_param}
+    gt_weights_per_track_per_key: dict = {k: [] for k in _unique_wt_keys}
 
     noise_base_key = jax.random.PRNGKey(noise_seed)
     for track_idx, ts in enumerate(track_specs):
@@ -1848,6 +1879,7 @@ def main():
 
         gt = tuple(gt_sim.forward(gt_params, deposits_gt))
         jax.block_until_ready(gt)
+        gt_signals_clean_per_track.append(tuple(np.array(a) for a in gt))
 
         if args.noise_scale > 0.0:
             track_noise_key = jax.random.fold_in(noise_base_key, track_idx)
@@ -1862,14 +1894,20 @@ def main():
         wts = tuple(make_sobolev_weight(a.shape[0], a.shape[1], max_pad=SOBOLEV_MAX_PAD,
                                         s=args.sobolev_exponent, freq_cutoff=args.freq_cutoff)
                     for a in gt)
+        if args.fourier_cutoff > 0.0:
+            wts = tuple(apply_fourier_power_mask(w, a, SOBOLEV_MAX_PAD, args.fourier_cutoff)
+                        for w, a in zip(wts, gt))
         # Move to CPU after computation to free GPU memory; JAX JIT transfers back per call.
         gt_signals_per_track.append(tuple(np.array(a) for a in gt))
         gt_weights_per_track.append(tuple(np.array(a) for a in wts))
-        for fc in _unique_fcs_per_param:
-            wts_fc = tuple(make_sobolev_weight(a.shape[0], a.shape[1], max_pad=SOBOLEV_MAX_PAD,
-                                               s=args.sobolev_exponent, freq_cutoff=fc)
-                           for a in gt)
-            gt_weights_per_track_per_fc[fc].append(tuple(np.array(a) for a in wts_fc))
+        for (fc_mag, fc_pwr) in _unique_wt_keys:
+            wts_k = tuple(make_sobolev_weight(a.shape[0], a.shape[1], max_pad=SOBOLEV_MAX_PAD,
+                                              s=args.sobolev_exponent, freq_cutoff=fc_mag)
+                          for a in gt)
+            if fc_pwr and fc_pwr > 0.0:
+                wts_k = tuple(apply_fourier_power_mask(w, a, SOBOLEV_MAX_PAD, fc_pwr)
+                              for w, a in zip(wts_k, gt))
+            gt_weights_per_track_per_key[(fc_mag, fc_pwr)].append(tuple(np.array(a) for a in wts_k))
 
     signal_rms = float(np.mean(sig_rms_acc))
     if args.noise_scale > 0.0:
@@ -1880,6 +1918,24 @@ def main():
     else:
         print(f'Done ({time.time() - t0:.1f} s) — Signal RMS: {signal_rms:.4g}')
 
+    # ── Pre-generate rotating noisy GT arrays ────────────────────────────────
+    # _rotate_n > 0: at step s use noise seed index s % _rotate_n.
+    # Rotation 0 = the existing gt_signals_per_track (noise_base_key).
+    # Rotations 1..N-1 use jax.random.fold_in(noise_base_key, r) as their base key.
+    _rotate_n = args.rotate_noise_seeds if args.noise_scale > 0.0 and args.rotate_noise_seeds > 0 else -1
+    gt_signals_rotating: list = []  # [rot_idx][track_idx] -> tuple of numpy arrays
+    if _rotate_n > 0:
+        gt_signals_rotating.append(gt_signals_per_track)  # rotation 0 = existing
+        for r in range(1, _rotate_n):
+            noise_key_r = jax.random.fold_in(noise_base_key, r)
+            gt_r = []
+            for ti, gt_clean in enumerate(gt_signals_clean_per_track):
+                track_key_r = jax.random.fold_in(noise_key_r, ti)
+                gt_noisy_r = apply_noise_to_gt(gt_clean, gt_sim, args.noise_scale, track_key_r)
+                gt_r.append(tuple(np.array(a) for a in gt_noisy_r))
+            gt_signals_rotating.append(gt_r)
+        print(f'Rotating noise seeds: {_rotate_n} realisations pre-generated')
+
     # ── Per-phase forward: build deposits upfront, compile lazily ─────────────
     # Deposit generation is cheap; compilation is deferred to first entry of each
     # phase so that only the active phase's arrays and XLA buffers are live at once.
@@ -1887,6 +1943,11 @@ def main():
     # before the next one is compiled, keeping peak memory to one phase at a time.
     _phase_fns_store: dict = {}
     phase_schedule = []   # [(until_step, build_fn), ...]
+    # Per-rotation phase schedules: _rotating_phase_schedules[r] is a phase_schedule
+    # that uses GT arrays from rotation r.  Each rotation has its own _fns_store so
+    # compiled-fn cache entries don't collide.  Only populated when _rotate_n > 0.
+    _rotating_phase_schedules: list = [[] for _ in range(max(_rotate_n, 1))]
+    _rotating_fns_stores: list = [{} for _ in range(max(_rotate_n, 1))]
     wandb_track_batch_groups = []   # [phase][batch] -> [(global_track_idx, name), ...]
 
     log_track_losses_wandb = (
@@ -1903,7 +1964,6 @@ def main():
 
         _batches = []
         _deps, _gts, _wts = [], [], []
-        _wts_per_fc: dict = {fc: [] for fc in _unique_fcs_per_param}
 
         for ti, ts in enumerate(track_specs):
             track_ph = generate_muon_track(
@@ -1924,30 +1984,26 @@ def main():
             _deps.append(deposits_ph)
             _gts.append(gt_signals_per_track[ti])
             _wts.append(gt_weights_per_track[ti])
-            for fc in _unique_fcs_per_param:
-                _wts_per_fc[fc].append(gt_weights_per_track_per_fc[fc][ti])
 
             if len(_deps) == phase['batch_size']:
                 _batches.append((list(_deps), list(_gts), list(_wts)))
-                for fc in _unique_fcs_per_param:
-                    _wts_per_fc[fc] = []   # reset accumulator; batches stored below
                 _deps.clear(); _gts.clear(); _wts.clear()
 
         if _deps:
             _batches.append((list(_deps), list(_gts), list(_wts)))
 
-        # Build per-fc batches by substituting the appropriate weights into _batches.
-        _batches_per_fc: dict = {}
-        for fc in _unique_fcs_per_param:
-            wts_flat = gt_weights_per_track_per_fc[fc]
+        # Build per-key batches by substituting per-key weights into _batches.
+        _batches_per_key: dict = {}
+        for wt_key in _unique_wt_keys:
+            wts_flat = gt_weights_per_track_per_key[wt_key]
             ti_cur = 0
-            fc_batches = []
+            key_batches = []
             for batch_deps, batch_gts, _ in _batches:
                 bs = len(batch_deps)
-                fc_batches.append((batch_deps, batch_gts,
-                                   [wts_flat[ti_cur + j] for j in range(bs)]))
+                key_batches.append((batch_deps, batch_gts,
+                                    [wts_flat[ti_cur + j] for j in range(bs)]))
                 ti_cur += bs
-            _batches_per_fc[fc] = fc_batches
+            _batches_per_key[wt_key] = key_batches
 
         ti_cursor = 0
         phase_track_groups = []
@@ -1960,14 +2016,19 @@ def main():
 
         print(f'Done ({time.time() - t0:.1f} s) — {len(_batches)} batches, compiling on first use')
 
-        def _make_build_fn(ph_idx, phase, sim_ph, batches):
+        def _make_build_fn(ph_idx, phase, sim_ph, batches, batches_per_key,
+                           _store=None, _do_gc=True):
+            _fns_store = _store if _store is not None else _phase_fns_store
             def _build(p):
-                if ph_idx not in _phase_fns_store:
+                if ph_idx not in _fns_store:
                     # Free previous phase's compiled fns and GPU buffers before
                     # allocating this phase's (potentially larger) data.
+                    # Skip for rotating schedules (_do_gc=False) — each rotation keeps
+                    # its own store; freeing one store must not clear the XLA cache
+                    # shared by the other rotations.
                     prev = ph_idx - 1
-                    if prev in _phase_fns_store:
-                        del _phase_fns_store[prev]
+                    if _do_gc and prev in _fns_store:
+                        del _fns_store[prev]
                         gc.collect()          # flush Python GC so JAX array __del__ runs
                         jax.clear_caches()    # release XLA compiled executables + device memory
                     cp = f'Phase {ph_idx}' if len(schedule) > 1 else 'Compiling loss fn'
@@ -1978,13 +2039,14 @@ def main():
                     t0 = time.time()
 
                     if _param_groups is not None and len(_param_groups) > 1:
-                        # Per-parameter cutoff/planes: build one fn set per group, then wrap.
+                        # Per-parameter cutoff/planes/freq/fourier: build one fn set per group.
                         # Per-track loss and Hessian are not supported with per-param groups.
                         n_params_local = len(param_names)
                         all_group_fns = []
-                        for cutoff_g, planes_g, indices_g in _param_groups:
+                        for cutoff_g, planes_g, fc_mag_g, fc_pwr_g, indices_g in _param_groups:
+                            batches_g = batches_per_key.get((fc_mag_g, fc_pwr_g), batches)
                             fns_g = build_phase_fns(
-                                args.loss, sim_ph, setter, batches,
+                                args.loss, sim_ph, setter, batches_g,
                                 return_per_track_loss=False,
                                 return_hessian=False,
                                 adc_cutoff=cutoff_g,
@@ -1997,7 +2059,7 @@ def main():
                         # Build boolean masks for gradient assembly: mask[k][i] is True
                         # when param i belongs to group k.
                         group_masks = []
-                        for _, _, indices_g in _param_groups:
+                        for _, _, _, _, indices_g in _param_groups:
                             m = np.zeros(n_params_local, dtype=bool)
                             m[list(indices_g)] = True
                             group_masks.append(jnp.array(m))
@@ -2036,12 +2098,38 @@ def main():
 
                     print(f'  done ({time.time() - t0:.1f} s) — {len(fns)} batches',
                           flush=True)
-                    _phase_fns_store[ph_idx] = fns
-                return _phase_fns_store[ph_idx]
+                    _fns_store[ph_idx] = fns
+                return _fns_store[ph_idx]
             return _build
 
         phase_schedule.append((phase['until_step'],
-                               _make_build_fn(ph_idx, phase, sim_ph, _batches)))
+                               _make_build_fn(ph_idx, phase, sim_ph, _batches, _batches_per_key)))
+
+        # Build per-rotation batches and phase schedules.
+        if _rotate_n > 0:
+            n_tracks_total = len(track_specs)
+            for r in range(_rotate_n):
+                ti_cur = 0
+                batches_r = []
+                for batch_deps, _, batch_wts in _batches:
+                    bs = len(batch_deps)
+                    gts_r = [gt_signals_rotating[r][ti_cur + j] for j in range(bs)]
+                    batches_r.append((batch_deps, gts_r, batch_wts))
+                    ti_cur += bs
+                batches_per_key_r: dict = {}
+                for wt_key, key_batches in _batches_per_key.items():
+                    ti_cur = 0
+                    kbatches_r = []
+                    for batch_deps, _, batch_wts in key_batches:
+                        bs = len(batch_deps)
+                        gts_r = [gt_signals_rotating[r][ti_cur + j] for j in range(bs)]
+                        kbatches_r.append((batch_deps, gts_r, batch_wts))
+                        ti_cur += bs
+                    batches_per_key_r[wt_key] = kbatches_r
+                _rotating_phase_schedules[r].append(
+                    (phase['until_step'],
+                     _make_build_fn(ph_idx, phase, sim_ph, batches_r, batches_per_key_r,
+                                    _store=_rotating_fns_stores[r], _do_gc=False)))
 
     # ── Random starting points ────────────────────────────────────────────────
     rng = start_rng
@@ -2260,6 +2348,7 @@ def main():
             initial_frozen_mask=init_frozen_mask,
             newton_damping=(args.newton_damping if is_newton else None),
             clip_grad_norm=args.clip_grad_norm,
+            rotating_phase_schedules=(_rotating_phase_schedules if _rotate_n > 0 else None),
         )
         all_trials.append(trial)
         result.pop('live_checkpoint', None)

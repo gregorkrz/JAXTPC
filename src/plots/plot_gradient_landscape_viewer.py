@@ -102,7 +102,7 @@ def load_and_group(results_dir: str) -> dict:
         adc_cutoff     = float(r.get('adc_cutoff', 0.0))
         fourier_cutoff = float(r.get('fourier_cutoff', 0.0))
         key            = (param_name, noise_scale, noise_seed, adc_cutoff, fourier_cutoff)
-        raw_groups[key].append(r)
+        raw_groups[key].append((fname, r))
 
         track_specs = r.get('track_specs', [])
         per_pl      = r.get('per_plane_loss_values', None)
@@ -113,8 +113,20 @@ def load_and_group(results_dir: str) -> dict:
     print(f'Loaded {len(paths)} file(s) → {len(raw_groups)} group(s)')
 
     groups: dict = {}
-    for key, raws in raw_groups.items():
+    for key, fname_raws in raw_groups.items():
         param_name, noise_scale, noise_seed, adc_cutoff, fourier_cutoff = key
+
+        # If the group contains per-factor pkls (filename contains '_fac'), drop any
+        # summary pkls (no '_fac') — they duplicate factor entries and misalign
+        # per_plane_loss indices when both exist in the same directory.
+        has_per_factor = any('_fac' in fn for fn, _ in fname_raws)
+        if has_per_factor:
+            dropped = [fn for fn, _ in fname_raws if '_fac' not in fn]
+            if dropped:
+                for fn in dropped:
+                    print(f'  (skip summary pkl, per-factor pkls present) {fn}')
+            fname_raws = [(fn, r) for fn, r in fname_raws if '_fac' in fn]
+        raws = [r for _, r in fname_raws]
 
         # Sort per-factor pkls by their first (and usually only) factor value.
         raws.sort(key=lambda r: r.get('factors', [0.0])[0])
