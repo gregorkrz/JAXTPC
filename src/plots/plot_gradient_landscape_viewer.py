@@ -462,19 +462,10 @@ button{padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:1
     <div style="display:flex;gap:12px;padding:10px 12px">
       <div style="width:210px;flex-shrink:0">
         <div class="mf-section-hdr">Custom selection</div>
-        <div style="font-size:11px;color:#888;margin-bottom:3px">Wire planes</div>
-        <select id="mf-custom-plane-sel" style="width:100%;margin-bottom:8px" onchange="renderMfCustom();renderMfCustomFourier()">
-          <option value="all">All</option>
-          <option value="U">U (U1+U2)</option>
-          <option value="V">V (V1+V2)</option>
-          <option value="Y">Y (Y1+Y2)</option>
-        </select>
         <div style="font-size:11px;color:#888;margin-bottom:3px">Tracks</div>
         <div class="quick-row">
           <button class="btn-sm quick-btn" onclick="mfSelAll()">All</button>
           <button class="btn-sm quick-btn none" onclick="mfSelNone()">None</button>
-          <button class="btn-sm quick-btn" onclick="mfSelGroup('FirstQuarter')">1st¼</button>
-          <button class="btn-sm quick-btn" onclick="mfSelGroup('LastQuarter')">Last¼</button>
           <button class="btn-sm quick-btn" onclick="mfSelGroup('original')">Orig</button>
           <button class="btn-sm quick-btn" onclick="mfSelGroup('nice')">Nice</button>
         </div>
@@ -489,7 +480,7 @@ button{padding:6px 14px;border:none;border-radius:4px;cursor:pointer;font-size:1
   </div>
 
   <div id="seeds-view" style="display:none">
-    <div class="col-header" style="flex-shrink:0">Seed ensemble <span style="font-weight:400;color:#aaa;text-transform:none;font-size:11px">— all seeds, individual points + mean ± 1σ band</span></div>
+    <div class="col-header" style="flex-shrink:0">Seed ensemble <span style="font-weight:400;color:#aaa;text-transform:none;font-size:11px">— all seeds, individual points + mean ± 1σ band</span><span id="seeds-min-label" style="font-weight:400;color:#333;text-transform:none;font-size:12px;margin-left:14px"></span></div>
     <div id="seeds-plot" style="flex:1;min-height:0"></div>
     <div id="seeds-stats" style="flex-shrink:0;padding:6px 12px;font-size:12px;font-family:monospace;color:#333;border-top:1px solid #e0e0e0;background:#fafafa;white-space:pre-wrap"></div>
   </div>
@@ -1069,7 +1060,6 @@ function saveState() {
     })),
     mfn:mfNoise, mfsd:mfSeed, mfas:mfAllSeeds, mfpg:mfPlaneGroup, mfst:mfSubTab,
     mffc:mfFourierCutoff, mfac:mfAdcCutoff,
-    mfcpg:document.getElementById('mf-custom-plane-sel')?.value || 'all',
     mfct
   };
   const enc = _encState(state);
@@ -1163,7 +1153,6 @@ function loadState() {
   if (st.mfst)               mfSubTab       = st.mfst;
   if (st.mffc !== undefined) mfFourierCutoff = st.mffc;
   if (st.mfac !== undefined) mfAdcCutoff    = st.mfac;
-  if (st.mfcpg)              _savedMfCustomPlane  = st.mfcpg;
   if (st.mfct)               _savedMfCustomTracks = st.mfct;
 
   return true;
@@ -1188,7 +1177,8 @@ function renderSeedsPlot() {
   const el = document.getElementById('seeds-plot');
   if (!el) return;
 
-  const xTitle = xax === 'factor' ? 'Factor  (param / GT)' : 'Parameter value';
+  const paramLabel = DATA.runs.find(r => r.param_name === fParam)?.param_label || fParam;
+  const xTitle = xax === 'factor' ? `Factor  (${paramLabel} / GT)` : paramLabel;
   const yTitle = { loss: 'Loss', absgrad: '|∂L/∂p|', grad: '∂L/∂p' }[qty];
   const layout = _baseLayout(yTitle, xTitle);
   const cfg    = { responsive: true };
@@ -1200,7 +1190,6 @@ function renderSeedsPlot() {
     Math.abs(r.adc_cutoff     - fCutoff)  < 1e-9 &&
     Math.abs(r.fourier_cutoff - fFourier) < 1e-9
   ).sort((a, b) => a.noise_seed - b.noise_seed);
-
   const tracks = getSelectedTracks();
   const planes = getSelectedPlanes();
   const traces = [];
@@ -1210,7 +1199,11 @@ function renderSeedsPlot() {
     else               { Plotly.react('seeds-plot', traces, layout, cfg); }
   };
 
-  if (matchRuns.length === 0 || tracks.length === 0) { _flush(); return; }
+  if (matchRuns.length === 0 || tracks.length === 0) {
+    const lbl = document.getElementById('seeds-min-label');
+    if (lbl) lbl.textContent = paramLabel;
+    _flush(); return;
+  }
 
   const allVals = matchRuns.map(r => ({
     seed: r.noise_seed, v: computeVals(r, tracks, planes)
@@ -1238,38 +1231,49 @@ function renderSeedsPlot() {
                   name: label, line: { color: '#1565C0', width: 2.5 },
                   marker: { color: '#1565C0', size: 5 } });
     _flush();
-    _showStats([`param/GT at min loss:  ${_fmtFactor(null, yArrs[0])}`]);
+    _showStats([`${paramLabel} / GT at min loss:  ${_fmtFactor(null, yArrs[0])}`]);
     return;
   }
 
-  // Mean and std
-  const yMean = new Array(n).fill(0);
+  // Mean and std — skip missing/NaN values from incomplete runs
+  const yMean = new Array(n).fill(null);
   const yStd  = new Array(n).fill(0);
   for (let i = 0; i < n; i++) {
-    const vals = yArrs.map(y => y[i]);
+    const vals = yArrs.map(y => (i < y.length && y[i] != null && isFinite(y[i])) ? y[i] : null)
+                      .filter(v => v !== null);
+    if (!vals.length) continue;
     const mean = vals.reduce((a, b) => a + b, 0) / vals.length;
-    yMean[i]   = mean;
-    yStd[i]    = Math.sqrt(vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length);
+    yMean[i] = mean;
+    yStd[i]  = vals.length > 1
+      ? Math.sqrt(vals.reduce((a, b) => a + (b - mean) ** 2, 0) / vals.length) : 0;
   }
-  const yHi = yMean.map((m, i) => m + yStd[i]);
-  const yLo = yMean.map((m, i) => m - yStd[i]);
+  const yHi = yMean.map((m, i) => m !== null ? m + yStd[i] : null);
+  const yLo = yMean.map((m, i) => m !== null ? m - yStd[i] : null);
 
-  // ± 1σ band
-  traces.push({
-    x: [...refX, ...[...refX].reverse()],
-    y: [...yHi, ...[...yLo].reverse()],
-    fill: 'toself', fillcolor: 'rgba(21,101,192,0.12)',
-    line: { color: 'transparent' },
-    name: 'mean ± 1σ', showlegend: true,
-    hoverinfo: 'skip', type: 'scatter'
-  });
+  // ± 1σ band: closed polygon built only from valid (non-null) points
+  const validIdx = [];
+  for (let i = 0; i < n; i++) if (yMean[i] !== null) validIdx.push(i);
+  if (validIdx.length > 1) {
+    const bx  = validIdx.map(i => refX[i]);
+    const bHi = validIdx.map(i => yHi[i]);
+    const bLo = validIdx.map(i => yLo[i]);
+    traces.push({
+      x: [...bx, ...[...bx].reverse()],
+      y: [...bHi, ...[...bLo].reverse()],
+      fill: 'toself', fillcolor: 'rgba(21,101,192,0.12)',
+      line: { color: 'transparent' },
+      name: 'mean ± 1σ', showlegend: true,
+      hoverinfo: 'skip', type: 'scatter',
+    });
+  }
 
   // Individual seed dots (one trace per seed, distinct colors)
   allVals.forEach((d, i) => {
     const hex = PALETTE[i % PALETTE.length];
     const [r, g, b] = hex.match(/[\da-f]{2}/gi).slice(0, 3).map(h => parseInt(h, 16));
+    const yi = yArrs[i].map(v => (v != null && isFinite(v)) ? v : null);
     traces.push({
-      x: refX, y: yArrs[i],
+      x: refX, y: yi,
       mode: 'markers', type: 'scatter',
       name: `seed ${d.seed}`,
       marker: { size: 6, color: `rgba(${r},${g},${b},0.55)` },
@@ -1277,29 +1281,42 @@ function renderSeedsPlot() {
     });
   });
 
-  // Mean line (on top)
+  // Mean line (on top, no gap bridging)
   traces.push({
     x: refX, y: yMean,
     mode: 'lines', type: 'scatter',
     name: 'mean',
     line: { color: '#1565C0', width: 2.5 },
     showlegend: true,
+    connectgaps: false,
   });
 
   _flush();
 
   // Stats panel: param/GT at min loss for mean and each seed
   const statsLines = [];
-  statsLines.push(`param/GT at min loss:`);
-  statsLines.push(`  mean  →  ${refX[_argmin(yMean)].toFixed(4)}`);
+  const yMeanFinite = yMean.filter(v => v !== null);
+  statsLines.push(`${paramLabel} / GT at min loss:`);
+  const minLbl = document.getElementById('seeds-min-label');
+  if (yMeanFinite.length) {
+    const mi = _argmin(yMean.map(v => v ?? Infinity));
+    const minFactor = refX[mi];
+    const minStd    = yStd[mi];
+    statsLines.push(`  mean  →  ${minFactor.toFixed(4)}  (σ = ${minStd.toFixed(4)})`);
+    if (minLbl) minLbl.textContent = `${paramLabel}  |  min at ${minFactor.toFixed(4)} ± ${minStd.toFixed(4)}`;
+  } else {
+    if (minLbl) minLbl.textContent = '';
+  }
   allVals.forEach((d, i) => {
-    statsLines.push(`  seed ${d.seed}  →  ${refX[_argmin(yArrs[i])].toFixed(4)}`);
+    const yi = yArrs[i];
+    if (yi.some(v => v != null && isFinite(v)))
+      statsLines.push(`  seed ${d.seed}  →  ${refX[_argmin(yi.map(v => v ?? Infinity))].toFixed(4)}`);
   });
   _showStats(statsLines);
 }
 
 /* ─────────────────────────────── Min-factor vs Cutoff tab ─────────────────────────────── */
-let mfNoise = 1.0, mfSeed = 42, mfPlaneGroup = 'all', mfAllSeeds = false, mfInited = false;
+let mfNoise = 1.0, mfSeed = 42, mfPlaneGroup = 'all', mfAllSeeds = true, mfInited = false;
 let mfSubTab = 'adc';
 let mfFourierCutoff = DATA.fourier_cutoff_options[0] || 0.0;
 let mfAdcCutoff     = DATA.cutoff_options[0]         || 0.0;
@@ -1481,22 +1498,21 @@ function renderMfCustom() {
   const tracks = DATA.all_tracks.filter(t => {
     const e = document.getElementById('mf-ck-' + sid(t)); return e && e.checked;
   });
-  const pg     = document.getElementById('mf-custom-plane-sel')?.value || 'all';
-  const planes = mfGetPlanes(pg);
+  const planes = mfGetPlanes(mfPlaneGroup);
   const color  = '#1565C0';
   DATA.params.forEach(p => {
     let traces;
     if (mfAllSeeds) {
       const groups = mfAllSeedsByCutoff(p, mfNoise);
       traces = tracks.length
-        ? [_mfMeanErrTrace(groups, tracks, planes, `${tracks.length} tracks [${pg}]`, color)]
+        ? [_mfMeanErrTrace(groups, tracks, planes, `${tracks.length} tracks [${mfPlaneGroup}]`, color)]
         : [];
     } else {
       const runs = mfRunsByCutoff(p, mfNoise, mfSeed);
       const xs   = runs.map(r => r.adc_cutoff);
       const ys   = runs.map(r => mfMinFactor(r, tracks, planes));
       traces = tracks.length ? [{ x:xs, y:ys,
-        name:`${tracks.length} tracks [${pg}]`, type:'scatter', mode:'lines+markers', connectgaps:true,
+        name:`${tracks.length} tracks [${mfPlaneGroup}]`, type:'scatter', mode:'lines+markers', connectgaps:true,
         line:{color, width:2.5}, marker:{color, size:7} }] : [];
     }
     const lbl = DATA.runs.find(r => r.param_name === p)?.param_label || p;
@@ -1533,22 +1549,21 @@ function renderMfCustomFourier() {
   const tracks = DATA.all_tracks.filter(t => {
     const e = document.getElementById('mf-ck-' + sid(t)); return e && e.checked;
   });
-  const pg     = document.getElementById('mf-custom-plane-sel')?.value || 'all';
-  const planes = mfGetPlanes(pg);
+  const planes = mfGetPlanes(mfPlaneGroup);
   const color  = '#1565C0';
   DATA.params.forEach(p => {
     let traces;
     if (mfAllSeeds) {
       const groups = mfAllSeedsByFCutoff(p, mfNoise);
       traces = tracks.length
-        ? [_mfMeanErrTrace(groups, tracks, planes, `${tracks.length} tracks [${pg}]`, color)]
+        ? [_mfMeanErrTrace(groups, tracks, planes, `${tracks.length} tracks [${mfPlaneGroup}]`, color)]
         : [];
     } else {
       const runs = mfRunsByFCutoff(p, mfNoise, mfSeed);
       const xs   = runs.map(r => r.fourier_cutoff);
       const ys   = runs.map(r => mfMinFactor(r, tracks, planes));
       traces = tracks.length ? [{ x:xs, y:ys,
-        name:`${tracks.length} tracks [${pg}]`, type:'scatter', mode:'lines+markers', connectgaps:true,
+        name:`${tracks.length} tracks [${mfPlaneGroup}]`, type:'scatter', mode:'lines+markers', connectgaps:true,
         line:{color, width:2.5}, marker:{color, size:7} }] : [];
     }
     const lbl = DATA.runs.find(r => r.param_name === p)?.param_label || p;
@@ -1583,8 +1598,8 @@ function setMfPlaneGroup(g) {
   mfPlaneGroup = g;
   document.querySelectorAll('#mf-plane-tabs .tab').forEach(b =>
     b.classList.toggle('active', b.dataset.pg === g));
-  if (mfSubTab === 'adc') { _mfRenderFixed(); }
-  else { _mfRenderFixedFourier(); }
+  if (mfSubTab === 'adc') { _mfRenderFixed(); renderMfCustom(); }
+  else { _mfRenderFixedFourier(); renderMfCustomFourier(); }
 }
 
 function buildMfNoiseSel() {
@@ -1695,12 +1710,6 @@ function initMfTab() {
     b.classList.toggle('active', b.dataset.pg === mfPlaneGroup));
   // Sync sub-tab state
   setMfSubTab(mfSubTab);
-  // Apply saved custom plane selection
-  if (_savedMfCustomPlane !== null) {
-    const cps = document.getElementById('mf-custom-plane-sel');
-    if (cps) cps.value = _savedMfCustomPlane;
-    _savedMfCustomPlane = null;
-  }
   mfInited = true;
 }
 

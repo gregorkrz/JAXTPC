@@ -163,7 +163,7 @@ def blur_mse_loss(signals_a, signals_b, spectral_weights, planes=(0, 1, 2, 3, 4,
 #   Ghost contamination exp(-4) ~ 2%.
 
 
-def make_sobolev_weight(H, W, max_pad=1024, s=2.0):
+def make_sobolev_weight(H, W, max_pad=1024, s=2.0, freq_cutoff=None):
     """H^{-s} Sobolev spectral weight.
 
     s=1: log(d) loss growth, 1/d gradient (Laplacian)
@@ -179,6 +179,10 @@ def make_sobolev_weight(H, W, max_pad=1024, s=2.0):
         Default 1024 matches the current Gaussian setup (4*256).
     s : float
         Sobolev exponent. Default 2.0.
+    freq_cutoff : float or None
+        Hard high-frequency cutoff in normalised units (0, 0.5].
+        Frequencies with |f| > freq_cutoff (L2 norm) are zeroed out.
+        None disables the cutoff (default).
 
     Returns
     -------
@@ -193,7 +197,10 @@ def make_sobolev_weight(H, W, max_pad=1024, s=2.0):
 
     eps = 1.0 / (math.pi ** 2 * max_pad ** 2)
 
-    return 1 / (freq_sq + eps) ** s
+    w = 1 / (freq_sq + eps) ** s
+    if freq_cutoff is not None:
+        w = jnp.where(freq_sq > freq_cutoff ** 2, 0.0, w)
+    return w
 
 
 def sobolev_loss_single(A, B, spectral_weight):

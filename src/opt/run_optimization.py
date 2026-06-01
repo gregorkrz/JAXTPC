@@ -297,6 +297,17 @@ def parse_args():
     p.add_argument('--gt-lifetime-us', type=float, default=None,
                    help='Override the GT electron lifetime in μs (default: use GT_LIFETIME_US '
                         f'= {GT_LIFETIME_US:.0f} μs). E.g. 6000 for 6 ms.')
+    p.add_argument('--sobolev-exponent', type=float, default=2.0,
+                   help='Sobolev exponent s passed to make_sobolev_weight (default: 2.0). '
+                        'Higher values penalise high-frequency components more strongly.')
+    p.add_argument('--freq-cutoff', type=float, default=None,
+                   help='Hard high-frequency cutoff for Sobolev weights, in normalised units '
+                        '(0, 0.5]. Frequencies with |f| > cutoff (L2 norm) are zeroed. '
+                        'None disables (default).')
+    p.add_argument('--freq-cutoff-per-param', default=None,
+                   help='Per-parameter freq cutoff: "param1:cutoff1,param2:cutoff2". '
+                        'Params not listed use --freq-cutoff (default None = no cutoff). '
+                        'Not compatible with --optimizer newton.')
     p.add_argument('--sobolev-loss-cutoff', type=float, default=0.0,
                    help='ADC cutoff: zero out pixels where |gt| < cutoff before computing loss '
                         '(default: 0.0, no cutoff). Applied to both sim and gt signals.')
@@ -1538,13 +1549,16 @@ def main():
     # Per-parameter ADC cutoffs + planes: build a list of (cutoff, planes_tuple, [param_indices])
     # groups. Params sharing the same (cutoff, planes) share one compiled phase-fn set.
     _param_groups = None  # None → use single global cutoff + planes (standard path)
-    if args.sobolev_loss_cutoff_per_param or args.planes_per_param:
+    # _param_groups entries are 4-tuples: (adc_cutoff, planes, freq_cutoff, indices)
+    if args.sobolev_loss_cutoff_per_param or args.planes_per_param or args.freq_cutoff_per_param:
         if is_newton:
             print('error: per-parameter cutoff/planes are not compatible with --optimizer newton.',
                   file=sys.stderr)
             raise SystemExit(2)
         _cutoff_per_param = parse_cutoff_per_param(
             args.sobolev_loss_cutoff_per_param or '', param_names, args.sobolev_loss_cutoff)
+        _freq_cutoff_per_param_list = parse_cutoff_per_param(
+            args.freq_cutoff_per_param or '', param_names, args.freq_cutoff)
         # planes_per_param parsed after active_planes is resolved (need n_planes from simulator).
         # Store the raw spec for later; resolution happens below after active_planes is set.
         _planes_per_param_spec = args.planes_per_param
@@ -1557,19 +1571,22 @@ def main():
     active_planes = parse_planes(args.planes) if args.planes else None
 
     # Resolve per-param groups now that active_planes is known.
-    if _param_groups is None and (args.sobolev_loss_cutoff_per_param or args.planes_per_param):
+    if _param_groups is None and (
+            args.sobolev_loss_cutoff_per_param or args.planes_per_param or args.freq_cutoff_per_param):
         _planes_per_param = parse_planes_per_param(
             _planes_per_param_spec or '', param_names, default_planes=active_planes)
-        # Group params by (cutoff, planes_tuple)
+        # Group params by (adc_cutoff, planes_tuple, freq_cutoff)
         group_key_to_indices: dict = {}
-        for i, (c, pl) in enumerate(zip(_cutoff_per_param, _planes_per_param)):
-            key = (c, pl)
+        for i, (c, pl, fc) in enumerate(
+                zip(_cutoff_per_param, _planes_per_param, _freq_cutoff_per_param_list)):
+            key = (c, pl, fc)
             group_key_to_indices.setdefault(key, []).append(i)
-        # Sort groups for determinism: by cutoff first, then by planes string repr
+        # Sort groups for determinism: by cutoff first, then by planes string repr, then fc
         _param_groups = [
-            (c, pl, indices)
-            for (c, pl), indices in sorted(
-                group_key_to_indices.items(), key=lambda kv: (kv[0][0], str(kv[0][1]))
+            (c, pl, fc, indices)
+            for (c, pl, fc), indices in sorted(
+                group_key_to_indices.items(),
+                key=lambda kv: (kv[0][0], str(kv[0][1]), str(kv[0][2]))
             )
         ]
 
@@ -1661,12 +1678,17 @@ def main():
     print(f'Seed         : {effective_seed}')
     print(f'Noise scale  : {args.noise_scale}')
     if _param_groups is not None and len(_param_groups) > 1:
-        for c, pl, idxs in _param_groups:
+        for c, pl, fc, idxs in _param_groups:
             names_str = ', '.join(param_names[i] for i in idxs)
             pl_str = str(pl) if pl is not None else 'all'
-            print(f'ADC cutoff   : {c}  planes={pl_str}  → {names_str}')
+            fc_str = f'  freq_cutoff={fc}' if fc is not None else ''
+            print(f'ADC cutoff   : {c}  planes={pl_str}{fc_str}  → {names_str}')
     elif args.sobolev_loss_cutoff > 0.0:
         print(f'ADC cutoff   : {args.sobolev_loss_cutoff}')
+    if args.sobolev_exponent != 2.0:
+        print(f'Sobolev s    : {args.sobolev_exponent}')
+    if args.freq_cutoff is not None and _param_groups is None:
+        print(f'Freq cutoff  : {args.freq_cutoff}')
     if active_planes is not None and _param_groups is None:
         print(f'Active planes: {active_planes} (of 6 total)')
     print(f'Num buckets  : {args.num_buckets:,}')
@@ -1795,9 +1817,16 @@ def main():
           f'(step_size={args.gt_step_size}mm  max_deposits={args.gt_max_deposits:,})...')
     t0 = time.time()
     gt_signals_per_track = []
-    gt_weights_per_track = []
+    gt_weights_per_track = []   # weights for the global/simple path
     sig_rms_acc = []
     noi_rms_acc = []
+    # For per-param freq_cutoff: dict {fc_value -> list[tuple[np.array,...]]}
+    _unique_fcs_per_param = (
+        list({fc for _, _, fc, _ in _param_groups})
+        if _param_groups is not None and len(_param_groups) > 1
+        else []
+    )
+    gt_weights_per_track_per_fc: dict = {fc: [] for fc in _unique_fcs_per_param}
 
     noise_base_key = jax.random.PRNGKey(noise_seed)
     for track_idx, ts in enumerate(track_specs):
@@ -1830,11 +1859,17 @@ def main():
         else:
             sig_rms_acc.append(float(np.mean([float(jnp.std(a)) for a in gt])))
 
-        wts = tuple(make_sobolev_weight(a.shape[0], a.shape[1], max_pad=SOBOLEV_MAX_PAD)
+        wts = tuple(make_sobolev_weight(a.shape[0], a.shape[1], max_pad=SOBOLEV_MAX_PAD,
+                                        s=args.sobolev_exponent, freq_cutoff=args.freq_cutoff)
                     for a in gt)
         # Move to CPU after computation to free GPU memory; JAX JIT transfers back per call.
         gt_signals_per_track.append(tuple(np.array(a) for a in gt))
         gt_weights_per_track.append(tuple(np.array(a) for a in wts))
+        for fc in _unique_fcs_per_param:
+            wts_fc = tuple(make_sobolev_weight(a.shape[0], a.shape[1], max_pad=SOBOLEV_MAX_PAD,
+                                               s=args.sobolev_exponent, freq_cutoff=fc)
+                           for a in gt)
+            gt_weights_per_track_per_fc[fc].append(tuple(np.array(a) for a in wts_fc))
 
     signal_rms = float(np.mean(sig_rms_acc))
     if args.noise_scale > 0.0:
@@ -1868,6 +1903,7 @@ def main():
 
         _batches = []
         _deps, _gts, _wts = [], [], []
+        _wts_per_fc: dict = {fc: [] for fc in _unique_fcs_per_param}
 
         for ti, ts in enumerate(track_specs):
             track_ph = generate_muon_track(
@@ -1888,13 +1924,30 @@ def main():
             _deps.append(deposits_ph)
             _gts.append(gt_signals_per_track[ti])
             _wts.append(gt_weights_per_track[ti])
+            for fc in _unique_fcs_per_param:
+                _wts_per_fc[fc].append(gt_weights_per_track_per_fc[fc][ti])
 
             if len(_deps) == phase['batch_size']:
                 _batches.append((list(_deps), list(_gts), list(_wts)))
+                for fc in _unique_fcs_per_param:
+                    _wts_per_fc[fc] = []   # reset accumulator; batches stored below
                 _deps.clear(); _gts.clear(); _wts.clear()
 
         if _deps:
             _batches.append((list(_deps), list(_gts), list(_wts)))
+
+        # Build per-fc batches by substituting the appropriate weights into _batches.
+        _batches_per_fc: dict = {}
+        for fc in _unique_fcs_per_param:
+            wts_flat = gt_weights_per_track_per_fc[fc]
+            ti_cur = 0
+            fc_batches = []
+            for batch_deps, batch_gts, _ in _batches:
+                bs = len(batch_deps)
+                fc_batches.append((batch_deps, batch_gts,
+                                   [wts_flat[ti_cur + j] for j in range(bs)]))
+                ti_cur += bs
+            _batches_per_fc[fc] = fc_batches
 
         ti_cursor = 0
         phase_track_groups = []
