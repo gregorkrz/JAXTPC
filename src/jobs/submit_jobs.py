@@ -77,6 +77,11 @@ Available profiles
                                Sobolev exp=2, noisy GT. trans+long diffusion only × 5 seeds = 5 jobs.
   Adam_20260601_diff_adc20_sob2        Same but no FT cutoff.
   Adam_20260601_diff_adc20_sob2_rot5   Same; --rotate-noise-seeds 5 (noise seed cycles every 5 steps).
+  Adam_20260601_cutoff_sweep  16 tracks (same as Adam_20260601, TRACKS_16_NICE_EXT); sweeps
+                               ADC cutoffs (5, 10, 20, 50), Fourier cutoffs (0, 10, 100) ADC²,
+                               and --rotate-noise-seeds (disabled / 5); trans+long diffusion only,
+                               5k steps, noisy GT, seeds 100–104. Each ADC cutoff is a separate
+                               dependency chain (30 jobs/chain); 4 chains × 30 = 120 jobs total.
   Adam_diffusionCutoff_collection_only_15tracks_v2  Like Adam_differentCutoffs_trans_and_long…v2 but
                                 the ADC cutoff and collection-only planes are applied only to both
                                 diffusion params; all other params use all planes and no cutoff.
@@ -547,6 +552,40 @@ def _seed_is_complete(results_base: str, noise_tag: str, seed: int, verbose: boo
             else:
                 print(f"    → complete: {len(trials)}/{n_expected} trials ✓")
         if not incomplete:
+            return True
+    return False
+
+
+def _seed_is_finished(results_base: str, seed: int, min_steps: int) -> bool:
+    """Return True if no new job is needed for this (results_base, seed).
+
+    A job is considered finished when either:
+    - all N trials completed and no live_checkpoint remains (early-stopped or fully run), or
+    - total steps accumulated across trials + live checkpoint >= min_steps.
+
+    Returns False if no pkl exists or it cannot be read.
+    ``$RESULTS_DIR`` in results_base is expanded automatically.
+    """
+    resolved = results_base.replace("$RESULTS_DIR", _RESULTS_DIR)
+    pattern = os.path.join(resolved, "**", f"result_{seed}.pkl")
+    for pkl_path in glob.glob(pattern, recursive=True):
+        try:
+            with open(pkl_path, "rb") as f:
+                data = pickle.load(f)
+        except Exception:
+            continue
+        if not _optimization_pickle_incomplete(data):
+            return True  # completed all trials (early-stopped or fully run)
+        trials = data.get("trials") or []
+        done = sum(int(t.get("steps_run", 0) or 0) for t in trials)
+        ckpt = data.get("live_checkpoint") or {}
+        if ckpt:
+            st = ckpt.get("step")
+            try:
+                done += int(st) if st is not None else 0
+            except (TypeError, ValueError):
+                pass
+        if done >= min_steps:
             return True
     return False
 
@@ -6059,6 +6098,92 @@ def profile_Adam_20260601_diff_adc20_sob2_rot5(*, submit=True, print_sbatch_only
         )
 
 
+def profile_Adam_20260601_cutoff_sweep(*, submit=True, print_sbatch_only=False, wandb_tags=None, skip_complete=False):
+    """16 tracks: 11 nice boundary + 5 extra near-cathode 100 MeV (TRACKS_16_NICE_EXT).
+
+    Sweeps ADC cutoffs (5, 10, 20, 50), Fourier cutoffs (0, 10, 100) ADC²,
+    and --rotate-noise-seeds (disabled / 5); trans+long diffusion only, 5k steps,
+    noisy GT (noise_scale=1), seeds 100–104.
+    Each ADC cutoff value is a separate dependency chain (seeds + fft + rot serialised
+    within that chain) to avoid overloading the cluster.
+    Total: 4 ADC × 3 FFT × 2 rot × 5 seeds = 120 jobs (4 chains of 30).
+    """
+    shared = dict(
+        tracks=TRACKS_16_NICE_EXT,
+        optimizer="adam",
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.001,
+        lr_schedule="cosine",
+        max_steps=4000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        grad_clip=0.0,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=1.0,
+        max_num_deposits=5000,
+        batch_size=1,
+        effective_batch_size=1,
+        gt_step_size=1.0,
+        gt_max_deposits=5000,
+        adam_beta2=0.9,
+        log_interval=50,
+        noise_scale=1.0,
+        sobolev_exponent=2.0,
+    )
+
+    params = "diffusion_trans_cm2_us,diffusion_long_cm2_us"
+    param_label = "trans_and_long"
+    seeds = [100, 101, 102, 103, 104]
+    adc_cutoffs = [0, 5, 10, 20, 50]
+    fft_cutoffs = [0, 10, 100]
+    rotate_noise_vals = [None, 5]  # None = disabled, 5 = rotate every 5 steps
+
+    for adc_cutoff in adc_cutoffs:
+        adc_tag = f"adc{int(adc_cutoff)}"
+        prev_job = None  # one chain per ADC cutoff value
+        for fft_cutoff in fft_cutoffs:
+            fft_tag = f"ft{int(fft_cutoff)}"
+            for rot in rotate_noise_vals:
+                rot_tag = "rotoff" if rot is None else f"rot{rot}"
+                profile_tag = (
+                    f"Adam_20260601_cutoff_sweep_{param_label}"
+                    f"_{adc_tag}_{fft_tag}_{rot_tag}"
+                )
+                results_base = f"$RESULTS_DIR/opt/{profile_tag}"
+                for seed in seeds:
+                    seed_results_base = f"{results_base}/noise"
+                    if skip_complete and _seed_is_finished(seed_results_base, seed, shared["max_steps"]):
+                        print(f"  [skip] {profile_tag} seed={seed}: already finished")
+                        continue
+                    command = make_opt_command(
+                        params=params,
+                        seed=seed,
+                        sobolev_loss_cutoff=float(adc_cutoff),
+                        fourier_cutoff=float(fft_cutoff) if fft_cutoff > 0 else None,
+                        rotate_noise_seeds=rot,
+                        results_base=seed_results_base,
+                        wandb_tags=(wandb_tags or []) + [
+                            "Adam_20260601_cutoff_sweep", param_label, "noise",
+                            "16trks_nice", adc_tag, fft_tag, rot_tag,
+                        ],
+                        **shared,
+                    )
+                    if not print_sbatch_only:
+                        print(command)
+                    prev_job = s3df_submit(
+                        command,
+                        time="00:12:00",
+                        submit=submit,
+                        mem_gb=64,
+                        print_sbatch_command=print_sbatch_only,
+                        dependency=prev_job,
+                    )
+
+
 PROFILES = {
     "3_part_schedule": profile_3_part_schedule,
     "2_part_schedule": profile_2_part_schedule,
@@ -6153,6 +6278,7 @@ PROFILES = {
     "Adam_20260601_diff_adc20_ft100_sob2": profile_Adam_20260601_diff_adc20_ft100_sob2,
     "Adam_20260601_diff_adc20_sob2": profile_Adam_20260601_diff_adc20_sob2,
     "Adam_20260601_diff_adc20_sob2_rot5": profile_Adam_20260601_diff_adc20_sob2_rot5,
+    "Adam_20260601_cutoff_sweep": profile_Adam_20260601_cutoff_sweep,
 }
 
 

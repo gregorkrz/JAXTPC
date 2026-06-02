@@ -95,6 +95,7 @@ class DetectorSimulator:
         recombination_model=None,
         include_electric_dist=False,
         electric_dist_path=None,
+        efield_model=None,
         include_digitize=False,
         digitization_config=None,
         differentiable=False,
@@ -166,7 +167,14 @@ class DetectorSimulator:
 
         # Load SCE maps (per-volume, converted to local frame)
         sce_per_volume = self._load_sce(include_electric_dist, electric_dist_path)
-        self._include_sce = sce_per_volume is not None
+        # Differentiable MLP SCE model (FieldConfig); field read from SimParams.sce_models.
+        # Mutually exclusive with a static SCE map.
+        self._efield_model = efield_model
+        if efield_model is not None and sce_per_volume is not None:
+            raise ValueError(
+                "efield_model (MLP SCE) and include_electric_dist (static SCE map) "
+                "are mutually exclusive; pass only one.")
+        self._include_sce = sce_per_volume is not None or efield_model is not None
 
         # Volume iteration mode
         self._iterate = scan_over if iterate_mode == 'scan' else vmap_over
@@ -228,7 +236,7 @@ class DetectorSimulator:
 
         # Build shared factories
         sce_factory, _build_response_fn, _build_response_fn_diff, _recomb_fn = \
-            self._setup_shared_factories(sce_per_volume)
+            self._setup_shared_factories(sce_per_volume, efield_model)
 
         # Build post-processing factories (once, shared)
         self.electronics_chunk_size = None
@@ -307,20 +315,38 @@ class DetectorSimulator:
         print(f"   Volumes: {cfg.n_volumes} (iterate={self._volume_mode})")
         print("--- DetectorSimulator Ready ---")
 
-    def _setup_shared_factories(self, sce_per_volume):
-        """Build SCE, response, and recombination factories (shared across volumes)."""
+    def _setup_shared_factories(self, sce_per_volume, efield_model=None):
+        """Build SCE, response, and recombination factories (shared across volumes).
+
+        SCE factories take ``sim_params`` so the differentiable MLP path can read
+        its weights from ``sim_params.sce_models``; the static-map and nominal
+        factories ignore the argument.
+        """
         from tools.recombination import compute_quanta, XI_FN
 
         cfg = self._sim_config
         _nominal_field = float(self._default_sim_params.recomb_params.field_strength_Vcm)
 
         # ── SCE factory (local frame) ──
-        if sce_per_volume is not None:
+        if efield_model is not None:
+            # Differentiable MLP SCE — field computed from sim_params.sce_models.
+            # The static FieldConfig is captured here; only weights flow through
+            # SimParams, so jax.grad reaches them.
+            from tools import nonlocal_efield as _nl
+            def sce_factory(sim_params, fcfg=efield_model, nf=_nominal_field):
+                mlp_params = sim_params.sce_models
+                def _sce(positions_cm):
+                    efield_corr, drift_corr = _nl.sce_outputs(
+                        mlp_params, positions_cm, fcfg, nf)
+                    return SCEOutputs(efield_correction=efield_corr,
+                                      drift_corr_cm=drift_corr)
+                return _sce
+        elif sce_per_volume is not None:
             # Real SCE — maps already in local frame from load_sce_per_volume.
             # For scan, all volumes must share one factory. Use volume 0's maps.
             # (Different per-volume SCE requires stacking maps — future work.)
             efield_fn, corr_fn = sce_per_volume[0]
-            def sce_factory(ef=efield_fn, cf=corr_fn, nf=_nominal_field):
+            def sce_factory(sim_params=None, ef=efield_fn, cf=corr_fn, nf=_nominal_field):
                 def _sce(positions_cm):
                     E_local = ef(positions_cm)
                     E_normalized = E_local / nf
@@ -329,7 +355,7 @@ class DetectorSimulator:
                 return _sce
         else:
             # Nominal SCE — identical for all volumes in local frame
-            def sce_factory():
+            def sce_factory(sim_params=None):
                 def _sce(pos):
                     N = pos.shape[0]
                     corr = jnp.broadcast_to(
@@ -428,7 +454,7 @@ class DetectorSimulator:
             pk = kernels  # PixelResponseKernel
 
             def process_one_volume(vol_deps, vol_key, sim_params):
-                sce_fn = sce_factory()
+                sce_fn = sce_factory(sim_params)
                 vol_int = compute_volume_physics(
                     vol_deps, sim_params, vol_geom, sce_fn, _recomb_fn)
 
@@ -480,7 +506,7 @@ class DetectorSimulator:
             _PLANE_LABELS = tuple(cfg.plane_names[0])
 
             def process_one_volume(vol_deps, vol_key, sim_params):
-                sce_fn = sce_factory()
+                sce_fn = sce_factory(sim_params)
                 vol_int = compute_volume_physics(
                     vol_deps, sim_params, vol_geom, sce_fn, _recomb_fn)
 
@@ -568,7 +594,7 @@ class DetectorSimulator:
 
         # ── Light-only JIT ──
         def light_one_volume(vol_deps, sim_params):
-            sce_fn = sce_factory()
+            sce_fn = sce_factory(sim_params)
             vol_int = compute_volume_physics(
                 vol_deps, sim_params, vol_geom, sce_fn, _recomb_fn)
             return vol_int.charges, vol_int.photons, vol_int.positions_cm
@@ -585,7 +611,7 @@ class DetectorSimulator:
             n_segments = self.n_segments
 
             def diff_one_volume(vol_deps, sim_params):
-                sce_fn = sce_factory()
+                sce_fn = sce_factory(sim_params)
                 vol_int = compute_volume_physics(
                     vol_deps, sim_params, vol_geom, sce_fn, _recomb_fn)
 

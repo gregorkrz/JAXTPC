@@ -35,6 +35,7 @@ load_dotenv()
 
 import argparse
 import html
+import json
 import re
 import time
 
@@ -261,6 +262,43 @@ def write_edep_3d_html(track, spec, path, de_min, de_max, de_range, volumes, sta
         margin=dict(l=0, r=0, b=0, t=60),
     )
     fig.write_html(path)
+
+
+def _track_kinematics_table(specs):
+    """Closed <details> table: per-track kinetic energy, theta, phi."""
+    if not specs:
+        return ''
+    rows = []
+    for spec in specs:
+        d = np.array(spec['direction'], dtype=float)
+        norm = np.linalg.norm(d)
+        if norm > 0:
+            d = d / norm
+        theta_deg = float(np.degrees(np.arccos(np.clip(d[2], -1.0, 1.0))))
+        phi_deg = float(np.degrees(np.arctan2(d[1], d[0])))
+        rows.append(
+            f'<tr>'
+            f'<td style="text-align:left;white-space:nowrap">{html.escape(spec["name"])}</td>'
+            f'<td>{spec["momentum_mev"]:.6g}</td>'
+            f'<td>{theta_deg:.2f}</td>'
+            f'<td>{phi_deg:.2f}</td>'
+            f'</tr>'
+        )
+    header = (
+        '<th style="text-align:left">Track</th>'
+        '<th>T (MeV)</th>'
+        '<th>θ (°)</th>'
+        '<th>φ (°)</th>'
+    )
+    return f'''<details style="margin:0.6rem 0">
+  <summary style="cursor:pointer;font-weight:600;font-size:0.9rem">
+    Track kinematics (θ from z-axis, φ = atan2(y,x))
+  </summary>
+  <table style="border-collapse:collapse;font-size:0.78rem;margin-top:0.4rem">
+    <thead><tr style="background:#f0f0f0">{header}</tr></thead>
+    <tbody>{''.join(rows)}</tbody>
+  </table>
+</details>'''
 
 
 def _pixel_count_table(specs, pixel_counts, plane_names=None):
@@ -531,9 +569,11 @@ def write_edep_index_html(specs, output_dir, stats=None, pdf_name=None, pixel_co
     <a href="bragg_peak_tail150mm.pdf" target="_blank">📄 Bragg peak tail 150 mm</a>
     <a href="bragg_peak_tail50mm.pdf" target="_blank">📄 Bragg peak tail 50 mm</a>
     <a href="bragg_peak_dedx_vs_pathlen.html" target="_blank">🌐 Bragg peak (interactive)</a>
+    <a href="histograms.html" target="_blank">🌐 Track histograms</a>
     <a href="coordinate_distributions.pdf" target="_blank">📄 Coordinate distributions</a>
     <a href="track_catalog.pdf" target="_blank">📄 Track catalog</a>
   </p>
+  {_track_kinematics_table(specs)}
   {_pixel_count_table(specs, pixel_counts, plane_names=plane_names) if pixel_counts else ''}
   {_drift_dist_table(specs, dist_stats) if dist_stats else ''}
   <p>
@@ -966,6 +1006,214 @@ def write_track_catalog_pdf(specs, path, stats=None):
     print(f'  Saved {path}')
 
 
+def write_histograms_html(specs, dist_stats, output_dir):
+    """Self-contained interactive HTML: pick muons, see histograms of E / theta / phi / drift distances."""
+    _UGLY_TRACKS = ['Muon4_100MeV', 'Muon5_100MeV', 'Muon10_100MeV',
+                    'Muon12_100MeV', 'Muon13_100MeV']
+
+    track_data = []
+    for i, spec in enumerate(specs):
+        d = np.array(spec['direction'], dtype=float)
+        norm = np.linalg.norm(d)
+        if norm > 0:
+            d = d / norm
+        theta_deg = float(np.degrees(np.arccos(np.clip(d[2], -1.0, 1.0))))
+        phi_deg = float(np.degrees(np.arctan2(d[1], d[0])))
+        ds = (dist_stats[i]
+              if dist_stats and i < len(dist_stats) and dist_stats[i] is not None
+              else None)
+        track_data.append({
+            'name': spec['name'],
+            'E': float(spec['momentum_mev']),
+            'theta': theta_deg,
+            'phi': phi_deg,
+            'mean_east': float(ds['east']['mean']) if ds else None,
+            'mean_west': float(ds['west']['mean']) if ds else None,
+        })
+
+    js_data = 'const TRACKS = ' + json.dumps(track_data) + ';'
+    ugly_js = json.dumps(_UGLY_TRACKS)
+
+    checkbox_items_html = ''.join(
+        f'<label class="muon-item">'
+        f'<input type="checkbox" class="muon-cb" value="{i}" checked> '
+        f'{html.escape(td["name"])}</label>\n'
+        for i, td in enumerate(track_data)
+    )
+
+    _TMPL = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Track histograms</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { display: flex; height: 100vh; font-family: system-ui, sans-serif; overflow: hidden; }
+    #sidebar {
+      width: 240px; min-width: 140px; border-right: 1px solid #ddd;
+      padding: 0.75rem; overflow-y: auto; flex-shrink: 0; background: #fafafa;
+    }
+    #sidebar h2 { font-size: 0.95rem; font-weight: 600; margin-bottom: 0.4rem; }
+    .btn-row { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 0.5rem; }
+    .btn-row button { font-size: 0.72rem; padding: 2px 7px; cursor: pointer;
+                      border: 1px solid #bbb; border-radius: 3px; background: #fff; }
+    .btn-row button:hover { background: #e8e8e8; }
+    .muon-item { display: block; font-size: 0.76rem; padding: 2px 0;
+                 cursor: pointer; white-space: nowrap; overflow: hidden;
+                 text-overflow: ellipsis; }
+    #main { flex: 1; padding: 0.85rem; overflow-y: auto; }
+    #main h1 { font-size: 1.05rem; margin-bottom: 0.75rem; font-weight: 600; }
+    .hist-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+      gap: 0.85rem;
+    }
+    .hist-card {
+      background: #fff; border: 1px solid #e0e0e0; border-radius: 6px;
+      padding: 0.6rem 0.8rem;
+    }
+    .hist-card h3 { font-size: 0.85rem; margin-bottom: 0.3rem; color: #333; }
+    svg { display: block; overflow: visible; }
+    rect.bar { fill: #4682B4; opacity: 0.72; transition: opacity 0.1s; }
+    rect.bar:hover { opacity: 1; }
+  </style>
+</head>
+<body>
+  <div id="sidebar">
+    <h2>Muons</h2>
+    <div class="btn-row">
+      <button onclick="selectPreset('all')">All</button>
+      <button onclick="selectPreset('none')">None</button>
+      <button onclick="selectPreset('orig')">Orig</button>
+      <button onclick="selectPreset('nice')">Nice</button>
+    </div>
+    __CHECKBOXES__
+  </div>
+  <div id="main">
+    <h1>Track histograms</h1>
+    <div class="hist-grid" id="hist-grid"></div>
+  </div>
+  <script>
+  __JS_DATA__
+  const UGLY_TRACKS = __UGLY_JS__;
+  const QUANTITIES = [
+    {key: 'E',         label: 'T (MeV)'},
+    {key: 'theta',     label: 'θ (°)'},
+    {key: 'phi',       label: 'φ (°)'},
+    {key: 'mean_east', label: 'Mean dist east (mm)'},
+    {key: 'mean_west', label: 'Mean dist west (mm)'},
+  ];
+  const N_BINS = 8;
+  const SVG_W = 290, SVG_H = 170;
+  const PAD = {top: 8, right: 10, bottom: 38, left: 36};
+
+  function computeHist(vals) {
+    const finite = vals.filter(v => v !== null && isFinite(v));
+    if (finite.length === 0) return null;
+    let lo = Math.min(...finite), hi = Math.max(...finite);
+    if (lo === hi) { lo -= 0.5; hi += 0.5; }
+    const w = (hi - lo) / N_BINS;
+    const counts = Array(N_BINS).fill(0);
+    const bnames = Array.from({length: N_BINS}, () => []);
+    for (let i = 0; i < vals.length; i++) {
+      const v = vals[i];
+      if (v === null || !isFinite(v)) continue;
+      let b = Math.floor((v - lo) / w);
+      if (b >= N_BINS) b = N_BINS - 1;
+      counts[b]++;
+      bnames[b].push(i);
+    }
+    return {lo, hi, w, counts, bnames};
+  }
+
+  function fmtVal(v) {
+    if (v === null || !isFinite(v)) return '—';
+    return Math.abs(v) >= 100 ? v.toFixed(1) : v.toFixed(2);
+  }
+
+  function buildSVG(hist, selNames) {
+    const pw = SVG_W - PAD.left - PAD.right;
+    const ph = SVG_H - PAD.top - PAD.bottom;
+    const nodata = `<text x="${SVG_W / 2}" y="${SVG_H / 2}" text-anchor="middle" font-size="12" fill="#999">no data</text>`;
+    if (!hist) return `<svg width="${SVG_W}" height="${SVG_H}">${nodata}</svg>`;
+    const maxCnt = Math.max(...hist.counts, 1);
+    let inner = '';
+    const bw = pw / N_BINS;
+    for (let b = 0; b < N_BINS; b++) {
+      const x = PAD.left + b * bw;
+      const cnt = hist.counts[b];
+      const bh = Math.max((cnt / maxCnt) * ph, cnt > 0 ? 1 : 0);
+      const y = PAD.top + ph - bh;
+      const tip = hist.bnames[b].map(i => selNames[i]).join('\n');
+      inner += `<rect class="bar" x="${(x+1).toFixed(1)}" y="${y.toFixed(1)}" width="${(bw-2).toFixed(1)}" height="${bh.toFixed(1)}"><title>${cnt} track(s):\n${tip}</title></rect>`;
+      if (cnt > 0) {
+        inner += `<text x="${(x+bw/2).toFixed(1)}" y="${(y-2).toFixed(1)}" text-anchor="middle" font-size="10" fill="#333">${cnt}</text>`;
+      }
+    }
+    inner += `<line x1="${PAD.left}" y1="${PAD.top+ph}" x2="${PAD.left+pw}" y2="${PAD.top+ph}" stroke="#888" stroke-width="1"/>`;
+    for (let t = 0; t <= 4; t++) {
+      const frac = t / 4;
+      const xp = PAD.left + frac * pw;
+      const val = hist.lo + frac * (hist.hi - hist.lo);
+      inner += `<line x1="${xp.toFixed(1)}" y1="${(PAD.top+ph).toFixed(1)}" x2="${xp.toFixed(1)}" y2="${(PAD.top+ph+4).toFixed(1)}" stroke="#888" stroke-width="1"/>`;
+      inner += `<text x="${xp.toFixed(1)}" y="${(PAD.top+ph+14).toFixed(1)}" text-anchor="middle" font-size="9" fill="#555">${fmtVal(val)}</text>`;
+    }
+    inner += `<line x1="${PAD.left}" y1="${PAD.top}" x2="${PAD.left}" y2="${PAD.top+ph}" stroke="#888" stroke-width="1"/>`;
+    for (let t = 0; t <= 4; t++) {
+      const frac = t / 4;
+      const yp = PAD.top + ph - frac * ph;
+      const cnt = Math.round(frac * maxCnt);
+      inner += `<line x1="${(PAD.left-3).toFixed(1)}" y1="${yp.toFixed(1)}" x2="${PAD.left}" y2="${yp.toFixed(1)}" stroke="#888" stroke-width="1"/>`;
+      inner += `<text x="${(PAD.left-5).toFixed(1)}" y="${(yp+3).toFixed(1)}" text-anchor="end" font-size="9" fill="#555">${cnt}</text>`;
+    }
+    return `<svg width="${SVG_W}" height="${SVG_H}">${inner}</svg>`;
+  }
+
+  function render() {
+    const sel = Array.from(document.querySelectorAll('.muon-cb:checked')).map(cb => +cb.value);
+    const selTracks = sel.map(i => TRACKS[i]);
+    const selNames = selTracks.map(t => t.name);
+    const grid = document.getElementById('hist-grid');
+    grid.innerHTML = '';
+    for (const q of QUANTITIES) {
+      const vals = selTracks.map(t => t[q.key]);
+      const hist = computeHist(vals);
+      const card = document.createElement('div');
+      card.className = 'hist-card';
+      card.innerHTML = `<h3>${q.label}</h3>` + buildSVG(hist, selNames);
+      grid.appendChild(card);
+    }
+  }
+
+  function selectPreset(preset) {
+    document.querySelectorAll('.muon-cb').forEach(cb => {
+      const name = TRACKS[+cb.value].name;
+      if      (preset === 'all')  cb.checked = true;
+      else if (preset === 'none') cb.checked = false;
+      else if (preset === 'orig') cb.checked = !name.includes('Quarter');
+      else if (preset === 'nice') cb.checked = !UGLY_TRACKS.some(u => name.includes(u));
+    });
+    render();
+  }
+
+  document.querySelectorAll('.muon-cb').forEach(cb => cb.addEventListener('change', render));
+  render();
+  </script>
+</body>
+</html>"""
+
+    page = (_TMPL
+            .replace('__JS_DATA__', js_data)
+            .replace('__UGLY_JS__', ugly_js)
+            .replace('__CHECKBOXES__', checkbox_items_html))
+    path = os.path.join(output_dir, 'histograms.html')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(page)
+    print(f'  Saved {path}')
+
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1150,6 +1398,7 @@ def main():
         })
 
     dist_stats = _compute_drift_dist_stats(tracks_raw)
+    write_histograms_html(specs, dist_stats, args.output_dir)
     write_edep_index_html(specs, args.output_dir, stats=track_stats,
                           pdf_name=os.path.basename(pdf_path),
                           pixel_counts=pixel_counts,

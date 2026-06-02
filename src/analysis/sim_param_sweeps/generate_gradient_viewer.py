@@ -429,7 +429,14 @@ tr.sel:hover td{background:#BBDEFB}
         <span class="hint">ADC &nbsp;(0 = show all; zeros pixels where |value| &lt; cutoff)</span>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;align-items:start;margin-top:6px">
-        <div id="evd-plot" style="cursor:crosshair"></div>
+        <div style="position:relative">
+          <div id="evd-plot" style="cursor:crosshair"></div>
+          <div id="evd-loading-overlay" style="display:none;position:absolute;top:0;left:0;right:0;bottom:0;
+               min-height:60px;background:rgba(255,255,255,.82);
+               flex-direction:column;align-items:center;justify-content:center;gap:6px;font-size:13px;color:#555">
+            <div class="spinner"></div>Loading…
+          </div>
+        </div>
         <div id="evd-pixel-loss"></div>
         <div id="evd-pixel-grad"></div>
       </div>
@@ -692,13 +699,19 @@ function _ifft1d(re, im) {
   for (let i = 0; i < N; i++) { re[i] /= N; im[i] = -im[i] / N; }
 }
 function _applyFourierCutoff2d(z2d, cutoff) {
+  // Mirror apply_fourier_power_mask / sobolev_loss_single in Python:
+  // pad 128 per side (centered), then zero-pad to next power of 2.
+  const PAD = 128;
   const nw = z2d.length, nt = z2d[0].length;
-  const Pw = _nextPow2(nw), Pt = _nextPow2(nt);
+  const Pw = _nextPow2(nw + 2*PAD), Pt = _nextPow2(nt + 2*PAD);
   const N = Pw * Pt;
   const re = new Float64Array(N), im = new Float64Array(N);
+  // Place signal centered at [PAD, PAD]
   for (let w = 0; w < nw; w++)
-    for (let t = 0; t < nt; t++)
-      re[w * Pt + t] = z2d[w][t];
+    for (let t = 0; t < nt; t++) {
+      const v = z2d[w][t];
+      re[(w + PAD) * Pt + (t + PAD)] = (v === null) ? 0 : v;
+    }
   // Row FFTs
   for (let w = 0; w < Pw; w++) {
     const rR = re.subarray(w*Pt, (w+1)*Pt), rI = im.subarray(w*Pt, (w+1)*Pt);
@@ -711,7 +724,7 @@ function _applyFourierCutoff2d(z2d, cutoff) {
     _fft1d(cR, cI);
     for (let w = 0; w < Pw; w++) { re[w*Pt+t] = cR[w]; im[w*Pt+t] = cI[w]; }
   }
-  // Threshold mask
+  // Threshold mask (power normalised by padded size, matching Python)
   for (let i = 0; i < N; i++) {
     if ((re[i]*re[i] + im[i]*im[i]) / N < cutoff) { re[i] = 0; im[i] = 0; }
   }
@@ -726,10 +739,11 @@ function _applyFourierCutoff2d(z2d, cutoff) {
     const rR = re.subarray(w*Pt, (w+1)*Pt), rI = im.subarray(w*Pt, (w+1)*Pt);
     _ifft1d(rR, rI);
   }
+  // Extract the original region from the center
   const out = [];
   for (let w = 0; w < nw; w++) {
     const row = [];
-    for (let t = 0; t < nt; t++) row.push(re[w*Pt+t]);
+    for (let t = 0; t < nt; t++) row.push(re[(w + PAD)*Pt + (t + PAD)]);
     out.push(row);
   }
   return out;
@@ -856,6 +870,8 @@ let _pIdx             = 0;
 let _evdInited        = false;
 let _evdPreviewInited = false;
 let _uiReady          = false;
+let _evdLastTrack     = null;
+let _evdLastPlane     = null;
 
 function _nextColor() { return _PALETTE[_pIdx++ % _PALETTE.length]; }
 function _ptLabel(pi, pt) { return PARAMS[pi].pt_labels[pt]; }
@@ -865,6 +881,12 @@ function _makeLabel(e) {
 }
 
 /* ── event display ── */
+function _evdSetLoading(on) {
+  const el = document.getElementById('evd-loading-overlay');
+  if (!el) return;
+  el.style.display = on ? 'flex' : 'none';
+}
+
 function _drawEvd() {
   const pi = _evdParamIdx;
   const a  = _dims(pi, _evdTrack, _evdPlane);
@@ -872,6 +894,19 @@ function _drawEvd() {
   const xArr = Array.from({length:a.n_time}, (_,i) => a.time_lo+i);
   const yArr = Array.from({length:a.n_wire}, (_,i) => a.wire_lo+i);
   const pt = Math.max(1, _sweepPt[pi]);
+
+  // Check whether the required JS files are loaded; kick off loading if not.
+  const needGT  = true;
+  const needSim = _evdMode !== 'gt';
+  const gtReady  = _valueLoaded[pi][0];
+  const simReady = !needSim || _valueLoaded[pi][pt];
+  if (!gtReady)  _loadValue(pi, 0);
+  if (!simReady) _loadValue(pi, pt);
+  if (!gtReady || !simReady) {
+    _evdSetLoading(true);
+    return;
+  }
+  _evdSetLoading(false);
 
   let z, titleSuffix;
   if (_evdMode === 'gt') {
@@ -885,7 +920,7 @@ function _drawEvd() {
     titleSuffix = 'Sim−GT @ ' + _ptLabel(pi, pt);
   }
 
-  if (!z.length) return;  // value not yet loaded — skip until VALUE_DATA_READY fires
+  if (!z.length) return;  // data present but plane key missing — skip
 
   const _sfCutoff  = parseFloat(document.getElementById('signal-fourier-cutoff')?.value || '0') || 0;
   const _adcCutoff = parseFloat(document.getElementById('signal-adc-cutoff')?.value   || '0') || 0;
@@ -926,6 +961,8 @@ function _drawEvd() {
   };
 
   const cfg = {responsive:true};
+  const _samePanelAsLast = (_evdLastTrack === _evdTrack && _evdLastPlane === _evdPlane);
+  _evdLastTrack = _evdTrack; _evdLastPlane = _evdPlane;
   if (!_evdInited) {
     Plotly.newPlot('evd-plot', [trace], layout, cfg);
     document.getElementById('evd-plot').on('plotly_click', d => {
@@ -936,6 +973,14 @@ function _drawEvd() {
     });
     _evdInited = true;
   } else {
+    const el = document.getElementById('evd-plot');
+    if (_samePanelAsLast) {
+      const cur = el.layout;
+      if (cur) {
+        if (cur.xaxis && cur.xaxis.range) layout.xaxis = {...(layout.xaxis||{}), range: cur.xaxis.range};
+        if (cur.yaxis && cur.yaxis.range) layout.yaxis = {...(layout.yaxis||{}), range: cur.yaxis.range};
+      }
+    }
     Plotly.react('evd-plot', [trace], layout, cfg);
   }
   _drawEvdPreview();
@@ -1377,6 +1422,8 @@ function _saveState() {
   if (maskEl && parseFloat(maskEl.value) > 0) sp.set('mask', maskEl.value);
   const sfcEl = document.getElementById('signal-fourier-cutoff');
   if (sfcEl && parseFloat(sfcEl.value) > 0) sp.set('sfc', sfcEl.value);
+  const sacEl = document.getElementById('signal-adc-cutoff');
+  if (sacEl && parseFloat(sacEl.value) > 0) sp.set('sac', sacEl.value);
   history.replaceState(null, '', window.location.pathname + '?' + sp.toString());
 }
 
@@ -1441,6 +1488,11 @@ function _restoreFromURL() {
   if (sfc !== null) {
     const el = document.getElementById('signal-fourier-cutoff');
     if (el) el.value = sfc;
+  }
+  const sac = sp.get('sac');
+  if (sac !== null) {
+    const el = document.getElementById('signal-adc-cutoff');
+    if (el) el.value = sac;
   }
   _syncRefInputs();
 }

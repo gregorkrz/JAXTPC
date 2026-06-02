@@ -17,10 +17,10 @@ echo "Syncing $PLOTS_DIR/ ..."
 aws s3 sync "$PLOTS_DIR/" "$BUCKET/plots/" \
   --exclude "1d_gradients/diffusion_debug_*/viewer.html"
 
-echo "Syncing $RESULTS_DIR/ ..."
-aws s3 sync "$RESULTS_DIR/" "$BUCKET/results/" \
-  --exclude "1d_gradients/diffusion_debug_*/*" \
-  --exclude "1d_gradients/cutoff_loss_landscape*" \
+#echo "Syncing $RESULTS_DIR/ ..."
+#aws s3 sync "$RESULTS_DIR/" "$BUCKET/results/" \
+#  --exclude "1d_gradients/diffusion_debug_*/*" \
+#  --exclude "1d_gradients/cutoff_loss_landscape*" \
 
 echo "Syncing done"
 

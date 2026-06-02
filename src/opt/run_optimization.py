@@ -40,7 +40,7 @@ Each pickle contains:
   optimizer, lr, lr_schedule, max_steps, tol, patience, N,
   tol_per_param, patience_per_param  optional; present when coordinate freezing is enabled
   loss_name, tracks,
-  range_lo, range_hi,
+  range_intervals,     list of (lo, hi) factor pairs
   factor_grid,           list of [f1, ...] per trial
   starting_p_n_values,   list of [pn1, ...] per trial
   trials,                list of N dicts:
@@ -60,7 +60,8 @@ Each pickle contains:
 
 import gc
 import sys, os, signal
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))  # repo root (tools.*)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))        # src/ (optlib.*)
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -73,11 +74,7 @@ import shlex
 import tempfile
 import time
 
-try:
-    import wandb as _wandb
-    _WANDB_AVAILABLE = True
-except ImportError:
-    _WANDB_AVAILABLE = False
+# wandb (_wandb, _WANDB_AVAILABLE) imported from optlib.wandb_utils below
 
 import jax
 import jax.numpy as jnp
@@ -101,448 +98,48 @@ from tools.simulation import DetectorSimulator
 
 # ── Constants ──────────────────────────────────────────────────────────────────
 
-# Log per-track loss curves to W&B only below this track count (avoids huge metric cardinality).
-WANDB_PER_TRACK_LOSS_MAX_TRACKS = 50
-GT_LIFETIME_US    = 10_000.0
-GT_VELOCITY_CM_US = 0.160
-SOBOLEV_MAX_PAD   = 128
+from optlib.constants import (  # noqa: E402  (constants live in optlib now)
+    WANDB_PER_TRACK_LOSS_MAX_TRACKS, GT_LIFETIME_US, GT_VELOCITY_CM_US, SOBOLEV_MAX_PAD,
+    CONFIG_PATH, N_SEGMENTS, MAX_ACTIVE_BUCKETS,
+    EFIELD_PARAM, VALID_PARAMS, _BETA_VARIANTS, _BASE_PARAMS,
+    VALID_LOSSES, VALID_OPTIMIZERS, TYPICAL_SCALES, TRACK_PRESETS,
+    ADAM_BETA1, ADAM_BETA2, ADAM_EPS, MOMENTUM, PLANE_NAME_MAP,
+)
+from optlib.paths import (  # noqa: E402
+    make_folder_name, next_result_path,
+    _serialize_opt_state, _safe_pickle_dump, optimization_run_complete,
+)
+from optlib.params import (  # noqa: E402
+    _get_gt_val, _apply_param, make_nparam_setter, build_efield_config,
+)
+from optlib.parsing import (  # noqa: E402
+    parse_args, parse_params, parse_tracks, parse_planes,
+    parse_lr_multipliers, parse_cutoff_per_param, parse_planes_per_param, parse_schedule,
+)
+from optlib.optim import (  # noqa: E402
+    _unpack_batch_fn_ret, _phase_index_at, sum_grad_batches_at_step,
+    burn_in_mean_abs_grad, auto_lr_multipliers_from_grad, make_optax_optimizer,
+)
+from optlib.wandb_utils import (  # noqa: E402
+    _wandb, _WANDB_AVAILABLE,
+    _wandb_track_metric_suffix, _wandb_json_safe, wandb_config_dict,
+    _wandb_sidecar_path, _read_stored_wandb_run_id, _stable_wandb_run_id,
+    _write_wandb_sidecar, _collect_gpu_metrics, _wandb_log_step,
+    fetch_init_params_from_wandb,
+)
 
-CONFIG_PATH        = 'config/cubic_wireplane_config.yaml'
-N_SEGMENTS         = 50_000
-MAX_ACTIVE_BUCKETS = 1000
-#DETECTOR_BOUNDS_MM = ((-300, 300), (-300, 300), (-300, 300))
-
+# JAX compilation cache (side-effectful config stays here).
 _JAX_CACHE_DIR = os.environ.get('JAX_COMPILATION_CACHE_DIR',
                                 os.path.expanduser('/tmp/jax_cache'))
 jax.config.update('jax_compilation_cache_dir', _JAX_CACHE_DIR)
 jax.config.update('jax_persistent_cache_min_compile_time_secs', 1.0)
-_RESULTS_DIR = os.environ.get('RESULTS_DIR', 'results')
-_PLOTS_DIR   = os.environ.get('PLOTS_DIR',   'plots')
 
-VALID_PARAMS = (
-    'velocity_cm_us',
-    'lifetime_us',
-    'diffusion_trans_cm2_us',
-    'diffusion_long_cm2_us',
-    'recomb_alpha',
-    'recomb_beta',
-    'recomb_beta_90',
-    'recomb_R',
-)
+# ── CLI + spec parsing: see optlib.parsing ───────────────────────────────────────
 
-# "All params" = all non-beta params + at least one beta variant (model-specific).
-_BETA_VARIANTS = frozenset({'recomb_beta', 'recomb_beta_90'})
-_BASE_PARAMS   = frozenset(VALID_PARAMS) - _BETA_VARIANTS
-
-VALID_LOSSES     = ('sobolev_loss', 'sobolev_loss_geomean_log1p', 'mse_loss', 'l1_loss')
-VALID_OPTIMIZERS = ('adam', 'sgd', 'momentum_sgd', 'newton')
-
-TYPICAL_SCALES = {
-    'velocity_cm_us':         0.1,
-    'lifetime_us':            10_000.0,
-    'diffusion_trans_cm2_us': 1e-5,
-    'diffusion_long_cm2_us':  1e-5,
-    'recomb_alpha':           1.0,
-    'recomb_beta':            0.2,
-    'recomb_beta_90':         0.2,
-    'recomb_R':               1.0,
-}
-
-# Named track presets: name → (direction_xyz_tuple, momentum_mev)
-TRACK_PRESETS = {
-    'diagonal': ((1.0,  1.0,  1.0),  1000.0),
-    'X':        ((1.0,  0.0,  0.0),  1000.0),
-    'Y':        ((0.0,  1.0,  0.0),  1000.0),
-    'Z':        ((0.0,  0.0,  1.0),  1000.0),
-    'U':        ((0.0,  0.866, 0.5), 1000.0),
-    'V':        ((0.0, -0.866, 0.5), 1000.0),
-    'track2':   ((0.5,  1.05, 0.2),   200.0),
-}
-
-ADAM_BETA1 = 0.9
-ADAM_BETA2 = 0.999
-ADAM_EPS   = 1e-8
-MOMENTUM   = 0.9
-
-# Plane name → global plane indices (0=U1, 1=V1, 2=Y1, 3=U2, 4=V2, 5=Y2)
-PLANE_NAME_MAP = {
-    'U1': (0,), 'V1': (1,), 'Y1': (2,),
-    'U2': (3,), 'V2': (4,), 'Y2': (5,),
-    'U':  (0, 3), 'V': (1, 4), 'Y': (2, 5),
-}
-
-# ── CLI ────────────────────────────────────────────────────────────────────────
-
-def parse_args():
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--params', required=True,
-                   help='Comma-separated params to optimize, e.g. recomb_alpha,recomb_beta_90')
-    p.add_argument('--range', type=float, nargs=2, metavar=('LO', 'HI'), default=(0.95, 1.05),
-                   help='Relative factor range for random starting points (default: 0.95 1.05)')
-    p.add_argument('--tracks', default='diagonal',
-                   help='"+"-separated track presets or name:dx,dy,dz:mom_mev specs '
-                        '("+" separates tracks, "," separates direction components). '
-                        f'Default: diagonal.  Presets: {", ".join(TRACK_PRESETS)}')
-    p.add_argument('--loss', default='sobolev_loss_geomean_log1p', choices=VALID_LOSSES,
-                   help='Loss function (default: sobolev_loss_geomean_log1p)')
-    p.add_argument('--optimizer', default='adam', choices=VALID_OPTIMIZERS,
-                   help='Optimizer (default: adam)')
-    p.add_argument('--lr', type=float, default=0.01,
-                   help='Peak learning rate (default: 0.01)')
-    p.add_argument('--lr-schedule', default='cosine', choices=('constant', 'cosine'),
-                   help='LR schedule: constant or cosine decay over --max-steps (default: constant)')
-    p.add_argument('--max-steps', type=int, default=200,
-                   help='Max gradient steps per trial (default: 200)')
-    p.add_argument('--tol', type=float, default=1e-5,
-                   help='Early-stop relative tolerance on p_n norm (default: 1e-5)')
-    p.add_argument('--patience', type=int, default=20,
-                   help='Steps over which relative change is checked (default: 20)')
-    p.add_argument('--tol-per-param', type=float, default=None,
-                   metavar='TOL',
-                   help='With --patience-per-param: freeze when relative change from t-W to '
-                        'now and every step-to-step change in the window are all < TOL '
-                        '(default: disabled).')
-    p.add_argument('--patience-per-param', type=int, default=None,
-                   metavar='STEPS',
-                   help='Window length W for --tol-per-param: compare to t-W and check each '
-                        'of the W consecutive updates (default: disabled). '
-                        'Set both flags together to enable per-parameter freezing.')
-    p.add_argument('--N', type=int, default=25,
-                   help='Number of random trials (default: 25)')
-    p.add_argument('--results-base', default=_RESULTS_DIR,
-                   help='Base directory; output goes to <results-base>/<folder>/ (default: $RESULTS_DIR or results)')
-    p.add_argument('--seed', type=int, default=None,
-                   help='Master RNG seed (default: random). Seeds everything: '
-                        'trial starting points and GT noise draw. '
-                        'The resolved seed is printed and stored in the pkl.')
-    p.add_argument('--noise-scale', type=float, default=0.0,
-                   help='Noise amplitude as a multiple of the calibrated detector noise '
-                        '(MicroBooNE model, converted to signal units via electrons_per_adc). '
-                        '0.0 = no noise (default), 1.0 = realistic noise. '
-                        'Signal and noise RMS are printed at startup for reference.')
-    p.add_argument('--rotate-noise-seeds', type=int, default=-1,
-                   metavar='N',
-                   help='Cycle through N distinct noise realisations across optimizer steps. '
-                        'At step s the noise seed index is s %% N, so each seed recurs every '
-                        'N steps. -1 (default) disables rotation (same seed every step). '
-                        'Has no effect when --noise-scale 0.')
-    p.add_argument('--warmup-steps', type=int, default=100,
-                   help='Linear LR warmup from 0 to --lr over this many steps '
-                        '(default: 100, set to 0 to disable).')
-    p.add_argument('--clip-grad-norm', type=float, default=10.0,
-                   help='If > 0, rescale the full gradient vector so its L2 norm is at most '
-                        'this value (global norm clip; default: 10.0). Set to 0 to disable.')
-    p.add_argument('--lr-multipliers', default=None,
-                   help='Per-parameter LR multipliers as comma-separated name:factor pairs, '
-                        'e.g. "velocity_cm_us:0.01,lifetime_us:0.1". '
-                        'Unlisted parameters keep multiplier 1.0. '
-                        'Use "auto" to set each multiplier once from |dL/dp| (median-scaled, '
-                        'clipped to [0.01, 10]); see --lr-mult-auto-burn-in-steps. '
-                        'Values are stored in the result pickle for resume.')
-    p.add_argument('--lr-mult-auto-burn-in-steps', type=int, default=100,
-                   help='With --lr-multipliers auto: run this many optimizer steps first '
-                        '(same LR/clip/warmup/schedule as trials, but no per-param grad scaling) '
-                        'and set each multiplier from the mean |dL/dp_i| over those steps, so '
-                        'multi-phase schedules are exercised by step index. '
-                        '0 = use a single summed grad at trial start (step 0). Default: 100.')
-    p.add_argument('--batch-size', type=int, default=1,
-                   help='Number of tracks processed together on GPU per grad call (default: 1). '
-                        'Larger values use vmap to parallelize tracks; try 2–4.')
-    p.add_argument('--effective-batch-size', type=int, default=1,
-                   help='Number of consecutive micro-batches to accumulate before one optimizer '
-                        'update (default: 1). This increases effective batch size without '
-                        'holding all tracks in memory at once.')
-    p.add_argument('--step-size', type=float, default=0.1,
-                   help='Muon track step size in mm (default: 0.1). '
-                        'Larger values reduce deposit count and memory use.')
-    p.add_argument('--max-num-deposits', type=int, default=50_000,
-                   help='Static deposit buffer size passed to the differentiable simulator '
-                        'as n_segments (default: 50000). Must be >= actual deposits per track.')
-    p.add_argument('--num-buckets', type=int, default=1000,
-                   help='Max active buckets for non-differentiable bucketed accumulation '
-                        '(default: 1000). Increase if you see bucket overflow warnings.')
-    p.add_argument('--schedule-steps', default=None,
-                   help='Comma-separated step thresholds that divide optimization into phases '
-                        '(e.g. "1000" → 2 phases; "1000,5000" → 3 phases).')
-    p.add_argument('--schedule-step-sizes', default=None,
-                   help='Comma-separated step sizes in mm, one per phase (e.g. "1.0,0.1").')
-    p.add_argument('--schedule-deposits', default=None,
-                   help='Comma-separated max-num-deposits, one per phase (e.g. "5000,50000").')
-    p.add_argument('--schedule-batch-sizes', default=None,
-                   help='Comma-separated batch sizes, one per phase (e.g. "5,1").')
-    p.add_argument('--gt-step-size', type=float, default=0.1,
-                   help='Step size in mm used to generate GT signals (default: 0.1). '
-                        'Independent of the forward simulation schedule.')
-    p.add_argument('--gt-max-deposits', type=int, default=50_000,
-                   help='Static deposit buffer for the GT simulator (default: 50000). '
-                        'Must be >= actual deposits per track at --gt-step-size.')
-    p.add_argument('--no-wandb', action='store_true',
-                   help='Disable Weights & Biases logging (enabled by default).')
-    p.add_argument('--wandb-project', default='jaxtpc-optimization',
-                   help='W&B project name (default: jaxtpc-optimization).')
-    p.add_argument('--wandb-tags', default=None,
-                   help='Comma-separated W&B run tags (e.g. "sched_v2,fine_stage").')
-    p.add_argument('--log-interval', type=int, default=50,
-                   help='Log to W&B every this many steps (default: 50).')
-    p.add_argument('--newton-damping', type=float, default=1e-3,
-                   help='Damping for Newton optimizer (lambda in H + lambda*I). Default 1e-3.')
-    p.add_argument('--adam-beta2', type=float, default=ADAM_BETA2,
-                   help=f'Adam beta2 (second-moment decay). Default {ADAM_BETA2}.')
-    p.add_argument('--init-from-wandb-run', default=None, metavar='RUN_ID',
-                   help='Start trial 0 from param values of an existing W&B run '
-                        '(fetches params/<name>_physical). '
-                        'Remaining trials use random starts as usual.')
-    p.add_argument('--init-from-wandb-step', type=int, default=-1, metavar='STEP',
-                   help='Step to read from --init-from-wandb-run. '
-                        '-1 (default) uses the run summary (last logged value). '
-                        'A non-negative value fetches that exact logged step.')
-    p.add_argument('--gt-param-multiplier', type=float, default=1.0,
-                   help='Multiply all optimized GT parameter values by this factor before '
-                        'generating the reference signal (default: 1.0, i.e. no shift). '
-                        'Use 1.2 to shift the true parameters 20%% upward.')
-    p.add_argument('--gt-lifetime-us', type=float, default=None,
-                   help='Override the GT electron lifetime in μs (default: use GT_LIFETIME_US '
-                        f'= {GT_LIFETIME_US:.0f} μs). E.g. 6000 for 6 ms.')
-    p.add_argument('--sobolev-exponent', type=float, default=2.0,
-                   help='Sobolev exponent s passed to make_sobolev_weight (default: 2.0). '
-                        'Higher values penalise high-frequency components more strongly.')
-    p.add_argument('--freq-cutoff', type=float, default=None,
-                   help='Hard high-frequency cutoff for Sobolev weights, in normalised units '
-                        '(0, 0.5]. Frequencies with |f| > cutoff (L2 norm) are zeroed. '
-                        'None disables (default).')
-    p.add_argument('--freq-cutoff-per-param', default=None,
-                   help='Per-parameter freq cutoff: "param1:cutoff1,param2:cutoff2". '
-                        'Params not listed use --freq-cutoff (default None = no cutoff). '
-                        'Not compatible with --optimizer newton.')
-    p.add_argument('--fourier-cutoff', type=float, default=0.0,
-                   help='Signal-power Fourier cutoff (ADC²): zero spectral bins where '
-                        '|FFT(gt)|^2/N < cutoff. Same convention as 1d_gradients.py. '
-                        '0 disables (default).')
-    p.add_argument('--fourier-cutoff-per-param', default=None,
-                   help='Per-parameter Fourier power cutoff: "param1:cutoff1,param2:cutoff2". '
-                        'Params not listed use --fourier-cutoff (default 0 = no cutoff). '
-                        'Not compatible with --optimizer newton.')
-    p.add_argument('--sobolev-loss-cutoff', type=float, default=0.0,
-                   help='ADC cutoff: zero out pixels where |gt| < cutoff before computing loss '
-                        '(default: 0.0, no cutoff). Applied to both sim and gt signals.')
-    p.add_argument('--sobolev-loss-cutoff-per-param', default=None,
-                   help='Per-parameter ADC cutoff: "param1:cutoff1,param2:cutoff2". '
-                        'Params not listed use --sobolev-loss-cutoff (default 0.0). '
-                        'Each param\'s gradient is computed from a loss masked with its own cutoff. '
-                        'Not compatible with --optimizer newton.')
-    p.add_argument('--planes-per-param', default=None,
-                   help='Per-parameter active planes: "param1:Y1,Y2%%param2:U1,V1". '
-                        'Uses "%%" as outer separator (between param entries) and ":" between '
-                        'param name and plane spec. Planes spec uses the same format as --planes. '
-                        'Params not listed use --planes (default: all planes). '
-                        'Not compatible with --optimizer newton.')
-    p.add_argument('--start-position-mm', default='0,0,0',
-                   help='Track start position as "x,y,z" in mm, applied to all tracks '
-                        '(default: 0,0,0)')
-    p.add_argument('--planes', default=None,
-                   help='Comma-separated plane names or indices to include in the loss '
-                        '(default: all planes). Names: U1,V1,Y1 (vol 0) / U2,V2,Y2 (vol 1); '
-                        'U,V,Y selects both volumes. Integer indices 0-5 also accepted. '
-                        'Example: --planes V1,V2')
-    return p.parse_args()
+# ── Folder name + result path: see optlib.paths ─────────────────────────────────
 
 
-# ── Parsing ────────────────────────────────────────────────────────────────────
-
-def parse_params(params_str):
-    names = [n.strip() for n in params_str.split(',') if n.strip()]
-    if not names:
-        raise ValueError('--params is empty')
-    for name in names:
-        if name not in VALID_PARAMS:
-            raise ValueError(f'Unknown param {name!r}. Choose from: {VALID_PARAMS}')
-    if len(names) != len(set(names)):
-        raise ValueError('Duplicate param names in --params')
-    return names
-
-
-def parse_tracks(tracks_str):
-    """Parse '+'-separated preset names or name:dx,dy,dz:mom_mev[:x,y,z] specs.
-
-    '+' separates tracks; ',' is used only inside direction/position components.
-    Mixed input is supported, e.g. 'diagonal+mytrack:0.1,0.2,0.9:500'.
-    Optional 4th field 'x,y,z' sets a per-track start position in mm.
-    Returns list of dicts: {name, direction (tuple), momentum_mev, start_position_mm (tuple or None)}.
-    """
-    specs = []
-    for item in tracks_str.split('+'):
-        item = item.strip()
-        if not item:
-            continue
-        if ':' in item:
-            # Full spec: name:dx,dy,dz:momentum_mev[:x,y,z]
-            parts = item.split(':')
-            if len(parts) not in (3, 4):
-                raise ValueError(
-                    f'Custom track must be name:dx,dy,dz:momentum_mev or '
-                    f'name:dx,dy,dz:momentum_mev:x,y,z, got {item!r}')
-            name = parts[0].strip()
-            try:
-                direction = tuple(float(x) for x in parts[1].split(','))
-            except ValueError:
-                raise ValueError(f'Bad direction in track spec {item!r}')
-            if len(direction) != 3:
-                raise ValueError(f'Direction must have 3 components in {item!r}')
-            try:
-                momentum_mev = float(parts[2])
-            except ValueError:
-                raise ValueError(f'Bad momentum in track spec {item!r}')
-            start_position_mm = None
-            if len(parts) == 4:
-                try:
-                    start_position_mm = tuple(float(x) for x in parts[3].split(','))
-                except ValueError:
-                    raise ValueError(f'Bad start position in track spec {item!r}')
-                if len(start_position_mm) != 3:
-                    raise ValueError(f'Start position must have 3 components in {item!r}')
-            specs.append(dict(name=name, direction=direction, momentum_mev=momentum_mev,
-                               start_position_mm=start_position_mm))
-        else:
-            # Preset name
-            if item not in TRACK_PRESETS:
-                raise ValueError(
-                    f'Unknown track preset {item!r}. '
-                    f'Known: {list(TRACK_PRESETS)}. '
-                    f'Use name:dx,dy,dz:mom_mev for custom tracks.')
-            direction, momentum_mev = TRACK_PRESETS[item]
-            specs.append(dict(name=item, direction=direction, momentum_mev=momentum_mev,
-                               start_position_mm=None))
-    if not specs:
-        raise ValueError('--tracks produced no entries')
-    return specs
-
-
-def parse_planes(planes_str, n_planes=6):
-    """Parse comma-separated plane names/indices into a sorted tuple of global plane indices.
-
-    Names: U1,V1,Y1 (volume 0) / U2,V2,Y2 (volume 1); U,V,Y expand to both volumes.
-    Integer indices 0-5 are also accepted.  None/empty string → all planes.
-    """
-    if not planes_str:
-        return tuple(range(n_planes))
-    indices: set = set()
-    for tok in planes_str.split(','):
-        tok = tok.strip()
-        if not tok:
-            continue
-        if tok in PLANE_NAME_MAP:
-            indices.update(PLANE_NAME_MAP[tok])
-        elif tok.lstrip('-').isdigit():
-            idx = int(tok)
-            if not (0 <= idx < n_planes):
-                raise ValueError(f'Plane index {idx} out of range (0-{n_planes - 1})')
-            indices.add(idx)
-        else:
-            raise ValueError(
-                f'Unknown plane {tok!r}. Known names: {sorted(PLANE_NAME_MAP)}, '
-                f'or use integer indices 0-{n_planes - 1}.')
-    if not indices:
-        raise ValueError('--planes produced no entries')
-    return tuple(sorted(indices))
-
-
-# ── Folder name ────────────────────────────────────────────────────────────────
-
-def make_folder_name(param_names, track_specs, loss_name, optimizer, lr,
-                     lr_schedule, max_steps, N, range_lo, range_hi,
-                     noise_scale=0.0, step_size=0.1, max_num_deposits=50_000, n_phases=1,
-                     active_planes=None):
-    _is_all = (_BASE_PARAMS <= frozenset(param_names) and
-               bool(frozenset(param_names) & _BETA_VARIANTS))
-    params_tag = 'all_params' if _is_all else '+'.join(param_names)
-    tracks_tag = (f'{len(track_specs)}tracks' if len(track_specs) >= 6
-                  else '+'.join(t['name'] for t in track_specs))
-    sched_tag     = '_cosine' if lr_schedule == 'cosine' else ''
-    range_tag     = f'r{range_lo:.3g}_{range_hi:.3g}'.replace('.', 'p')
-    noise_tag     = f'_noise{noise_scale:.3g}'.replace('.', 'p') if noise_scale > 0.0 else ''
-    ss_tag        = f'_ss{step_size:.3g}'.replace('.', 'p') if step_size != 0.1 else ''
-    dep_tag       = f'_dep{max_num_deposits // 1000}k' if max_num_deposits != 50_000 else ''
-    phase_tag     = f'_sched{n_phases}' if n_phases > 1 else ''
-    _all_planes   = tuple(range(6))
-    planes_tag    = (f'_planes{"".join(str(p) for p in active_planes)}'
-                     if active_planes is not None and tuple(active_planes) != _all_planes else '')
-    return (f'{params_tag}__{tracks_tag}__{loss_name}__'
-            f'{optimizer}_lr{lr}{sched_tag}_s{max_steps}_N{N}_{range_tag}'
-            f'{noise_tag}{ss_tag}{dep_tag}{phase_tag}{planes_tag}')
-
-
-def next_result_path(folder, seed=None):
-    """Return the output pkl path inside folder.
-
-    If seed is given: results/<folder>/result_<seed>.pkl (fixed, deterministic).
-    If seed is None:  results/<folder>/result_0.pkl, result_1.pkl, ... (first unused).
-    """
-    os.makedirs(folder, exist_ok=True)
-    if seed is not None:
-        return os.path.join(folder, f'result_{seed}.pkl')
-    i = 0
-    while True:
-        path = os.path.join(folder, f'result_{i}.pkl')
-        if not os.path.exists(path):
-            return path
-        i += 1
-
-
-# ── Physics helpers (mirrors 2d_opt.py) ───────────────────────────────────────
-
-def _get_gt_val(param_name, gt_params, recomb_model):
-    rp = gt_params.recomb_params
-    if param_name == 'velocity_cm_us':         return float(gt_params.velocity_cm_us)
-    if param_name == 'lifetime_us':            return float(gt_params.lifetime_us)
-    if param_name == 'diffusion_trans_cm2_us': return float(gt_params.diffusion_trans_cm2_us)
-    if param_name == 'diffusion_long_cm2_us':  return float(gt_params.diffusion_long_cm2_us)
-    if param_name == 'recomb_alpha':           return float(rp.alpha)
-    if param_name == 'recomb_beta':
-        if recomb_model != 'modified_box':
-            raise ValueError('recomb_beta requires modified_box model')
-        return float(rp.beta)
-    if param_name == 'recomb_beta_90':
-        if recomb_model != 'emb':
-            raise ValueError('recomb_beta_90 requires emb model')
-        return float(rp.beta_90)
-    if param_name == 'recomb_R':
-        if recomb_model != 'emb':
-            raise ValueError('recomb_R requires emb model')
-        return float(rp.R)
-    raise ValueError(f'Unknown param {param_name!r}')
-
-
-def _apply_param(param_name, value, sim_params):
-    rp = sim_params.recomb_params
-    if param_name == 'velocity_cm_us':         return sim_params._replace(velocity_cm_us=value)
-    if param_name == 'lifetime_us':            return sim_params._replace(lifetime_us=value)
-    if param_name == 'diffusion_trans_cm2_us': return sim_params._replace(diffusion_trans_cm2_us=value)
-    if param_name == 'diffusion_long_cm2_us':  return sim_params._replace(diffusion_long_cm2_us=value)
-    if param_name == 'recomb_alpha':           return sim_params._replace(recomb_params=rp._replace(alpha=value))
-    if param_name == 'recomb_beta':            return sim_params._replace(recomb_params=rp._replace(beta=value))
-    if param_name == 'recomb_beta_90':         return sim_params._replace(recomb_params=rp._replace(beta_90=value))
-    if param_name == 'recomb_R':               return sim_params._replace(recomb_params=rp._replace(R=value))
-    raise ValueError(f'Unknown param {param_name!r}')
-
-
-def make_nparam_setter(param_names, gt_params, recomb_model):
-    """Return (setter, gt_vals, scales, p_n_gts) for any number of params.
-
-    setter(p_n_vec) -> SimParams  where p_n_vec[i] = physical_val[i] / scales[i]
-    """
-    scales  = [TYPICAL_SCALES[n] for n in param_names]
-    gt_vals = [_get_gt_val(n, gt_params, recomb_model) for n in param_names]
-    # q[i] = log(physical[i] / scale[i]);  physical[i] = exp(q[i]) * scale[i]
-    p_n_gts = [float(np.log(v / s)) for v, s in zip(gt_vals, scales)]
-
-    def setter(p_n_vec):
-        params = gt_params
-        for i, name in enumerate(param_names):
-            params = _apply_param(name, jnp.exp(p_n_vec[i]) * scales[i], params)
-        return params
-
-    return setter, gt_vals, scales, p_n_gts
+# ── Physics / param helpers: see optlib.params ───────────────────────────────────
 
 
 # ── Loss builder ───────────────────────────────────────────────────────────────
@@ -750,371 +347,12 @@ def build_phase_fns(loss_name, simulator, setter, batches, *, return_per_track_l
 
 # ── Optimizer factory ──────────────────────────────────────────────────────────
 
-def _unpack_batch_fn_ret(ret):
-    if len(ret) == 3:
-        return ret[0], ret[1], ret[2]
-    lv, gv = ret
-    return lv, gv, None
-
-
-def _phase_index_at(step, phase_schedule):
-    for ph_idx, (until_step, _) in enumerate(phase_schedule):
-        if step < until_step:
-            return ph_idx
-    return len(phase_schedule) - 1
-
-
-def sum_grad_batches_at_step(p0, phase_schedule, start_step):
-    """Sum ∂L/∂p over all batches for the phase active at ``start_step`` (same convention as run_trial)."""
-    p = jnp.asarray(p0, dtype=jnp.float32)
-    ph_idx = _phase_index_at(start_step, phase_schedule)
-    _, build_fn = phase_schedule[ph_idx]
-    fns = build_fn(p)
-    gv_acc = jnp.zeros_like(p)
-    for fn in fns:
-        lv, gv, _ = _unpack_batch_fn_ret(fn(p))
-        jax.block_until_ready((lv, gv))
-        gv_acc = gv_acc + gv
-    return gv_acc
-
-
-def burn_in_mean_abs_grad(p0, phase_schedule, optimizer, burn_in_steps, effective_batch_size=1):
-    """Run ``burn_in_steps`` trial-like optimizer steps and return mean |∂L/∂p| per coordinate.
-
-    Uses the same phase-vs-step indexing as ``run_trial`` (so schedule boundaries apply).
-    ``optimizer`` should be built **without** per-param LR multipliers (uniform scaling).
-
-    Returns:
-        mean_abs: JAX vector, time-average of |grad| over the burn-in window
-        steps_used: int, number of steps actually run (``burn_in_steps``)
-    """
-    n_steps = int(burn_in_steps)
-    eff_bs = int(effective_batch_size)
-    if n_steps <= 0:
-        raise ValueError('burn_in_mean_abs_grad: burn_in_steps must be positive')
-    if eff_bs < 1:
-        raise ValueError('burn_in_mean_abs_grad: effective_batch_size must be >= 1')
-    p = jnp.asarray(p0, dtype=jnp.float32)
-    opt_state = optimizer.init(p)
-    _cur_ph_idx = [-1]
-    _cur_fns = [None]
-
-    def _get_fns(ph_idx, p_):
-        if ph_idx != _cur_ph_idx[0]:
-            _cur_fns[0] = None
-            _cur_ph_idx[0] = ph_idx
-            _, build_fn = phase_schedule[ph_idx]
-            _cur_fns[0] = build_fn(p_)
-        return _cur_fns[0]
-
-    def _phase_at(step, p_):
-        ph_idx = _phase_index_at(step, phase_schedule)
-        return ph_idx, _get_fns(ph_idx, p_)
-
-    sum_abs = jnp.zeros_like(p)
-    for step in range(n_steps):
-        _, batch_fns = _phase_at(step, p)
-        gv_acc = jnp.zeros_like(p)
-        for micro in range(eff_bs):
-            batch_idx = (step * eff_bs + micro) % len(batch_fns)
-            fn = batch_fns[batch_idx]
-            lv, gv, _ = _unpack_batch_fn_ret(fn(p))
-            jax.block_until_ready((lv, gv))
-            sum_abs = sum_abs + jnp.abs(gv)
-            gv_acc = gv_acc + gv
-        gv_eff = gv_acc / float(eff_bs)
-        updates, opt_state = optimizer.update(gv_eff, opt_state)
-        p = optax.apply_updates(p, updates)
-
-    mean_abs = sum_abs / float(n_steps * eff_bs)
-    return mean_abs, n_steps
-
-
-def auto_lr_multipliers_from_grad(gv):
-    """Per-parameter scales from per-coordinate sensitivity (non-negative).
-
-    sens_i = |v_i| (typically v = ∂L/∂p or a time-mean thereof), then
-    lr_mult_i = clip(median(sens) / (sens_i + 1e-8), 0.01, 10).
-
-    Returns (multipliers list, median(sens), list of sens_i per param).
-    """
-    sens = jnp.abs(gv)
-    med = jnp.median(sens)
-    mult = jnp.clip(med / (sens + 1e-8), 0.01, 10.0)
-    mult_list = [float(x) for x in mult]
-    sens_list = [float(x) for x in sens]
-    return mult_list, float(med), sens_list
-
-
-def parse_lr_multipliers(spec, param_names):
-    """Parse 'name:factor,...' string into a per-parameter scale vector (length = len(param_names)).
-
-    Unlisted parameters default to 1.0.
-    """
-    scales = [1.0] * len(param_names)
-    if not spec:
-        return scales
-    if spec.strip().lower() == 'auto':
-        raise ValueError('parse_lr_multipliers: use resolve path for "auto" (caller handles this)')
-    for item in spec.split(','):
-        item = item.strip()
-        if not item:
-            continue
-        name, factor = item.split(':')
-        name = name.strip()
-        if name not in param_names:
-            raise ValueError(f'--lr-multipliers: unknown param {name!r}. Known: {param_names}')
-        scales[param_names.index(name)] = float(factor)
-    return scales
-
-
-def parse_cutoff_per_param(spec, param_names, default_cutoff=0.0):
-    """Parse 'name:cutoff,...' into a per-parameter cutoff list (length = len(param_names)).
-
-    Unlisted parameters default to default_cutoff.
-    """
-    cutoffs = [default_cutoff] * len(param_names)
-    if not spec:
-        return cutoffs
-    for item in spec.split(','):
-        item = item.strip()
-        if not item:
-            continue
-        parts = item.split(':')
-        if len(parts) != 2:
-            raise ValueError(
-                f'--sobolev-loss-cutoff-per-param: bad spec {item!r} (expected name:cutoff)')
-        name, val = parts[0].strip(), parts[1].strip()
-        if name not in param_names:
-            raise ValueError(
-                f'--sobolev-loss-cutoff-per-param: unknown param {name!r}. Known: {param_names}')
-        cutoffs[param_names.index(name)] = float(val)
-    return cutoffs
-
-
-def parse_planes_per_param(spec, param_names, n_planes=6, default_planes=None):
-    """Parse 'param1:Y1,Y2%param2:U1,V1' into per-parameter active_planes tuples.
-
-    Uses '%' as outer separator (between param entries) and ':' between name and plane spec.
-    The plane spec itself uses ',' (same format as --planes).
-    Params not listed default to default_planes (None = all planes).
-    Returns a list of (sorted tuple of int) or None, one entry per param.
-    """
-    result = [default_planes] * len(param_names)
-    if not spec:
-        return result
-    for entry in spec.split('%'):
-        entry = entry.strip()
-        if not entry:
-            continue
-        if ':' not in entry:
-            raise ValueError(
-                f'--planes-per-param: bad entry {entry!r} (expected param_name:plane_spec)')
-        name, planes_str = entry.split(':', 1)
-        name = name.strip()
-        if name not in param_names:
-            raise ValueError(
-                f'--planes-per-param: unknown param {name!r}. Known: {param_names}')
-        result[param_names.index(name)] = parse_planes(planes_str.strip(), n_planes=n_planes)
-    return result
-
-
-def parse_schedule(args):
-    """Return a list of phase dicts: {step_size, max_num_deposits, batch_size, until_step}.
-
-    Single-phase (no --schedule-steps) returns a one-element list using the
-    top-level --step-size / --max-num-deposits / --batch-size values.
-    """
-    if args.schedule_steps is None:
-        return [dict(step_size=args.step_size,
-                     max_num_deposits=args.max_num_deposits,
-                     batch_size=args.batch_size,
-                     until_step=args.max_steps)]
-
-    thresholds = [int(x.strip()) for x in args.schedule_steps.split(',')]
-    n_phases   = len(thresholds) + 1
-
-    def _csv(s, typ, default):
-        if s is None:
-            return [typ(default)] * n_phases
-        vals = [typ(x.strip()) for x in s.split(',')]
-        if len(vals) != n_phases:
-            raise ValueError(
-                f'Expected {n_phases} comma-separated values (got {len(vals)}): {s!r}')
-        return vals
-
-    step_sizes  = _csv(args.schedule_step_sizes,  float, args.step_size)
-    deposits    = _csv(args.schedule_deposits,     int,   args.max_num_deposits)
-    batch_sizes = _csv(args.schedule_batch_sizes,  int,   args.batch_size)
-
-    until_steps = thresholds + [args.max_steps]
-    return [dict(step_size=ss, max_num_deposits=dep, batch_size=bs, until_step=us)
-            for ss, dep, bs, us in zip(step_sizes, deposits, batch_sizes, until_steps)]
-
-
-def _scale_by_vector(scales):
-    """Optax transform that element-wise multiplies gradients by a fixed scale vector."""
-    scales_arr = jnp.array(scales, dtype=jnp.float32)
-    def init_fn(params):
-        return ()
-    def update_fn(updates, state, params=None):
-        return updates * scales_arr, state
-    return optax.GradientTransformation(init_fn, update_fn)
-
-
-def make_optax_optimizer(optimizer_name, lr, lr_schedule, max_steps, clip_grad_norm=0.0,
-                         warmup_steps=0, lr_multipliers=None, adam_beta2=ADAM_BETA2):
-    if warmup_steps > 0:
-        warmup = optax.linear_schedule(init_value=0.0, end_value=lr, transition_steps=warmup_steps)
-        if lr_schedule == 'cosine':
-            post = optax.cosine_decay_schedule(init_value=lr, decay_steps=max_steps - warmup_steps)
-        else:
-            post = optax.constant_schedule(lr)
-        schedule = optax.join_schedules([warmup, post], boundaries=[warmup_steps])
-    elif lr_schedule == 'cosine':
-        schedule = optax.cosine_decay_schedule(init_value=lr, decay_steps=max_steps)
-    else:
-        schedule = lr
-    if optimizer_name == 'adam':         base = optax.adam(schedule, b1=ADAM_BETA1, b2=adam_beta2, eps=ADAM_EPS)
-    elif optimizer_name == 'sgd':          base = optax.sgd(schedule)
-    elif optimizer_name == 'momentum_sgd': base = optax.sgd(schedule, momentum=MOMENTUM)
-    elif optimizer_name == 'newton':
-        raise ValueError(
-            'Newton optimizer bypasses optax entirely — do not call make_optax_optimizer for newton')
-    else: raise ValueError(f'Unknown optimizer {optimizer_name!r}')
-    transforms = []
-    if lr_multipliers is not None and any(s != 1.0 for s in lr_multipliers):
-        transforms.append(_scale_by_vector(lr_multipliers))
-    if clip_grad_norm > 0.0:
-        transforms.append(optax.clip_by_global_norm(clip_grad_norm))
-    transforms.append(base)
-    tx = optax.chain(*transforms)
-    # Wrap schedule in a callable so callers can query lr at any step
-    schedule_fn = schedule if callable(schedule) else (lambda _s, _lr=schedule: _lr)
-    return tx, schedule_fn
-
+# (optimizer/LR/burn-in helpers moved to optlib.optim)
 
 # ── Trial runner ───────────────────────────────────────────────────────────────
 
-def _serialize_opt_state(opt_state):
-    """Convert JAX arrays in optax state to numpy arrays for pickling."""
-    return jax.tree_util.tree_map(np.asarray, opt_state)
 
-
-def _safe_pickle_dump(path, obj):
-    """Write pickle atomically so interrupted writes do not leave truncated pkls."""
-    path = os.path.abspath(path)
-    out_dir = os.path.dirname(path)
-    os.makedirs(out_dir, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix=".result_", suffix=".tmp", dir=out_dir)
-    try:
-        with os.fdopen(fd, "wb") as f:
-            pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, path)
-    except BaseException:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-
-
-def _wandb_track_metric_suffix(track_name):
-    """Fragment safe for use inside W&B metric keys."""
-    return str(track_name).replace('/', '_').replace(' ', '_')
-
-
-def _wandb_json_safe(value):
-    """Convert values for wandb.init(config=...) / JSON-ish summaries."""
-    if isinstance(value, tuple):
-        return [_wandb_json_safe(v) for v in value]
-    if isinstance(value, list):
-        return [_wandb_json_safe(v) for v in value]
-    if isinstance(value, dict):
-        return {str(k): _wandb_json_safe(v) for k, v in value.items()}
-    if isinstance(value, (bool, int, float, str)) or value is None:
-        return value
-    return str(value)
-
-
-def wandb_config_dict(args, *, param_names, track_specs, schedule, effective_seed,
-                      output_path, wandb_tag_list, argv_cmd):
-    """Full CLI snapshot plus derived fields for W&B run config."""
-    cfg = {k: _wandb_json_safe(v) for k, v in vars(args).items()}
-    cfg.update(
-        effective_seed=effective_seed,
-        command=argv_cmd,
-        param_names=param_names,
-        track_names=[t['name'] for t in track_specs],
-        schedule_phases=[_wandb_json_safe(ph) for ph in schedule],
-        output_path=output_path,
-        jax_compilation_cache_dir=jax.config.jax_compilation_cache_dir,
-        wandb_tags=wandb_tag_list or None,
-    )
-    return cfg
-
-
-def _wandb_sidecar_path(output_dir, seed):
-    return os.path.join(output_dir, f'.wandb_run_id_{seed}')
-
-
-def _read_stored_wandb_run_id(output_dir, seed, existing_result):
-    if existing_result:
-        rid = existing_result.get('wandb_run_id')
-        if isinstance(rid, str) and rid.strip():
-            return rid.strip()
-    path = _wandb_sidecar_path(output_dir, seed)
-    if os.path.isfile(path):
-        try:
-            with open(path, encoding='utf-8') as f:
-                s = f.read().strip()
-                return s or None
-        except OSError:
-            return None
-    return None
-
-
-def _stable_wandb_run_id(project, folder_name, seed):
-    """Deterministic W&B run id when none was persisted (legacy checkpoints)."""
-    digest = hashlib.sha256(f'{project}:{folder_name}:{seed}'.encode()).hexdigest()
-    return digest[:12]
-
-
-def _write_wandb_sidecar(output_dir, seed, run_id):
-    if not run_id:
-        return
-    os.makedirs(output_dir, exist_ok=True)
-    path = _wandb_sidecar_path(output_dir, seed)
-    with open(path, 'w', encoding='utf-8') as f:
-        f.write(run_id)
-
-
-def optimization_run_complete(data, min_steps=2000):
-    """Return True when all N trials are present (nothing left to optimize).
-
-    ``run_complete`` is only written on clean shutdown and is **not** required here:
-    treating ``run_complete=False`` after SIGTERM even though ``trials`` is full
-    used to queue redundant Slurm jobs (duplicate W&B runs).
-
-    Also returns True when a live_checkpoint exists with more than ``min_steps``
-    steps, treating SIGTERM'd mid-trial runs as effectively complete.
-    """
-    trials = data.get("trials")
-    if trials is None:
-        return False
-    n_expected = data.get("N")
-    if not isinstance(n_expected, int) or n_expected < 0:
-        return False
-    live_ckpt = data.get("live_checkpoint")
-    if live_ckpt and live_ckpt.get("step", 0) > min_steps:
-        return True
-    if len(trials) < n_expected:
-        return False
-    if live_ckpt:
-        return False
-    return True
+# (W&B config/sidecar/run-id helpers moved to optlib.wandb_utils)
 
 
 def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
@@ -1128,7 +366,8 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
               effective_batch_size=1,
               newton_damping=None,
               clip_grad_norm=0.0,
-              rotating_phase_schedules=None):
+              rotating_phase_schedules=None,
+              n_record_coords=None):
     """Run one optimization trial from starting p_n vector p0 (any length).
 
     phase_schedule: list of (until_step, build_fn) sorted by until_step.
@@ -1167,6 +406,14 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
 
     freeze_enabled = tol_per_param is not None and patience_per_param is not None
     n_dim = int(p.shape[0])
+    # Coordinates recorded in the param/grad trajectories. When optimizing an MLP
+    # (Efield), only the leading scalar coords are recorded to keep pickles small;
+    # the full vector is still saved via checkpoints and `final_p`.
+    n_rec = int(n_record_coords) if n_record_coords is not None else n_dim
+    n_rec = max(0, min(n_rec, n_dim))
+    # Per-param features (freezing, wandb) only apply to named (scalar) coords.
+    n_named = len(param_names) if param_names is not None else n_dim
+    n_named = min(n_named, n_dim)
     frozen_np = np.zeros(n_dim, dtype=bool)
     if freeze_enabled and initial_frozen_mask is not None:
         fm = np.asarray(initial_frozen_mask, dtype=bool).reshape(-1)
@@ -1248,15 +495,15 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
             for loc_i, (gi, nm) in enumerate(groups):
                 sk = _wandb_track_metric_suffix(nm)
                 wandb_track_extra_init[f'loss/track/{gi}_{sk}'] = float(pt_np[loc_i])
-    param_traj.append(p.tolist())
+    param_traj.append(p[:n_rec].tolist())
     loss_traj.append(lv_init)
-    grad_traj.append(gv_init.tolist())
+    grad_traj.append(gv_init[:n_rec].tolist())
 
     # Skip initial W&B row when resuming — that step was already logged before checkpoint.
     if use_wandb and _WANDB_AVAILABLE and start_step == 0:
         extra0 = dict(wandb_track_extra_init or {})
         if freeze_enabled and param_names is not None:
-            for i in range(n_dim):
+            for i in range(n_named):
                 extra0[f'freeze/{param_names[i]}'] = (1.0 if frozen_np[i] else 0.0)
         _wandb_log_step(start_step, lv_init, gv_init, p, param_names, scales, p_n_gts,
                         step_time_s=0.0, trial_idx=trial_idx, schedule_fn=schedule_fn,
@@ -1327,9 +574,9 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
             jax.block_until_ready((lv_new, gv_new))
         step_time = time.time() - step_start
 
-        param_traj.append(p.tolist())
+        param_traj.append(p[:n_rec].tolist())
         loss_traj.append(float(lv_new))
-        grad_traj.append(gv_new.tolist())
+        grad_traj.append(gv_new[:n_rec].tolist())
 
         if use_wandb and _WANDB_AVAILABLE and wandb_track_batch_groups is not None and pt_new is not None:
             groups = wandb_track_batch_groups[ph_idx][last_batch_idx]
@@ -1343,7 +590,7 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
         if freeze_enabled and len(param_traj) > patience_per_param:
             W = patience_per_param
             frozen_names = []
-            for i in range(n_dim):
+            for i in range(n_named):
                 if frozen_np[i]:
                     continue
                 if _per_param_freeze_ok(param_traj, i, W, tol_per_param):
@@ -1353,11 +600,11 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
             if frozen_names:
                 print(f'\n    [freeze @{step + 1}] {", ".join(frozen_names)}', flush=True)
 
-        if freeze_enabled and frozen_np.all():
+        if freeze_enabled and n_named > 0 and frozen_np[:n_named].all():
             stopped_early = True
             break
 
-        if len(param_traj) > patience:
+        if n_rec > 0 and len(param_traj) > patience:
             p_now  = np.array(param_traj[-1])
             p_prev = np.array(param_traj[-1 - patience])
             rel = np.linalg.norm(p_now - p_prev) / (np.linalg.norm(p_prev) + 1e-30)
@@ -1371,7 +618,7 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
                 if freeze_enabled and param_names is not None:
                     freeze_metrics = {
                         f'freeze/{param_names[i]}': (1.0 if frozen_np[i] else 0.0)
-                        for i in range(n_dim)}
+                        for i in range(n_named)}
                 _wandb_log_step(step + 1, float(lv_new), gv_new, p,
                                 param_names, scales, p_n_gts,
                                 step_time_s=step_time, trial_idx=trial_idx,
@@ -1393,6 +640,7 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
         stopped_early    = stopped_early,
         steps_run        = len(param_traj) - 1,
         final_opt_state  = (_serialize_opt_state(opt_state) if opt_state is not None else None),
+        final_p          = np.asarray(p).tolist(),  # full vector incl. any MLP block
     )
     if freeze_enabled:
         out['frozen_mask_final'] = frozen_np.tolist()
@@ -1401,75 +649,7 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
     return out
 
 
-def _collect_gpu_metrics():
-    """Collect GPU utilization and memory from nvidia-smi and JAX device memory stats."""
-    metrics = {}
-    devs = jax.local_devices()
-    for i, dev in enumerate(devs):
-        try:
-            mem = dev.memory_stats()
-            if mem:
-                pfx = f'gpu{i}' if len(devs) > 1 else 'gpu'
-                metrics[f'sys/{pfx}/jax_mem_gb']  = mem.get('bytes_in_use', 0) / 2**30
-                metrics[f'sys/{pfx}/jax_peak_gb'] = mem.get('peak_bytes_in_use', 0) / 2**30
-        except Exception:
-            pass
-    try:
-        import subprocess
-        out = subprocess.check_output(
-            ['nvidia-smi',
-             '--query-gpu=index,utilization.gpu,memory.used,memory.total',
-             '--format=csv,noheader,nounits'],
-            timeout=5, stderr=subprocess.DEVNULL,
-        ).decode()
-        for line in out.strip().splitlines():
-            idx_s, util_s, used_s, total_s = [s.strip() for s in line.split(',')]
-            pfx = f'sys/gpu{idx_s}'
-            metrics[f'{pfx}/util_pct']     = float(util_s)
-            metrics[f'{pfx}/mem_used_gb']  = float(used_s) / 1024.0
-            metrics[f'{pfx}/mem_total_gb'] = float(total_s) / 1024.0
-    except Exception:
-        pass
-    return metrics
-
-
-def _wandb_log_step(step, loss, gv, p, param_names, scales, p_n_gts,
-                    step_time_s, trial_idx, schedule_fn=None, lr_multipliers=None,
-                    phase=None, extra_metrics=None):
-    """Log one step to W&B."""
-    p_np  = np.array(p)
-    gv_np = np.array(gv)
-
-    log = {
-        'trial':          trial_idx,
-        'loss':           loss,
-        'grad_norm':      float(np.linalg.norm(gv_np)),
-        'param_norm':     float(np.linalg.norm(p_np)),
-        'step_time_s':    step_time_s,
-    }
-    if phase is not None:
-        log['phase'] = phase
-    if schedule_fn is not None:
-        log['lr'] = float(schedule_fn(step))
-
-    if param_names is not None:
-        for i, name in enumerate(param_names):
-            log[f'params/{name}_normalized'] = float(p_np[i])
-            if scales is not None:
-                log[f'params/{name}_physical'] = float(np.exp(p_np[i]) * scales[i])
-            if p_n_gts is not None:
-                # rel_err in physical space: |exp(q) - exp(q_gt)| / exp(q_gt) = |exp(q - q_gt) - 1|
-                rel_err = abs(float(np.exp(p_np[i] - p_n_gts[i])) - 1.0)
-                log[f'params/{name}_rel_err'] = rel_err
-            if gv_np is not None:
-                scale = lr_multipliers[i] if lr_multipliers is not None else 1.0
-                log[f'grads/{name}'] = float(gv_np[i] * scale)
-
-    if extra_metrics:
-        log.update(extra_metrics)
-
-    log.update(_collect_gpu_metrics())
-    _wandb.log(log, step=step)
+# (_collect_gpu_metrics, _wandb_log_step moved to optlib.wandb_utils)
 
 
 # ── Noise ─────────────────────────────────────────────────────────────────────
@@ -1501,50 +681,11 @@ def apply_noise_to_gt(gt_arrays, simulator, noise_scale, noise_key):
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-def fetch_init_params_from_wandb(run_id, param_names, scales, wandb_project, step=-1):
-    """Fetch physical param values from a W&B run and return a p_n list.
-
-    step=-1 (default): use the run summary (last logged value).
-    step>=0: fetch that specific logged step via scan_history.
-    Raises ValueError if any params/<name>_physical key is missing.
-    """
-    if not _WANDB_AVAILABLE:
-        raise RuntimeError('wandb not installed; cannot use --init-from-wandb-run')
-    api = _wandb.Api()
-    run = api.run(f"{wandb_project}/{run_id}")
-    keys = [f"params/{name}_physical" for name in param_names]
-
-    if step < 0:
-        source = run.summary
-        row = {k: source.get(k) for k in keys}
-        step_label = 'summary (latest)'
-    else:
-        rows = list(run.scan_history(keys=keys, min_step=step, max_step=step + 1))
-        if not rows:
-            raise ValueError(
-                f"No history row found at step {step} in W&B run {run_id}. "
-                f"Check that this step was actually logged."
-            )
-        row = rows[0]
-        step_label = f'step {step}'
-
-    p_n_init = []
-    for name, scale, key in zip(param_names, scales, keys):
-        val = row.get(key)
-        if val is None:
-            available = sorted(k for k in run.summary.keys() if k.startswith('params/'))
-            raise ValueError(
-                f"Key {key!r} not found at {step_label} in W&B run {run_id}.\n"
-                f"Available params/* keys in summary: {available}"
-            )
-        p_n = float(np.log(float(val) / scale))
-        p_n_init.append(p_n)
-        print(f"  {name}: {float(val):.6g}  (p_n={p_n:.4f})")
-    return p_n_init
+# (fetch_init_params_from_wandb moved to optlib.wandb_utils)
 
 
 def main():
-    args = parse_args()
+    args = parse_args(__doc__)
     is_newton = args.optimizer == 'newton'
 
     if args.effective_batch_size < 1:
@@ -1564,7 +705,28 @@ def main():
         print('error: --patience-per-param must be >= 1.', file=sys.stderr)
         raise SystemExit(2)
 
-    param_names = parse_params(args.params)
+    _all_param_names = parse_params(args.params)
+    # 'Efield' is a non-scalar MLP model handled separately from the scalar
+    # param machinery; strip it out and keep param_names as scalars only.
+    efield_present = EFIELD_PARAM in _all_param_names
+    param_names = [n for n in _all_param_names if n != EFIELD_PARAM]
+    if efield_present:
+        if args.electric_dist_path is None:
+            print('error: --electric-dist-path is required when "Efield" is in --params.',
+                  file=sys.stderr)
+            raise SystemExit(2)
+        if not os.path.exists(args.electric_dist_path):
+            print(f'error: --electric-dist-path not found: {args.electric_dist_path}',
+                  file=sys.stderr)
+            raise SystemExit(2)
+        if args.optimizer == 'newton':
+            print('error: "Efield" optimization is not supported with --optimizer newton '
+                  '(dense Hessian over MLP weights is intractable).', file=sys.stderr)
+            raise SystemExit(2)
+        if args.init_from_wandb_run:
+            print('error: --init-from-wandb-run is not supported together with "Efield".',
+                  file=sys.stderr)
+            raise SystemExit(2)
 
     # Per-parameter ADC cutoffs + planes: build a list of (cutoff, planes_tuple, [param_indices])
     # groups. Params sharing the same (cutoff, planes) share one compiled phase-fn set.
@@ -1591,7 +753,13 @@ def main():
         _planes_per_param_spec = args.planes_per_param
 
     track_specs = parse_tracks(args.tracks)
-    range_lo, range_hi = getattr(args, 'range')
+    _range_vals = list(getattr(args, 'range'))
+    if len(_range_vals) % 2 != 0:
+        raise ValueError(f'--range requires an even number of values, got {len(_range_vals)}')
+    range_intervals = [(float(_range_vals[i]), float(_range_vals[i + 1]))
+                       for i in range(0, len(_range_vals), 2)]
+    if any(lo >= hi for lo, hi in range_intervals):
+        raise ValueError(f'Each --range pair must satisfy lo < hi, got {range_intervals}')
     _spm = [float(v) for v in args.start_position_mm.split(',')]
     track_start_mm = tuple(_spm)
     schedule     = parse_schedule(args)
@@ -1626,9 +794,11 @@ def main():
     start_rng        = np.random.default_rng(start_ss)
     noise_seed       = int(noise_ss.generate_state(1)[0])
 
+    _folder_param_names = list(param_names) + (
+        [f'{EFIELD_PARAM}-{args.efield_mode}'] if efield_present else [])
     folder_name = make_folder_name(
-        param_names, track_specs, args.loss, args.optimizer,
-        args.lr, args.lr_schedule, args.max_steps, args.N, range_lo, range_hi,
+        _folder_param_names, track_specs, args.loss, args.optimizer,
+        args.lr, args.lr_schedule, args.max_steps, args.N, range_intervals,
         noise_scale=args.noise_scale,
         step_size=schedule[-1]['step_size'],
         max_num_deposits=schedule[-1]['max_num_deposits'],
@@ -1690,7 +860,8 @@ def main():
 
     print(f'JAX devices  : {jax.devices()}')
     print(f'Params       : {param_names}')
-    print(f'Range        : [{range_lo}, {range_hi}] × GT')
+    _range_str = ' ∪ '.join(f'[{lo}, {hi}]' for lo, hi in range_intervals)
+    print(f'Range        : {_range_str} × GT')
     print(f'Tracks       : {[t["name"] for t in track_specs]}')
     print(f'Loss         : {args.loss}')
     clip_tag   = f'{args.clip_grad_norm}' if args.clip_grad_norm > 0.0 else 'disabled'
@@ -1793,15 +964,21 @@ def main():
                   f'deposits={ph["max_num_deposits"]:,}  '
                   f'batch_size={ph["batch_size"]}')
 
-    # ── Simulators (cached by n_segments) ─────────────────────────────────────
+    # ── Simulators (cached by n_segments, role) ───────────────────────────────
     detector_config = generate_detector(CONFIG_PATH)
     _sim_cache: dict = {}
+    # FieldConfig + zero-init weights for the MLP SCE model. Assigned after gt_sim
+    # is built (needs geometry); read lazily by _get_sim when building diff sims.
+    efield_cfg = None
+    efield_zero_params = None
 
-    def _get_sim(n_seg):
-        if n_seg not in _sim_cache:
-            print(f'\nBuilding differentiable simulator (n_segments={n_seg:,})...')
-            sim = DetectorSimulator(
-                detector_config,
+    def _get_sim(n_seg, role='diff'):
+        # role 'gt' uses the static GT distortion map; role 'diff' uses the
+        # differentiable MLP SCE model (when Efield is being optimized).
+        key = (n_seg, role)
+        if key not in _sim_cache:
+            print(f'\nBuilding {role} simulator (n_segments={n_seg:,})...')
+            kw = dict(
                 differentiable=True,
                 n_segments=n_seg,
                 use_bucketed=True,
@@ -1811,14 +988,25 @@ def main():
                 include_track_hits=False,
                 include_digitize=False,
             )
+            if efield_present and role == 'gt':
+                kw['include_electric_dist'] = True
+                kw['electric_dist_path'] = args.electric_dist_path
+            elif efield_present and role == 'diff':
+                kw['efield_model'] = efield_cfg
+            sim = DetectorSimulator(detector_config, **kw)
+            # Diff sim: inject zero MLP weights so warm-up compiles with a valid
+            # sce_models pytree (real weights flow in later with same structure).
+            if efield_present and role == 'diff':
+                sim._default_sim_params = sim._default_sim_params._replace(
+                    sce_models=efield_zero_params)
             print('Warming up JIT...')
             t0 = time.time()
             sim.warm_up()
             print(f'Done ({time.time() - t0:.1f} s)')
-            _sim_cache[n_seg] = sim
-        return _sim_cache[n_seg]
+            _sim_cache[key] = sim
+        return _sim_cache[key]
 
-    gt_sim = _get_sim(args.gt_max_deposits)
+    gt_sim = _get_sim(args.gt_max_deposits, role='gt')
     gt_lifetime = args.gt_lifetime_us if args.gt_lifetime_us is not None else GT_LIFETIME_US
     gt_params = gt_sim.default_sim_params._replace(
         lifetime_us    = jnp.array(gt_lifetime),
@@ -1826,6 +1014,20 @@ def main():
     )
     if args.gt_lifetime_us is not None:
         print(f'GT lifetime overridden: {gt_lifetime:.0f} μs ({gt_lifetime / 1000:.1f} ms)')
+
+    # Build the MLP field config + zero starting weights now that geometry is known.
+    efield_n_mlp = 0
+    efield_unravel = None
+    if efield_present:
+        import tools.nonlocal_efield as _nl
+        efield_cfg = build_efield_config(
+            gt_sim, gt_params, mode=args.efield_mode, hidden=args.efield_hidden)
+        efield_zero_params = _nl.zero_params(efield_cfg)
+        _flat0, efield_unravel = _nl.flatten_params(efield_zero_params)
+        efield_n_mlp = int(_flat0.size)
+        print(f'Efield MLP    : mode={args.efield_mode}  hidden={tuple(args.efield_hidden)}  '
+              f'weights={efield_n_mlp:,}  lr_mult={args.efield_lr_mult}  '
+              f'GT map={args.electric_dist_path}')
 
     if args.gt_param_multiplier != 1.0:
         for _pname in param_names:
@@ -1836,11 +1038,25 @@ def main():
             print(f'  {_pname}: {_get_gt_val(_pname, gt_params, gt_sim.recomb_model):.6g}')
 
     # ── Setter ────────────────────────────────────────────────────────────────
-    setter, gt_vals, scales, p_n_gts = make_nparam_setter(
+    scalar_setter, gt_vals, scales, p_n_gts = make_nparam_setter(
         param_names, gt_params, gt_sim.recomb_model)
 
     for name, gt_val, scale, p_n_gt in zip(param_names, gt_vals, scales, p_n_gts):
         print(f'  {name}: GT={gt_val:.6g}  scale={scale:.6g}  log(GT/scale)={p_n_gt:.6g}')
+
+    n_scalar = len(param_names)
+    if efield_present:
+        # The optimized vector is [scalar block | flattened MLP weights]. The
+        # scalar block keeps the existing log-normalization; the MLP block is raw
+        # (no log-norm) and is reshaped into SimParams.sce_models.
+        _unravel = efield_unravel
+        _n_scalar = n_scalar
+        def setter(p_n_vec):
+            base = scalar_setter(p_n_vec[:_n_scalar])
+            mlp = _unravel(p_n_vec[_n_scalar:])
+            return base._replace(sce_models=mlp)
+    else:
+        setter = scalar_setter
 
     # ── GT signals (computed once at fixed fine resolution) ────────────────────
     print(f'\nComputing GT signals '
@@ -2134,9 +1350,32 @@ def main():
     # ── Random starting points ────────────────────────────────────────────────
     rng = start_rng
     n_params = len(param_names)
-    factors = rng.uniform(range_lo, range_hi, size=(args.N, n_params))   # (N, n_params)
+    _widths  = np.array([hi - lo for lo, hi in range_intervals])
+    _cum_w   = np.cumsum(_widths)
+    _total_w = _cum_w[-1]
+    _u       = rng.uniform(0.0, _total_w, size=(args.N, n_params))
+    _k       = np.searchsorted(_cum_w, _u, side='right').clip(0, len(range_intervals) - 1)
+    _los     = np.array([lo for lo, _ in range_intervals])
+    _offsets = np.where(_k > 0, _cum_w[np.maximum(_k - 1, 0)], 0.0)
+    factors  = _los[_k] + (_u - _offsets)                                # (N, n_scalar)
     factor_grid   = factors.tolist()
-    p_n_starts    = (np.log(factors) + np.array(p_n_gts)).tolist()
+    if n_params > 0:
+        _p_n_scalar = np.log(factors) + np.array(p_n_gts)               # (N, n_scalar)
+    else:
+        _p_n_scalar = np.zeros((args.N, 0))
+    if efield_present:
+        # MLP block: random hidden + zeroed output layer ⇒ the field starts at
+        # nominal (no distortion) yet has nonzero gradient so it can learn.
+        # Distinct seed per trial so trials explore different hidden features.
+        import tools.nonlocal_efield as _nl
+        mlp_blocks = []
+        for _t in range(args.N):
+            _k = jax.random.PRNGKey(int(effective_seed) + 7919 + _t)
+            _ip = _nl.nominal_start_params(efield_cfg, _k)
+            _flat, _ = _nl.flatten_params(_ip)
+            mlp_blocks.append(np.asarray(_flat, dtype=np.float64))
+        _p_n_scalar = np.hstack([_p_n_scalar, np.stack(mlp_blocks)])
+    p_n_starts    = _p_n_scalar.tolist()
 
     if args.init_from_wandb_run:
         _step_label = (f'step {args.init_from_wandb_step}'
@@ -2242,7 +1481,13 @@ def main():
         lr_multipliers = parse_lr_multipliers(lr_spec, param_names)
 
     if not is_newton:
-        if not want_auto and any(s != 1.0 for s in lr_multipliers):
+        if efield_present:
+            # Extend per-param multipliers to per-coordinate: keep the scalar
+            # block, set every MLP weight to the single Efield multiplier. The
+            # optimizer's _scale_by_vector needs length = len(p) = n_coords.
+            lr_multipliers = (list(lr_multipliers[:n_scalar])
+                              + [args.efield_lr_mult] * efield_n_mlp)
+        if not want_auto and any(s != 1.0 for s in lr_multipliers[:n_scalar]):
             pairs = ', '.join(f'{n}×{s}' for n, s in zip(param_names, lr_multipliers) if s != 1.0)
             print(f'LR multipliers : {pairs}')
 
@@ -2276,20 +1521,39 @@ def main():
         loss_name           = args.loss,
         active_planes       = active_planes,
         tracks              = track_specs,
-        range_lo            = range_lo,
-        range_hi            = range_hi,
+        range_intervals     = range_intervals,
         seed                = effective_seed,
         noise_scale         = args.noise_scale,
         factor_grid         = factor_grid,
-        starting_p_n_values = p_n_starts,
+        # Store only the scalar block of starts / multipliers (MLP block is all
+        # zeros / a constant) to keep the pickle small and resume-compatible.
+        starting_p_n_values = ([row[:n_scalar] for row in p_n_starts]
+                               if efield_present else p_n_starts),
         command             = _argv_cmd,
         trials              = all_trials,
         run_complete        = False,
         wandb_run_id        = wb_run_id_for_result,
-        lr_multipliers      = lr_multipliers,
+        lr_multipliers      = (list(lr_multipliers[:n_scalar])
+                               if efield_present else lr_multipliers),
     )
     if lr_mult_auto_meta is not None:
         result['lr_mult_auto_meta'] = lr_mult_auto_meta
+    if efield_present:
+        # Everything needed to reconstruct the learned field from a trial's
+        # `final_p` (the trailing block after the scalar coords).
+        result['efield'] = dict(
+            present       = True,
+            mode          = efield_cfg.mode,
+            hidden        = list(efield_cfg.hidden),
+            n_weights     = efield_n_mlp,
+            n_scalar      = n_scalar,
+            lr_mult       = args.efield_lr_mult,
+            gt_map_path   = args.electric_dist_path,
+            center_cm     = list(efield_cfg.center_cm),
+            half_cm       = list(efield_cfg.half_cm),
+            bg_field_Vcm  = list(efield_cfg.bg_field_Vcm),
+            out_scale     = efield_cfg.out_scale,
+        )
     preemption_state['result'] = result
 
     # ── Intra-trial checkpoint ────────────────────────────────────────────────
@@ -2313,8 +1577,9 @@ def main():
             continue  # already completed in a previous run
 
         factors_str = ', '.join(f'{f:.4f}' for f in factors_i)
-        pn_str      = ', '.join(f'{v:.4f}' for v in pn_start)
-        print(f'\nTrial [{gi+1}/{args.N}]  factors=({factors_str})  p_n=({pn_str})',
+        pn_str      = ', '.join(f'{v:.4f}' for v in pn_start[:n_scalar])  # scalar coords only
+        _ef_tag     = f'  +Efield[{efield_n_mlp}w@0]' if efield_present else ''
+        print(f'\nTrial [{gi+1}/{args.N}]  factors=({factors_str})  p_n=({pn_str}){_ef_tag}',
               end='', flush=True)
 
         pn0            = pn_start
@@ -2349,6 +1614,7 @@ def main():
             newton_damping=(args.newton_damping if is_newton else None),
             clip_grad_norm=args.clip_grad_norm,
             rotating_phase_schedules=(_rotating_phase_schedules if _rotate_n > 0 else None),
+            n_record_coords=(n_scalar if efield_present else None),
         )
         all_trials.append(trial)
         result.pop('live_checkpoint', None)
