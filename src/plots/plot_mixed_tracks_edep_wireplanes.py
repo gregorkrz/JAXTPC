@@ -1031,7 +1031,7 @@ def write_histograms_html(specs, dist_stats, output_dir):
             'mean_west': float(ds['west']['mean']) if ds else None,
         })
 
-    js_data = 'const TRACKS = ' + json.dumps(track_data) + ';'
+    js_data = 'var TRACKS = ' + json.dumps(track_data) + ';'
     ugly_js = json.dumps(_UGLY_TRACKS)
 
     checkbox_items_html = ''.join(
@@ -1041,168 +1041,208 @@ def write_histograms_html(specs, dist_stats, output_dir):
         for i, td in enumerate(track_data)
     )
 
-    _TMPL = """\
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Track histograms</title>
-  <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { display: flex; height: 100vh; font-family: system-ui, sans-serif; overflow: hidden; }
-    #sidebar {
-      width: 240px; min-width: 140px; border-right: 1px solid #ddd;
-      padding: 0.75rem; overflow-y: auto; flex-shrink: 0; background: #fafafa;
-    }
-    #sidebar h2 { font-size: 0.95rem; font-weight: 600; margin-bottom: 0.4rem; }
-    .btn-row { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 0.5rem; }
-    .btn-row button { font-size: 0.72rem; padding: 2px 7px; cursor: pointer;
-                      border: 1px solid #bbb; border-radius: 3px; background: #fff; }
-    .btn-row button:hover { background: #e8e8e8; }
-    .muon-item { display: block; font-size: 0.76rem; padding: 2px 0;
-                 cursor: pointer; white-space: nowrap; overflow: hidden;
-                 text-overflow: ellipsis; }
-    #main { flex: 1; padding: 0.85rem; overflow-y: auto; }
-    #main h1 { font-size: 1.05rem; margin-bottom: 0.75rem; font-weight: 600; }
-    .hist-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
-      gap: 0.85rem;
-    }
-    .hist-card {
-      background: #fff; border: 1px solid #e0e0e0; border-radius: 6px;
-      padding: 0.6rem 0.8rem;
-    }
-    .hist-card h3 { font-size: 0.85rem; margin-bottom: 0.3rem; color: #333; }
-    svg { display: block; overflow: visible; }
-    rect.bar { fill: #4682B4; opacity: 0.72; transition: opacity 0.1s; }
-    rect.bar:hover { opacity: 1; }
-  </style>
-</head>
-<body>
-  <div id="sidebar">
-    <h2>Muons</h2>
-    <div class="btn-row">
-      <button onclick="selectPreset('all')">All</button>
-      <button onclick="selectPreset('none')">None</button>
-      <button onclick="selectPreset('orig')">Orig</button>
-      <button onclick="selectPreset('nice')">Nice</button>
-    </div>
-    __CHECKBOXES__
-  </div>
-  <div id="main">
-    <h1>Track histograms</h1>
-    <div class="hist-grid" id="hist-grid"></div>
-  </div>
-  <script>
-  __JS_DATA__
-  const UGLY_TRACKS = __UGLY_JS__;
-  const QUANTITIES = [
-    {key: 'E',         label: 'T (MeV)'},
-    {key: 'theta',     label: 'θ (°)'},
-    {key: 'phi',       label: 'φ (°)'},
-    {key: 'mean_east', label: 'Mean dist east (mm)'},
-    {key: 'mean_west', label: 'Mean dist west (mm)'},
-  ];
-  const N_BINS = 8;
-  const SVG_W = 290, SVG_H = 170;
-  const PAD = {top: 8, right: 10, bottom: 38, left: 36};
-
-  function computeHist(vals) {
-    const finite = vals.filter(v => v !== null && isFinite(v));
-    if (finite.length === 0) return null;
-    let lo = Math.min(...finite), hi = Math.max(...finite);
-    if (lo === hi) { lo -= 0.5; hi += 0.5; }
-    const w = (hi - lo) / N_BINS;
-    const counts = Array(N_BINS).fill(0);
-    const bnames = Array.from({length: N_BINS}, () => []);
-    for (let i = 0; i < vals.length; i++) {
-      const v = vals[i];
-      if (v === null || !isFinite(v)) continue;
-      let b = Math.floor((v - lo) / w);
-      if (b >= N_BINS) b = N_BINS - 1;
-      counts[b]++;
-      bnames[b].push(i);
-    }
-    return {lo, hi, w, counts, bnames};
-  }
-
-  function fmtVal(v) {
-    if (v === null || !isFinite(v)) return '—';
-    return Math.abs(v) >= 100 ? v.toFixed(1) : v.toFixed(2);
-  }
-
-  function buildSVG(hist, selNames) {
-    const pw = SVG_W - PAD.left - PAD.right;
-    const ph = SVG_H - PAD.top - PAD.bottom;
-    const nodata = `<text x="${SVG_W / 2}" y="${SVG_H / 2}" text-anchor="middle" font-size="12" fill="#999">no data</text>`;
-    if (!hist) return `<svg width="${SVG_W}" height="${SVG_H}">${nodata}</svg>`;
-    const maxCnt = Math.max(...hist.counts, 1);
-    let inner = '';
-    const bw = pw / N_BINS;
-    for (let b = 0; b < N_BINS; b++) {
-      const x = PAD.left + b * bw;
-      const cnt = hist.counts[b];
-      const bh = Math.max((cnt / maxCnt) * ph, cnt > 0 ? 1 : 0);
-      const y = PAD.top + ph - bh;
-      const tip = hist.bnames[b].map(i => selNames[i]).join('\n');
-      inner += `<rect class="bar" x="${(x+1).toFixed(1)}" y="${y.toFixed(1)}" width="${(bw-2).toFixed(1)}" height="${bh.toFixed(1)}"><title>${cnt} track(s):\n${tip}</title></rect>`;
-      if (cnt > 0) {
-        inner += `<text x="${(x+bw/2).toFixed(1)}" y="${(y-2).toFixed(1)}" text-anchor="middle" font-size="10" fill="#333">${cnt}</text>`;
-      }
-    }
-    inner += `<line x1="${PAD.left}" y1="${PAD.top+ph}" x2="${PAD.left+pw}" y2="${PAD.top+ph}" stroke="#888" stroke-width="1"/>`;
-    for (let t = 0; t <= 4; t++) {
-      const frac = t / 4;
-      const xp = PAD.left + frac * pw;
-      const val = hist.lo + frac * (hist.hi - hist.lo);
-      inner += `<line x1="${xp.toFixed(1)}" y1="${(PAD.top+ph).toFixed(1)}" x2="${xp.toFixed(1)}" y2="${(PAD.top+ph+4).toFixed(1)}" stroke="#888" stroke-width="1"/>`;
-      inner += `<text x="${xp.toFixed(1)}" y="${(PAD.top+ph+14).toFixed(1)}" text-anchor="middle" font-size="9" fill="#555">${fmtVal(val)}</text>`;
-    }
-    inner += `<line x1="${PAD.left}" y1="${PAD.top}" x2="${PAD.left}" y2="${PAD.top+ph}" stroke="#888" stroke-width="1"/>`;
-    for (let t = 0; t <= 4; t++) {
-      const frac = t / 4;
-      const yp = PAD.top + ph - frac * ph;
-      const cnt = Math.round(frac * maxCnt);
-      inner += `<line x1="${(PAD.left-3).toFixed(1)}" y1="${yp.toFixed(1)}" x2="${PAD.left}" y2="${yp.toFixed(1)}" stroke="#888" stroke-width="1"/>`;
-      inner += `<text x="${(PAD.left-5).toFixed(1)}" y="${(yp+3).toFixed(1)}" text-anchor="end" font-size="9" fill="#555">${cnt}</text>`;
-    }
-    return `<svg width="${SVG_W}" height="${SVG_H}">${inner}</svg>`;
-  }
-
-  function render() {
-    const sel = Array.from(document.querySelectorAll('.muon-cb:checked')).map(cb => +cb.value);
-    const selTracks = sel.map(i => TRACKS[i]);
-    const selNames = selTracks.map(t => t.name);
-    const grid = document.getElementById('hist-grid');
-    grid.innerHTML = '';
-    for (const q of QUANTITIES) {
-      const vals = selTracks.map(t => t[q.key]);
-      const hist = computeHist(vals);
-      const card = document.createElement('div');
-      card.className = 'hist-card';
-      card.innerHTML = `<h3>${q.label}</h3>` + buildSVG(hist, selNames);
-      grid.appendChild(card);
-    }
-  }
-
-  function selectPreset(preset) {
-    document.querySelectorAll('.muon-cb').forEach(cb => {
-      const name = TRACKS[+cb.value].name;
-      if      (preset === 'all')  cb.checked = true;
-      else if (preset === 'none') cb.checked = false;
-      else if (preset === 'orig') cb.checked = !name.includes('Quarter');
-      else if (preset === 'nice') cb.checked = !UGLY_TRACKS.some(u => name.includes(u));
-    });
-    render();
-  }
-
-  document.querySelectorAll('.muon-cb').forEach(cb => cb.addEventListener('change', render));
-  render();
-  </script>
-</body>
-</html>"""
+    # Template uses __JS_DATA__, __UGLY_JS__, __CHECKBOXES__ as substitution targets.
+    # All JS is written without innerHTML / eval so it works under strict CSP / Trusted Types.
+    _TMPL = (
+        '<!DOCTYPE html>\n'
+        '<html lang="en">\n'
+        '<head>\n'
+        '  <meta charset="utf-8">\n'
+        '  <meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        '  <title>Track histograms</title>\n'
+        '  <style>\n'
+        '    * { box-sizing: border-box; margin: 0; padding: 0; }\n'
+        '    body { display: flex; height: 100vh; font-family: system-ui, sans-serif; overflow: hidden; }\n'
+        '    #sidebar {\n'
+        '      width: 240px; min-width: 140px; border-right: 1px solid #ddd;\n'
+        '      padding: 0.75rem; overflow-y: auto; flex-shrink: 0; background: #fafafa;\n'
+        '    }\n'
+        '    #sidebar h2 { font-size: 0.95rem; font-weight: 600; margin-bottom: 0.4rem; }\n'
+        '    .btn-row { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 0.5rem; }\n'
+        '    .btn-row button { font-size: 0.72rem; padding: 2px 7px; cursor: pointer;\n'
+        '                      border: 1px solid #bbb; border-radius: 3px; background: #fff; }\n'
+        '    .btn-row button:hover { background: #e8e8e8; }\n'
+        '    .muon-item { display: block; font-size: 0.76rem; padding: 2px 0;\n'
+        '                 cursor: pointer; white-space: nowrap; overflow: hidden;\n'
+        '                 text-overflow: ellipsis; }\n'
+        '    #main { flex: 1; padding: 0.85rem; overflow-y: auto; }\n'
+        '    #main h1 { font-size: 1.05rem; margin-bottom: 0.75rem; font-weight: 600; }\n'
+        '    .hist-grid {\n'
+        '      display: grid;\n'
+        '      grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));\n'
+        '      gap: 0.85rem;\n'
+        '    }\n'
+        '    .hist-card {\n'
+        '      background: #fff; border: 1px solid #e0e0e0; border-radius: 6px;\n'
+        '      padding: 0.6rem 0.8rem;\n'
+        '    }\n'
+        '    .hist-card h3 { font-size: 0.85rem; margin-bottom: 0.3rem; color: #333; }\n'
+        '    svg { display: block; overflow: visible; }\n'
+        '    .bar { fill: #4682B4; opacity: 0.72; }\n'
+        '    .bar:hover { opacity: 1; }\n'
+        '  </style>\n'
+        '</head>\n'
+        '<body>\n'
+        '  <div id="sidebar">\n'
+        '    <h2>Muons</h2>\n'
+        '    <div class="btn-row">\n'
+        "      <button onclick=\"selectPreset('all')\">All</button>\n"
+        "      <button onclick=\"selectPreset('none')\">None</button>\n"
+        "      <button onclick=\"selectPreset('orig')\">Orig</button>\n"
+        "      <button onclick=\"selectPreset('nice')\">Nice</button>\n"
+        '    </div>\n'
+        '    __CHECKBOXES__\n'
+        '  </div>\n'
+        '  <div id="main">\n'
+        '    <a href="index.html" style="font-size:0.82rem;color:#4682B4;display:block;margin-bottom:0.75rem">&#8592; Back to 3D event displays</a>\n'
+        '    <h1>Track histograms</h1>\n'
+        '    <div class="hist-grid" id="hist-grid"></div>\n'
+        '  </div>\n'
+        '  <script>\n'
+        '  __JS_DATA__\n'
+        '  var UGLY_TRACKS = __UGLY_JS__;\n'
+        '  var QUANTITIES = [\n'
+        "    {key: 'E',         label: 'T (MeV)'},\n"
+        "    {key: 'theta',     label: 'θ (°)'},\n"
+        "    {key: 'phi',       label: 'φ (°)'},\n"
+        "    {key: 'mean_east', label: 'Mean dist east (mm)'},\n"
+        "    {key: 'mean_west', label: 'Mean dist west (mm)'},\n"
+        '  ];\n'
+        '  var N_BINS = 8, SVG_W = 290, SVG_H = 170;\n'
+        '  var PL = 36, PR = 10, PT = 8, PB = 38;\n'
+        '\n'
+        '  function computeHist(vals) {\n'
+        '    var finite = [];\n'
+        '    for (var i = 0; i < vals.length; i++) {\n'
+        '      if (vals[i] !== null && isFinite(vals[i])) finite.push(vals[i]);\n'
+        '    }\n'
+        '    if (finite.length === 0) return null;\n'
+        '    var lo = finite[0], hi = finite[0];\n'
+        '    for (var j = 1; j < finite.length; j++) {\n'
+        '      if (finite[j] < lo) lo = finite[j];\n'
+        '      if (finite[j] > hi) hi = finite[j];\n'
+        '    }\n'
+        '    if (lo === hi) { lo -= 0.5; hi += 0.5; }\n'
+        '    var w = (hi - lo) / N_BINS;\n'
+        '    var counts = [], bnames = [];\n'
+        '    for (var bi = 0; bi < N_BINS; bi++) { counts.push(0); bnames.push([]); }\n'
+        '    for (var k = 0; k < vals.length; k++) {\n'
+        '      if (vals[k] === null || !isFinite(vals[k])) continue;\n'
+        '      var b = Math.floor((vals[k] - lo) / w);\n'
+        '      if (b >= N_BINS) b = N_BINS - 1;\n'
+        '      counts[b]++;\n'
+        '      bnames[b].push(k);\n'
+        '    }\n'
+        '    return {lo: lo, hi: hi, w: w, counts: counts, bnames: bnames};\n'
+        '  }\n'
+        '\n'
+        '  function fmtVal(v) {\n'
+        "    if (v === null || !isFinite(v)) return '-';\n"
+        '    return Math.abs(v) >= 100 ? v.toFixed(1) : v.toFixed(2);\n'
+        '  }\n'
+        '\n'
+        "  var SVGNS = 'http://www.w3.org/2000/svg';\n"
+        '  function se(tag, attrs) {\n'
+        '    var e = document.createElementNS(SVGNS, tag);\n'
+        '    for (var k in attrs) { if (Object.prototype.hasOwnProperty.call(attrs, k)) e.setAttribute(k, attrs[k]); }\n'
+        '    return e;\n'
+        '  }\n'
+        '  function st(tag, attrs, text) {\n'
+        '    var e = se(tag, attrs);\n'
+        '    e.textContent = String(text);\n'
+        '    return e;\n'
+        '  }\n'
+        '\n'
+        '  function buildSVGEl(hist, selNames) {\n'
+        '    var pw = SVG_W - PL - PR, ph = SVG_H - PT - PB;\n'
+        '    var svg = se("svg", {width: SVG_W, height: SVG_H});\n'
+        '    if (!hist) {\n'
+        '      svg.appendChild(st("text", {x: SVG_W/2, y: SVG_H/2, "text-anchor": "middle", "font-size": "12", fill: "#999"}, "no data"));\n'
+        '      return svg;\n'
+        '    }\n'
+        '    var maxCnt = 1;\n'
+        '    for (var mi = 0; mi < hist.counts.length; mi++) { if (hist.counts[mi] > maxCnt) maxCnt = hist.counts[mi]; }\n'
+        '    var bw = pw / N_BINS;\n'
+        '    for (var b = 0; b < N_BINS; b++) {\n'
+        '      var x = PL + b * bw;\n'
+        '      var cnt = hist.counts[b];\n'
+        '      var bh = (cnt / maxCnt) * ph;\n'
+        '      if (cnt > 0 && bh < 1) bh = 1;\n'
+        '      var y = PT + ph - bh;\n'
+        '      var r = se("rect", {"class": "bar", x: (x+1).toFixed(1), y: y.toFixed(1), width: (bw-2).toFixed(1), height: bh.toFixed(1)});\n'
+        '      if (hist.bnames[b].length > 0) {\n'
+        '        var tip = document.createElementNS(SVGNS, "title");\n'
+        '        var tipLines = [cnt + " track(s):"];\n'
+        '        for (var ti = 0; ti < hist.bnames[b].length; ti++) tipLines.push(selNames[hist.bnames[b][ti]]);\n'
+        '        tip.textContent = tipLines.join("\\n");\n'
+        '        r.appendChild(tip);\n'
+        '      }\n'
+        '      svg.appendChild(r);\n'
+        '      if (cnt > 0) svg.appendChild(st("text", {x: (x+bw/2).toFixed(1), y: (y-2).toFixed(1), "text-anchor": "middle", "font-size": "10", fill: "#333"}, cnt));\n'
+        '    }\n'
+        '    svg.appendChild(se("line", {x1: PL, y1: PT+ph, x2: PL+pw, y2: PT+ph, stroke: "#888", "stroke-width": "1"}));\n'
+        '    for (var t = 0; t <= 4; t++) {\n'
+        '      var frac = t / 4, xp = PL + frac * pw, xval = hist.lo + frac * (hist.hi - hist.lo);\n'
+        '      svg.appendChild(se("line", {x1: xp.toFixed(1), y1: (PT+ph).toFixed(1), x2: xp.toFixed(1), y2: (PT+ph+4).toFixed(1), stroke: "#888", "stroke-width": "1"}));\n'
+        '      svg.appendChild(st("text", {x: xp.toFixed(1), y: (PT+ph+14).toFixed(1), "text-anchor": "middle", "font-size": "9", fill: "#555"}, fmtVal(xval)));\n'
+        '    }\n'
+        '    svg.appendChild(se("line", {x1: PL, y1: PT, x2: PL, y2: PT+ph, stroke: "#888", "stroke-width": "1"}));\n'
+        '    for (var t2 = 0; t2 <= 4; t2++) {\n'
+        '      var frac2 = t2 / 4, yp = PT + ph - frac2 * ph, ycnt = Math.round(frac2 * maxCnt);\n'
+        '      svg.appendChild(se("line", {x1: (PL-3).toFixed(1), y1: yp.toFixed(1), x2: PL, y2: yp.toFixed(1), stroke: "#888", "stroke-width": "1"}));\n'
+        '      svg.appendChild(st("text", {x: (PL-5).toFixed(1), y: (yp+3).toFixed(1), "text-anchor": "end", "font-size": "9", fill: "#555"}, ycnt));\n'
+        '    }\n'
+        '    return svg;\n'
+        '  }\n'
+        '\n'
+        '  function render() {\n'
+        '    var cbs = document.querySelectorAll(".muon-cb:checked");\n'
+        '    var selTracks = [], selNames = [];\n'
+        '    for (var ci = 0; ci < cbs.length; ci++) {\n'
+        '      var tr = TRACKS[+cbs[ci].value];\n'
+        '      selTracks.push(tr);\n'
+        '      selNames.push(tr.name);\n'
+        '    }\n'
+        '    var grid = document.getElementById("hist-grid");\n'
+        '    while (grid.firstChild) grid.removeChild(grid.firstChild);\n'
+        '    for (var qi = 0; qi < QUANTITIES.length; qi++) {\n'
+        '      var q = QUANTITIES[qi];\n'
+        '      var vals = [];\n'
+        '      for (var vi = 0; vi < selTracks.length; vi++) vals.push(selTracks[vi][q.key]);\n'
+        '      var hist = computeHist(vals);\n'
+        '      var card = document.createElement("div");\n'
+        '      card.className = "hist-card";\n'
+        '      var h3 = document.createElement("h3");\n'
+        '      h3.textContent = q.label;\n'
+        '      card.appendChild(h3);\n'
+        '      card.appendChild(buildSVGEl(hist, selNames));\n'
+        '      grid.appendChild(card);\n'
+        '    }\n'
+        '  }\n'
+        '\n'
+        '  function selectPreset(preset) {\n'
+        '    var allCbs = document.querySelectorAll(".muon-cb");\n'
+        '    for (var i = 0; i < allCbs.length; i++) {\n'
+        '      var name = TRACKS[+allCbs[i].value].name;\n'
+        "      if (preset === 'all')       allCbs[i].checked = true;\n"
+        "      else if (preset === 'none') allCbs[i].checked = false;\n"
+        "      else if (preset === 'orig') allCbs[i].checked = (name.indexOf('Quarter') === -1);\n"
+        "      else if (preset === 'nice') {\n"
+        '        var ugly = false;\n'
+        '        for (var u = 0; u < UGLY_TRACKS.length; u++) { if (name.indexOf(UGLY_TRACKS[u]) !== -1) { ugly = true; break; } }\n'
+        '        allCbs[i].checked = !ugly;\n'
+        '      }\n'
+        '    }\n'
+        '    render();\n'
+        '  }\n'
+        '\n'
+        '  var initCbs = document.querySelectorAll(".muon-cb");\n'
+        '  for (var ic = 0; ic < initCbs.length; ic++) initCbs[ic].addEventListener("change", render);\n'
+        '  render();\n'
+        '  </script>\n'
+        '</body>\n'
+        '</html>'
+    )
 
     page = (_TMPL
             .replace('__JS_DATA__', js_data)

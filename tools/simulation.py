@@ -375,7 +375,11 @@ class DetectorSimulator:
                 dkernel = pk.DKernel
                 def response_fn(positions_cm, drift_distance_cm,
                                 py_offsets, pz_offsets, time_offsets):
-                    s_values = jnp.clip(jnp.sqrt(drift_distance_cm / _global_max_drift), 0.0, 1.0)
+                    s_values = jnp.minimum(
+                        jnp.where(drift_distance_cm > 0,
+                                  jnp.sqrt(drift_distance_cm / _global_max_drift),
+                                  jnp.zeros_like(drift_distance_cm)),
+                        1.0)
                     return apply_pixel_diffusion_response(
                         dkernel, s_values, py_offsets, pz_offsets, time_offsets,
                         pk.pixel_spacing, pk.kernel_py, pk.kernel_pz, pk.rebin_factor)
@@ -386,7 +390,12 @@ class DetectorSimulator:
                 kernel = kernels[plane_type]
                 dkernel = kernel.DKernel
                 def response_fn(positions_cm, drift_distance_cm, wire_offsets, time_offsets):
-                    s_values = jnp.clip(jnp.sqrt(drift_distance_cm / _global_max_drift), 0.0, 1.0)
+                    # jnp.where prevents Inf gradient from sqrt at drift_dist=0.
+                    s_values = jnp.minimum(
+                        jnp.where(drift_distance_cm > 0,
+                                  jnp.sqrt(drift_distance_cm / _global_max_drift),
+                                  jnp.zeros_like(drift_distance_cm)),
+                        1.0)
                     return apply_diffusion_response(
                         dkernel, s_values, wire_offsets, time_offsets,
                         kernel.wire_spacing, kernel.num_wires)
@@ -416,7 +425,14 @@ class DetectorSimulator:
                     kernel.base_kernel, kernel.kernel_dx, kernel.kernel_dy,
                     kernel.s_levels, ks_w=kernel.ks_w, ks_t=kernel.ks_t)
                 def response_fn(positions_cm, drift_distance_cm, wire_offsets, time_offsets):
-                    s_values = jnp.clip(jnp.sqrt(drift_distance_cm / _global_max_drift), 0.0, 1.0)
+                    # jnp.where prevents Inf gradient from sqrt at drift_dist=0.
+                    # d(sqrt(x))/dx|_{x=0} = Inf; the where masks that branch so
+                    # select(False, Inf, 0) = 0 rather than producing NaN via 0*Inf.
+                    s_values = jnp.minimum(
+                        jnp.where(drift_distance_cm > 0,
+                                  jnp.sqrt(drift_distance_cm / _global_max_drift),
+                                  jnp.zeros_like(drift_distance_cm)),
+                        1.0)
                     return apply_diffusion_response(
                         dkernel, s_values, wire_offsets, time_offsets,
                         kernel.wire_spacing, kernel.num_wires)

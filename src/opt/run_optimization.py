@@ -367,7 +367,8 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
               newton_damping=None,
               clip_grad_norm=0.0,
               rotating_phase_schedules=None,
-              n_record_coords=None):
+              n_record_coords=None,
+              mlp_snapshot_interval=0):
     """Run one optimization trial from starting p_n vector p0 (any length).
 
     phase_schedule: list of (until_step, build_fn) sorted by until_step.
@@ -425,6 +426,8 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
     param_traj = []
     loss_traj  = []
     grad_traj  = []
+    mlp_traj   = []   # [(step, flat_p)] snapshots; populated when mlp_snapshot_interval > 0
+    _mlp_snap  = int(mlp_snapshot_interval) if mlp_snapshot_interval and mlp_snapshot_interval > 0 else 0
 
     _freeze_eps = 1e-30
 
@@ -498,6 +501,8 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
     param_traj.append(p[:n_rec].tolist())
     loss_traj.append(lv_init)
     grad_traj.append(gv_init[:n_rec].tolist())
+    if _mlp_snap:
+        mlp_traj.append((start_step, np.asarray(p).tolist()))
 
     # Skip initial W&B row when resuming — that step was already logged before checkpoint.
     if use_wandb and _WANDB_AVAILABLE and start_step == 0:
@@ -577,6 +582,8 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
         param_traj.append(p[:n_rec].tolist())
         loss_traj.append(float(lv_new))
         grad_traj.append(gv_new[:n_rec].tolist())
+        if _mlp_snap and (step + 1) % _mlp_snap == 0:
+            mlp_traj.append((step + 1, np.asarray(p).tolist()))
 
         if use_wandb and _WANDB_AVAILABLE and wandb_track_batch_groups is not None and pt_new is not None:
             groups = wandb_track_batch_groups[ph_idx][last_batch_idx]
@@ -632,6 +639,12 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
                     step + 1, p, opt_state,
                     frozen_np if freeze_enabled else None)
 
+    # Ensure the final step is always included in mlp_traj (avoid duplicate if already there).
+    if _mlp_snap:
+        final_step = len(param_traj) - 1 + start_step
+        if not mlp_traj or mlp_traj[-1][0] != final_step:
+            mlp_traj.append((final_step, np.asarray(p).tolist()))
+
     out = dict(
         param_trajectory = param_traj,
         grad_trajectory  = grad_traj,
@@ -642,6 +655,8 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
         final_opt_state  = (_serialize_opt_state(opt_state) if opt_state is not None else None),
         final_p          = np.asarray(p).tolist(),  # full vector incl. any MLP block
     )
+    if _mlp_snap:
+        out['mlp_trajectory'] = mlp_traj  # list of (step, flat_p) pairs
     if freeze_enabled:
         out['frozen_mask_final'] = frozen_np.tolist()
         out['tol_per_param'] = tol_per_param
@@ -1615,6 +1630,7 @@ def main():
             clip_grad_norm=args.clip_grad_norm,
             rotating_phase_schedules=(_rotating_phase_schedules if _rotate_n > 0 else None),
             n_record_coords=(n_scalar if efield_present else None),
+            mlp_snapshot_interval=(args.mlp_snapshot_interval if efield_present else 0),
         )
         all_trials.append(trial)
         result.pop('live_checkpoint', None)

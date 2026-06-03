@@ -82,6 +82,10 @@ Available profiles
                                and --rotate-noise-seeds (disabled / 5); trans+long diffusion only,
                                5k steps, noisy GT, seeds 100–104. Each ADC cutoff is a separate
                                dependency chain (30 jobs/chain); 4 chains × 30 = 120 jobs total.
+  Adam_20260601_cutoff_sweep_v2  Same as Adam_20260601_cutoff_sweep but 13 tracks (TRACKS_13_NICE_EXT:
+                               TRACKS_16_NICE_EXT minus Muon9_500MeV, Muon_throughEw..., Muon_throughWe...);
+                               sweeps ADC cutoffs (5, 10, 20, 50), Fourier cutoffs (0, 10, 100) ADC²,
+                               rotate-noise-seeds 5 and -1; 4 chains × 30 = 120 jobs total.
   Adam_diffusionCutoff_collection_only_15tracks_v2  Like Adam_differentCutoffs_trans_and_long…v2 but
                                 the ADC cutoff and collection-only planes are applied only to both
                                 diffusion params; all other params use all planes and no cutoff.
@@ -205,6 +209,24 @@ TRACKS_16_NICE_EXT = (
     + "+Muon15_100MeV:0.290155194,0.467674594,-0.834919420:100:-738.504,-605.471,2160.000"
     + "+Muon16_100MeV:-0.362498911,-0.215251579,-0.906786247:100:-678.254,1635.218,2160.000"
     + "+Muon17_100MeV:0.348470036,0.919222376,-0.183299913:100:-768.051,-2160.000,-1358.605"
+)
+
+# TRACKS_16_NICE_EXT minus Muon9_500MeV, Muon_throughEw_skew02_1000MeV,
+# and Muon_throughWe_skew03_1000MeV (13 tracks total).
+TRACKS_13_NICE_EXT = (
+    "Muon1_1000MeV:-0.747872530,0.661463000,0.056154945:1000"
+    "+Muon2_500MeV:-0.641581737,0.275323919,-0.715939672:500"
+    "+Muon3_500MeV:-0.483652826,0.868350593,-0.109759697:500"
+    "+Muon6_1000MeV:-0.624672693,-0.613017831,0.483728401:1000"
+    "+Muon7_500MeV:-0.610394124,-0.747896572,0.260901765:500"
+    "+Muon8_1000MeV:0.773174642,0.198385012,0.602365637:1000"
+    "+Muon11_1000MeV:-0.482051010,0.584842086,0.652369955:1000"
+    "+Muon_diagCross_1000MeV:-0.577350269,-0.577350269,-0.577350269:1000"
+    "+Muon13_100MeV:-0.194353283,-0.967595642,-0.161200106:100:102.344,2160.000,-1106.403"
+    "+Muon14_100MeV:-0.108495799,0.312632631,0.943657512:100:602.601,-1767.737,-2160.000"
+    "+Muon15_100MeV:0.290155194,0.467674594,-0.834919420:100:-738.504,-605.471,2160.000"
+    "+Muon16_100MeV:-0.362498911,-0.215251579,-0.906786247:100:-678.254,1635.218,2160.000"
+    "+Muon17_100MeV:0.348470036,0.919222376,-0.183299913:100:-768.051,-2160.000,-1358.605"
 )
 
 # 15-track ensemble for 1d_gradients.py landscape sweeps.
@@ -827,7 +849,7 @@ def make_opt_command(
         parts.append(f"--sobolev-exponent {sobolev_exponent}")
     if fourier_cutoff is not None and fourier_cutoff > 0.0:
         parts.append(f"--fourier-cutoff {fourier_cutoff}")
-    if rotate_noise_seeds is not None and rotate_noise_seeds > 0:
+    if rotate_noise_seeds is not None:
         parts.append(f"--rotate-noise-seeds {rotate_noise_seeds}")
     return " ".join(parts)
 
@@ -6184,6 +6206,90 @@ def profile_Adam_20260601_cutoff_sweep(*, submit=True, print_sbatch_only=False, 
                     )
 
 
+def profile_Adam_20260601_cutoff_sweep_v2(*, submit=True, print_sbatch_only=False, wandb_tags=None, skip_complete=False):
+    """13 tracks: TRACKS_16_NICE_EXT minus Muon9_500MeV, Muon_throughEw..., Muon_throughWe...
+
+    Sweeps ADC cutoffs (5, 10, 20, 50), Fourier cutoffs (0, 10, 100) ADC², rotate-noise-seeds 5 and -1;
+    trans+long diffusion only, 5k steps, noisy GT (noise_scale=1), seeds 100–104.
+    Each ADC cutoff is a separate dependency chain (same as v1).
+    Total: 4 ADC × 3 FFT × 2 rot × 5 seeds = 120 jobs (4 chains of 30).
+    """
+    shared = dict(
+        tracks=TRACKS_13_NICE_EXT,
+        optimizer="adam",
+        loss="sobolev_loss_geomean_log1p",
+        lr=0.001,
+        lr_schedule="cosine",
+        max_steps=4000,
+        tol=1e-6,
+        patience=2000,
+        N=1,
+        range_lo=0.9,
+        range_hi=1.1,
+        grad_clip=0.0,
+        warmup_steps=1000,
+        num_buckets=1000,
+        step_size=1.0,
+        max_num_deposits=5000,
+        batch_size=1,
+        effective_batch_size=1,
+        gt_step_size=1.0,
+        gt_max_deposits=5000,
+        adam_beta2=0.9,
+        log_interval=50,
+        noise_scale=1.0,
+        sobolev_exponent=2.0,
+    )
+
+    params = "diffusion_trans_cm2_us,diffusion_long_cm2_us"
+    param_label = "trans_and_long"
+    seeds = [100, 101, 102, 103, 104]
+    adc_cutoffs = [5, 10, 20, 50]
+    fft_cutoffs = [0, 10, 100]
+    rotate_noise_vals = [5, -1]
+
+    for adc_cutoff in adc_cutoffs:
+        adc_tag = f"adc{int(adc_cutoff)}"
+        prev_job = None  # one chain per ADC cutoff value
+        for fft_cutoff in fft_cutoffs:
+            fft_tag = f"ft{int(fft_cutoff)}"
+            for rot in rotate_noise_vals:
+                rot_tag = f"rot{rot}"
+                profile_tag = (
+                    f"Adam_20260601_cutoff_sweep_v2_{param_label}"
+                    f"_{adc_tag}_{fft_tag}_{rot_tag}"
+                )
+                results_base = f"$RESULTS_DIR/opt/{profile_tag}"
+                for seed in seeds:
+                    seed_results_base = f"{results_base}/noise"
+                    if skip_complete and _seed_is_finished(seed_results_base, seed, shared["max_steps"]):
+                        print(f"  [skip] {profile_tag} seed={seed}: already finished")
+                        continue
+                    command = make_opt_command(
+                        params=params,
+                        seed=seed,
+                        sobolev_loss_cutoff=float(adc_cutoff),
+                        fourier_cutoff=float(fft_cutoff) if fft_cutoff > 0 else None,
+                        rotate_noise_seeds=rot,
+                        results_base=seed_results_base,
+                        wandb_tags=(wandb_tags or []) + [
+                            "Adam_20260601_cutoff_sweep_v2", param_label, "noise",
+                            "13trks_nice", adc_tag, fft_tag, rot_tag,
+                        ],
+                        **shared,
+                    )
+                    if not print_sbatch_only:
+                        print(command)
+                    prev_job = s3df_submit(
+                        command,
+                        time="00:12:00",
+                        submit=submit,
+                        mem_gb=64,
+                        print_sbatch_command=print_sbatch_only,
+                        dependency=prev_job,
+                    )
+
+
 PROFILES = {
     "3_part_schedule": profile_3_part_schedule,
     "2_part_schedule": profile_2_part_schedule,
@@ -6279,6 +6385,7 @@ PROFILES = {
     "Adam_20260601_diff_adc20_sob2": profile_Adam_20260601_diff_adc20_sob2,
     "Adam_20260601_diff_adc20_sob2_rot5": profile_Adam_20260601_diff_adc20_sob2_rot5,
     "Adam_20260601_cutoff_sweep": profile_Adam_20260601_cutoff_sweep,
+    "Adam_20260601_cutoff_sweep_v2": profile_Adam_20260601_cutoff_sweep_v2,
 }
 
 

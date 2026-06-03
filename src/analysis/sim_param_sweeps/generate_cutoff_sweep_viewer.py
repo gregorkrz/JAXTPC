@@ -1,8 +1,9 @@
 #!/usr/bin/env python
-"""Generate a self-contained interactive HTML viewer for the Adam_20260601_cutoff_sweep results.
+"""Generate a self-contained interactive HTML viewer for cutoff sweep results.
 
-Sweeps: ADC cutoffs (5, 10, 20, 50) × Fourier cutoffs (0, 10, 100) × rotate-noise (off/5)
-Each grid cell shows mean ± std of relative error at final step across seeds 100-104.
+Supports multiple sweep configurations selectable via an in-page dropdown:
+  v1  Adam_20260601_cutoff_sweep   — 16 tracks (TRACKS_16_NICE_EXT)
+  v2  Adam_20260601_cutoff_sweep_v2 — 13 tracks (TRACKS_13_NICE_EXT)
 
 Usage (on S3DF):
     /sdf/home/g/gregork/envs/base_env/bin/python \
@@ -19,13 +20,6 @@ import sys
 from pathlib import Path
 
 
-ADC_CUTOFFS      = [5, 10, 20, 50]
-FFT_CUTOFFS      = [0, 10, 100]
-ROTATE_NOISE_VALS = [None, 5]   # None = disabled
-SEEDS            = [100, 101, 102, 103, 104]
-PARAM_LABEL      = "trans_and_long"
-LOG_INTERVAL     = 50
-
 PARAM_PRETTY = {
     'diffusion_trans_cm2_us': 'D⊥ (cm²/μs)',
     'diffusion_long_cm2_us':  'D∥ (cm²/μs)',
@@ -37,23 +31,49 @@ PARAM_SHORT = {
 
 SEED_COLORS = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
 
+SUMMARY_STEP = 4000  # step used for grid summary stats (same for all configs)
 
-def profile_tag(adc, fft, rot):
+SWEEP_CONFIGS = [
+    {
+        "key":              "v1",
+        "label":            "16 tracks — original (Adam_20260601_cutoff_sweep)",
+        "profile_prefix":   "Adam_20260601_cutoff_sweep",
+        "adc_cutoffs":      [5, 10, 20, 50],
+        "fft_cutoffs":      [0, 10, 100],
+        "rotate_noise_vals": [None, 5],
+        "rot_tag_fn":       lambda rot: "rotoff" if rot is None else f"rot{rot}",
+        "seeds":            [100, 101, 102, 103, 104],
+        "param_label":      "trans_and_long",
+    },
+    {
+        "key":              "v2",
+        "label":            "13 tracks — v2 (Adam_20260601_cutoff_sweep_v2)",
+        "profile_prefix":   "Adam_20260601_cutoff_sweep_v2",
+        "adc_cutoffs":      [5, 10, 20, 50],
+        "fft_cutoffs":      [0, 10, 100],
+        "rotate_noise_vals": [5, -1],
+        "rot_tag_fn":       lambda rot: f"rot{rot}",
+        "seeds":            [100, 101, 102, 103, 104],
+        "param_label":      "trans_and_long",
+    },
+]
+
+
+def profile_tag(config, adc, fft, rot):
     adc_tag = f"adc{int(adc)}"
     fft_tag = f"ft{int(fft)}"
-    rot_tag = "rotoff" if rot is None else f"rot{rot}"
-    return f"Adam_20260601_cutoff_sweep_{PARAM_LABEL}_{adc_tag}_{fft_tag}_{rot_tag}"
+    rot_tag = config["rot_tag_fn"](rot)
+    return f"{config['profile_prefix']}_{config['param_label']}_{adc_tag}_{fft_tag}_{rot_tag}"
 
 
-def load_seed_result(results_dir: Path, adc, fft, rot, seed):
-    tag     = profile_tag(adc, fft, rot)
+def load_seed_result(results_dir: Path, config, adc, fft, rot, seed):
+    tag     = profile_tag(config, adc, fft, rot)
     base    = results_dir / "opt" / tag / "noise"
     pattern = f"*/result_{seed}.pkl"
     matches = list(base.glob(pattern))
     if not matches:
         return None
-    path = matches[0]
-    with open(path, "rb") as f:
+    with open(matches[0], "rb") as f:
         return pickle.load(f)
 
 
@@ -62,7 +82,7 @@ def rel_err_trajectory(param_traj, p_n_gts):
     result = []
     for pns in param_traj:
         row = []
-        for i, (pn, pn_gt) in enumerate(zip(pns, p_n_gts)):
+        for pn, pn_gt in zip(pns, p_n_gts):
             row.append(abs(math.exp(pn - pn_gt) - 1.0))
         result.append(row)
     return result
@@ -72,38 +92,40 @@ def phys_trajectory(param_traj, scales):
     """Return phys[step][param] = scale * exp(p_n)."""
     result = []
     for pns in param_traj:
-        row = []
-        for pn, sc in zip(pns, scales):
-            row.append(sc * math.exp(pn))
+        row = [sc * math.exp(pn) for pn, sc in zip(pns, scales)]
         result.append(row)
     return result
 
 
-def collect_data(results_dir: Path):
+def _rot_key(rot):
+    return 'null' if rot is None else str(rot)
+
+
+def collect_data(results_dir: Path, config):
     cells = {}
     any_loaded = False
-    for rot in ROTATE_NOISE_VALS:
-        for adc in ADC_CUTOFFS:
-            for fft in FFT_CUTOFFS:
-                key = f"{'null' if rot is None else rot}|{adc}|{fft}"
+    for rot in config["rotate_noise_vals"]:
+        for adc in config["adc_cutoffs"]:
+            for fft in config["fft_cutoffs"]:
+                key = f"{_rot_key(rot)}|{adc}|{fft}"
                 seed_data = []
-                for seed in SEEDS:
-                    res = load_seed_result(results_dir, adc, fft, rot, seed)
+                for seed in config["seeds"]:
+                    res = load_seed_result(results_dir, config, adc, fft, rot, seed)
                     if res is None:
-                        print(f"  MISSING: {profile_tag(adc, fft, rot)} seed {seed}", file=sys.stderr)
+                        tag = profile_tag(config, adc, fft, rot)
+                        print(f"  MISSING: {tag} seed {seed}", file=sys.stderr)
                         seed_data.append(None)
                         continue
                     any_loaded = True
-                    trials = res.get("trials", [])
+                    trials  = res.get("trials", [])
                     p_n_gts = res["p_n_gts"]
                     scales  = res["scales"]
 
                     if not trials:
-                        # Job still running — use live_checkpoint for a single-point snapshot
                         ckpt = res.get("live_checkpoint")
+                        tag  = profile_tag(config, adc, fft, rot)
                         if ckpt is None:
-                            # pkl exists but job preempted before any checkpoint — show as pending
-                            print(f"  PENDING (no ckpt): {profile_tag(adc, fft, rot)} seed {seed}", file=sys.stderr)
+                            print(f"  PENDING (no ckpt): {tag} seed {seed}", file=sys.stderr)
                             seed_data.append({
                                 "seed":          seed,
                                 "steps_run":     0,
@@ -118,11 +140,11 @@ def collect_data(results_dir: Path):
                                 "param_names":   list(res["param_names"]),
                             })
                             continue
-                        step   = ckpt["step"]
-                        p_cur  = ckpt["p"][:len(p_n_gts)]   # strip any MLP tail
-                        p_traj = [p_cur]
+                        step      = ckpt["step"]
+                        p_cur     = ckpt["p"][:len(p_n_gts)]
+                        p_traj    = [p_cur]
                         step_idxs = [step]
-                        print(f"  IN PROGRESS @ step {step}: {profile_tag(adc, fft, rot)} seed {seed}", file=sys.stderr)
+                        print(f"  IN PROGRESS @ step {step}: {tag} seed {seed}", file=sys.stderr)
                         seed_data.append({
                             "seed":          seed,
                             "steps_run":     step,
@@ -138,12 +160,10 @@ def collect_data(results_dir: Path):
                         })
                         continue
 
-                    trial      = trials[0]
-                    p_traj     = trial["param_trajectory"]
-                    steps_run  = trial["steps_run"]
+                    trial         = trials[0]
+                    p_traj        = trial["param_trajectory"]
+                    steps_run     = trial["steps_run"]
                     stopped_early = trial.get("stopped_early", False)
-                    # wandb-patched trials store explicit step indices; pkl trials record
-                    # every gradient step so the index IS the step number.
                     if "step_indices" in trial:
                         step_idxs = trial["step_indices"]
                     else:
@@ -162,59 +182,67 @@ def collect_data(results_dir: Path):
                         "param_names":   list(res["param_names"]),
                     })
                 cells[key] = {
-                    "adc": adc,
-                    "fft": fft,
-                    "rot": rot,
+                    "adc":   adc,
+                    "fft":   fft,
+                    "rot":   rot,
                     "seeds": seed_data,
                 }
     if not any_loaded:
-        print("WARNING: no pkl files found — check --results-dir path", file=sys.stderr)
+        print(f"  WARNING: no pkl files found for '{config['key']}' — check --results-dir path",
+              file=sys.stderr)
     return cells
 
 
-def build_payload(cells):
-    """Flatten cells into a JSON-serialisable dict, trimming numpy arrays."""
-    payload = {
-        "adc_cutoffs":       ADC_CUTOFFS,
-        "fft_cutoffs":       FFT_CUTOFFS,
-        "rotate_noise_vals": ROTATE_NOISE_VALS,
-        "seeds":             SEEDS,
-        "cells":             {},
-    }
-    param_names = None
-    param_gts   = None
-    scales      = None
+def build_payload(sweep_results):
+    """Build JSON-serialisable payload from list of (config, cells) pairs."""
+    configs_out = []
+    for config, cells in sweep_results:
+        param_names = None
+        param_gts   = None
+        scales      = None
+        cells_out   = {}
 
-    for key, cell in cells.items():
-        seeds_out = []
-        for sd in cell["seeds"]:
-            if sd is None:
-                seeds_out.append(None)
-                continue
-            if param_names is None:
-                param_names = sd["param_names"]
-                param_gts   = sd["param_gts"]
-                scales      = sd["scales"]
-            seeds_out.append({
-                "seed":          sd["seed"],
-                "steps_run":     sd["steps_run"],
-                "stopped_early": sd["stopped_early"],
-                "in_progress":   sd.get("in_progress", False),
-                "step_idxs":     sd["step_idxs"],
-                "phys_traj":     sd["phys_traj"],
-                "rel_err_traj":  sd["rel_err_traj"],
-            })
-        payload["cells"][key] = {
-            "adc":   cell["adc"],
-            "fft":   cell["fft"],
-            "rot":   cell["rot"],
-            "seeds": seeds_out,
-        }
+        for key, cell in cells.items():
+            seeds_out = []
+            for sd in cell["seeds"]:
+                if sd is None:
+                    seeds_out.append(None)
+                    continue
+                if param_names is None:
+                    param_names = sd["param_names"]
+                    param_gts   = sd["param_gts"]
+                    scales      = sd["scales"]
+                seeds_out.append({
+                    "seed":          sd["seed"],
+                    "steps_run":     sd["steps_run"],
+                    "stopped_early": sd["stopped_early"],
+                    "in_progress":   sd.get("in_progress", False),
+                    "step_idxs":     sd["step_idxs"],
+                    "phys_traj":     sd["phys_traj"],
+                    "rel_err_traj":  sd["rel_err_traj"],
+                })
+            cells_out[key] = {
+                "adc":   cell["adc"],
+                "fft":   cell["fft"],
+                "rot":   cell["rot"],
+                "seeds": seeds_out,
+            }
 
-    payload["param_names"] = param_names or ["diffusion_trans_cm2_us", "diffusion_long_cm2_us"]
-    payload["param_gts"]   = param_gts   or [1e-5, 1e-5]
-    payload["scales"]      = scales      or [1e-5, 1e-5]
-    return payload
+        # rotate_noise_vals: None → null in JSON (handled by json.dumps)
+        configs_out.append({
+            "key":               config["key"],
+            "label":             config["label"],
+            "adc_cutoffs":       config["adc_cutoffs"],
+            "fft_cutoffs":       config["fft_cutoffs"],
+            "rotate_noise_vals": config["rotate_noise_vals"],
+            "seeds":             config["seeds"],
+            "param_names":       param_names or ["diffusion_trans_cm2_us", "diffusion_long_cm2_us"],
+            "param_gts":         param_gts   or [1e-5, 1e-5],
+            "scales":            scales      or [1e-5, 1e-5],
+            "cells":             cells_out,
+        })
+
+    return {"sweep_configs": configs_out}
 
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -253,14 +281,14 @@ table.grid td.selected { outline: 3px solid #0057b7; }
 </head>
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
 <body>
-<h1>Cutoff Sweep — Diffusion Calibration (Adam_20260601)</h1>
+<h1>Cutoff Sweep — Diffusion Calibration</h1>
 
 <div class="controls">
+  <div><label>Track set:&nbsp;</label>
+    <select id="trackset-sel"></select>
+  </div>
   <div><label>Noise cycles (--rotate-noise-seeds):&nbsp;</label>
-    <select id="rot-sel">
-      <option value="null">Disabled</option>
-      <option value="5">5</option>
-    </select>
+    <select id="rot-sel"></select>
   </div>
   <div><label>Grid metric (@ step 4000):&nbsp;</label>
     <select id="param-sel"></select>
@@ -296,15 +324,21 @@ const PARAM_SHORT = {
   'diffusion_long_cm2_us':  'D∥',
 };
 const SEED_COLORS = ['#1f77b4','#ff7f0e','#2ca02c','#d62728','#9467bd'];
-const SUMMARY_STEP = 4000;  // step used for grid summary stats
+const SUMMARY_STEP = 4000;
 
-let selectedCell = null;
+let activeConfigKey = DATA.sweep_configs[0].key;
+let selectedCell    = null;
+let GLOBAL_MAX_ERR_PER_PARAM = [];
+
+function getActiveConfig() {
+  return DATA.sweep_configs.find(c => c.key === activeConfigKey);
+}
 
 // ── Colour helpers ────────────────────────────────────────────────────────────
 
 function errToHue(relErr, maxErr) {
   const t = Math.min(relErr / maxErr, 1.0);
-  const hue = 120 * (1 - t);   // 120 = green, 0 = red
+  const hue = 120 * (1 - t);
   return `hsl(${hue.toFixed(1)}, 80%, 52%)`;
 }
 
@@ -320,15 +354,71 @@ function drawColorScale() {
   }
 }
 
+// ── Dropdown builders ─────────────────────────────────────────────────────────
+
+function buildTrackSetDropdown() {
+  const sel = document.getElementById('trackset-sel');
+  sel.innerHTML = '';
+  for (const cfg of DATA.sweep_configs) {
+    const opt = document.createElement('option');
+    opt.value       = cfg.key;
+    opt.textContent = cfg.label;
+    sel.appendChild(opt);
+  }
+  sel.onchange = () => {
+    activeConfigKey = sel.value;
+    closeDetail();
+    const cfg = getActiveConfig();
+    buildRotDropdown(cfg);
+    buildParamDropdown(cfg);
+    computeGlobalMaxErr();
+    buildGrid();
+  };
+}
+
+function buildRotDropdown(config) {
+  const sel = document.getElementById('rot-sel');
+  sel.innerHTML = '';
+  for (const rot of config.rotate_noise_vals) {
+    const opt = document.createElement('option');
+    opt.value       = rot === null ? 'null' : String(rot);
+    opt.textContent = rot === null ? 'Disabled' : String(rot);
+    sel.appendChild(opt);
+  }
+  sel.onchange = () => { closeDetail(); buildGrid(); };
+}
+
+function buildParamDropdown(config) {
+  const pSel = document.getElementById('param-sel');
+  pSel.innerHTML = '';
+  for (let i = 0; i < config.param_names.length; i++) {
+    const opt = document.createElement('option');
+    opt.value       = i;
+    opt.textContent = PARAM_PRETTY[config.param_names[i]] || config.param_names[i];
+    pSel.appendChild(opt);
+  }
+  pSel.onchange = buildGrid;
+}
+
 // ── Grid rendering ────────────────────────────────────────────────────────────
 
 function cellKey(rot, adc, fft) {
   return `${rot}|${adc}|${fft}`;
 }
 
+function getSelectedRot() {
+  const v = document.getElementById('rot-sel').value;
+  return v === 'null' ? null : Number(v);
+}
+
+function getSelectedParamIdx() {
+  return Number(document.getElementById('param-sel').value);
+}
+
 function getCellSummary(rot, adc, fft, paramIdx) {
-  const key  = cellKey(rot, adc, fft);
-  const cell = DATA.cells[key];
+  const config = getActiveConfig();
+  const key    = cellKey(rot, adc, fft);
+  const cell   = config.cells[key];
   if (!cell) return { mean: null, std: null, n: 0, n_prog: 0 };
   const errs = [];
   let n_prog = 0;
@@ -336,8 +426,7 @@ function getCellSummary(rot, adc, fft, paramIdx) {
     if (!sd) continue;
     const traj = sd.rel_err_traj;
     if (!traj || traj.length === 0) continue;
-    if (sd.in_progress) { n_prog++; continue; }  // exclude in-progress from summary stats
-    // Use the entry at SUMMARY_STEP, or the last available if run stopped before it
+    if (sd.in_progress) { n_prog++; continue; }
     const idx = Math.min(
       sd.step_idxs.findIndex(s => s > SUMMARY_STEP) - 1,
       traj.length - 1
@@ -345,19 +434,18 @@ function getCellSummary(rot, adc, fft, paramIdx) {
     errs.push(traj[idx < 0 ? traj.length - 1 : idx][paramIdx]);
   }
   if (errs.length === 0) return { mean: null, std: null, n: 0, n_prog };
-  const mean = errs.reduce((a,b)=>a+b,0) / errs.length;
-  const variance = errs.reduce((s,v)=>s+(v-mean)**2, 0) / errs.length;
+  const mean     = errs.reduce((a, b) => a + b, 0) / errs.length;
+  const variance = errs.reduce((s, v) => s + (v - mean) ** 2, 0) / errs.length;
   return { mean, std: Math.sqrt(variance), n: errs.length, n_prog };
 }
 
-let GLOBAL_MAX_ERR_PER_PARAM = [];  // computed once at init; shared across rot, separate per param
-
 function computeGlobalMaxErr() {
-  const nParams = DATA.param_names.length;
+  const config  = getActiveConfig();
+  const nParams = config.param_names.length;
   GLOBAL_MAX_ERR_PER_PARAM = Array(nParams).fill(0);
-  for (const rot of DATA.rotate_noise_vals)
-    for (const adc of DATA.adc_cutoffs)
-      for (const fft of DATA.fft_cutoffs)
+  for (const rot of config.rotate_noise_vals)
+    for (const adc of config.adc_cutoffs)
+      for (const fft of config.fft_cutoffs)
         for (let pi = 0; pi < nParams; pi++) {
           const s = getCellSummary(rot, adc, fft, pi);
           if (s.mean !== null)
@@ -372,16 +460,8 @@ function fmtPct(v) {
   return (v * 100).toFixed(1) + '%';
 }
 
-function getSelectedRot() {
-  const v = document.getElementById('rot-sel').value;
-  return v === 'null' ? null : Number(v);
-}
-
-function getSelectedParamIdx() {
-  return Number(document.getElementById('param-sel').value);
-}
-
 function buildGrid() {
+  const config = getActiveConfig();
   const table  = document.getElementById('grid-table');
   const rot    = getSelectedRot();
   const pIdx   = getSelectedParamIdx();
@@ -393,26 +473,26 @@ function buildGrid() {
   const thead = table.createTHead();
   const hrow  = thead.insertRow();
   hrow.insertCell().innerHTML = '<th>|ADC| \\ FFT cut</th>';
-  for (const fft of DATA.fft_cutoffs) {
+  for (const fft of config.fft_cutoffs) {
     const th = document.createElement('th');
     th.textContent = fft === 0 ? 'No FFT cut' : `FFT ${fft} ADC²`;
     hrow.appendChild(th);
   }
 
   const tbody = table.createTBody();
-  for (const adc of DATA.adc_cutoffs) {
+  for (const adc of config.adc_cutoffs) {
     const row = tbody.insertRow();
     const lbl = document.createElement('th');
-    lbl.textContent = `|ADC| ≥ ${adc}`;
+    lbl.textContent = adc === 0 ? 'No ADC cut' : `|ADC| ≥ ${adc}`;
     row.appendChild(lbl);
 
-    for (const fft of DATA.fft_cutoffs) {
+    for (const fft of config.fft_cutoffs) {
       const td  = row.insertCell();
       const key = cellKey(rot, adc, fft);
       td.dataset.key = key;
       if (selectedCell === key) td.classList.add('selected');
 
-      const s = getCellSummary(rot, adc, fft, pIdx);
+      const s     = getCellSummary(rot, adc, fft, pIdx);
       const inner = document.createElement('div');
       inner.className = 'cell-inner';
 
@@ -421,7 +501,7 @@ function buildGrid() {
         const progTag = s.n_prog > 0 ? ` <span style="opacity:.6">(+${s.n_prog}▶)</span>` : '';
         inner.innerHTML = `<div class="mean">${fmtPct(s.mean)}</div>`
                         + `<div class="std">± ${fmtPct(s.std)}</div>`
-                        + `<div class="miss">${s.n}/${DATA.seeds.length} done${progTag}</div>`;
+                        + `<div class="miss">${s.n}/${config.seeds.length} done${progTag}</div>`;
       } else if (s.n_prog > 0) {
         td.style.background = '#c8d8f0';
         inner.innerHTML = `<div class="miss">${s.n_prog} pending/running ▶</div>`;
@@ -440,16 +520,17 @@ function buildGrid() {
 
 function onCellClick(key, adc, fft, rot) {
   selectedCell = key;
-  buildGrid();  // re-render to update selection highlight
+  buildGrid();
 
-  const cell = DATA.cells[key];
-  const rotLabel = rot === null ? 'disabled' : `${rot} steps`;
+  const config   = getActiveConfig();
+  const cell     = config.cells[key];
+  const rotLabel = rot === null ? 'disabled' : String(rot);
   document.getElementById('detail-title').textContent =
-    `ADC cutoff ${adc}  ·  FFT cutoff ${fft === 0 ? 'none' : fft + ' ADC²'}  ·  noise rotation ${rotLabel}`;
+    `ADC cutoff ${adc === 0 ? 'none' : adc}  ·  FFT cutoff ${fft === 0 ? 'none' : fft + ' ADC²'}  ·  noise rotation ${rotLabel}`;
 
-  buildDetailCharts(cell);
+  buildDetailCharts(cell, config);
   document.getElementById('detail').style.display = 'block';
-  document.getElementById('detail').scrollIntoView({behavior:'smooth', block:'nearest'});
+  document.getElementById('detail').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
 function closeDetail() {
@@ -463,7 +544,7 @@ function seedLabel(sd) {
 }
 
 const PLOTLY_LAYOUT_BASE = {
-  margin: { l:60, r:20, t:36, b:50 },
+  margin: { l: 60, r: 20, t: 36, b: 50 },
   height: 240,
   width:  500,
   paper_bgcolor: '#fff',
@@ -475,21 +556,20 @@ const PLOTLY_LAYOUT_BASE = {
 };
 const PLOTLY_CONFIG = { displayModeBar: false, responsive: false };
 
-function buildDetailCharts(cell) {
-  const row = document.getElementById('charts-row');
+function buildDetailCharts(cell, config) {
+  const row    = document.getElementById('charts-row');
   row.innerHTML = '';
 
-  const pNames = DATA.param_names;
-  const pGts   = DATA.param_gts;
+  const pNames = config.param_names;
+  const pGts   = config.param_gts;
 
-  // Clamp trajectories to SUMMARY_STEP
   function clamp(xs, ys) {
     const cutIdx = xs.findIndex(x => x > SUMMARY_STEP);
     if (cutIdx === -1) return { xs, ys };
     return { xs: xs.slice(0, cutIdx), ys: ys.slice(0, cutIdx) };
   }
 
-  // ── 1. Param value vs step (one chart per param) ──────────────────────────
+  // Param value vs step
   for (let pi = 0; pi < pNames.length; pi++) {
     const gt  = pGts[pi];
     const lbl = PARAM_PRETTY[pNames[pi]] || pNames[pi];
@@ -506,15 +586,14 @@ function buildDetailCharts(cell) {
         line: { color: SEED_COLORS[si % SEED_COLORS.length], width: 1.8 },
       });
     }
-    // GT as horizontal dashed line via shape
     const layout = Object.assign({}, PLOTLY_LAYOUT_BASE, {
       title: { text: lbl + ' vs step', font: { size: 13 } },
       yaxis: { title: lbl, tickformat: '.2e', gridcolor: '#e8e8e8' },
-      shapes: [{ type:'line', x0:0, x1:SUMMARY_STEP, y0:gt, y1:gt,
-                 line:{ color:'#888', width:1.5, dash:'dash' } }],
-      annotations: [{ x:SUMMARY_STEP, y:gt, xanchor:'right', yanchor:'bottom',
-                      text:`GT: ${fmt_si(gt)}`, showarrow:false,
-                      font:{ size:10, color:'#888' } }],
+      shapes: [{ type: 'line', x0: 0, x1: SUMMARY_STEP, y0: gt, y1: gt,
+                 line: { color: '#888', width: 1.5, dash: 'dash' } }],
+      annotations: [{ x: SUMMARY_STEP, y: gt, xanchor: 'right', yanchor: 'bottom',
+                      text: `GT: ${fmt_si(gt)}`, showarrow: false,
+                      font: { size: 10, color: '#888' } }],
     });
 
     const div = document.createElement('div');
@@ -523,7 +602,7 @@ function buildDetailCharts(cell) {
     Plotly.newPlot(div, traces, layout, PLOTLY_CONFIG);
   }
 
-  // ── 2. Relative error vs step (one chart per param) ───────────────────────
+  // Relative error vs step
   for (let pi = 0; pi < pNames.length; pi++) {
     const lbl = PARAM_SHORT[pNames[pi]] || pNames[pi];
 
@@ -562,23 +641,13 @@ function fmt_si(v) {
   return v.toExponential(2);
 }
 
-
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 function init() {
-  // Populate param dropdown
-  const pSel = document.getElementById('param-sel');
-  for (let i = 0; i < DATA.param_names.length; i++) {
-    const opt = document.createElement('option');
-    opt.value = i;
-    opt.textContent = PARAM_PRETTY[DATA.param_names[i]] || DATA.param_names[i];
-    pSel.appendChild(opt);
-  }
-  pSel.onchange = buildGrid;
-  document.getElementById('rot-sel').onchange = () => {
-    closeDetail();
-    buildGrid();
-  };
+  buildTrackSetDropdown();
+  const firstConfig = getActiveConfig();
+  buildParamDropdown(firstConfig);
+  buildRotDropdown(firstConfig);
   computeGlobalMaxErr();
   drawColorScale();
   buildGrid();
@@ -609,10 +678,13 @@ def main():
         print(f"ERROR: results-dir does not exist: {results_dir}", file=sys.stderr)
         sys.exit(1)
 
-    print("Loading pkl files...", file=sys.stderr)
-    cells   = collect_data(results_dir)
-    payload = build_payload(cells)
+    sweep_results = []
+    for config in SWEEP_CONFIGS:
+        print(f"Loading {config['label']}...", file=sys.stderr)
+        cells = collect_data(results_dir, config)
+        sweep_results.append((config, cells))
 
+    payload  = build_payload(sweep_results)
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     html = generate_html(payload)

@@ -28,6 +28,7 @@ BIND_MOUNTS = [
     "/sdf/home/g/gregork/jaxtpc",
     "/fs/ddn/sdf/group/atlas/d/gregork/jaxtpc",
     JAX_CACHE_DIR,
+    APPTAINER_TMPDIR,
 ]
 
 

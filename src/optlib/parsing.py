@@ -39,6 +39,10 @@ def parse_args(doc=None):
     p.add_argument('--efield-lr-mult', type=float, default=1.0,
                    help='LR multiplier applied to all Efield MLP weights (default: 1.0). '
                         'MLP weights typically need a different step size than physics scalars.')
+    p.add_argument('--mlp-snapshot-interval', type=int, default=0,
+                   help='Save the full MLP weight vector every N steps into mlp_trajectory '
+                        '(0 = disabled, only final_p is saved). Useful for visualising '
+                        'how the learned field evolves during training.')
     p.add_argument('--tracks', default='diagonal',
                    help='"+"-separated track presets or name:dx,dy,dz:mom_mev specs '
                         '("+" separates tracks, "," separates direction components). '
