@@ -91,7 +91,7 @@ def profile_E_debug(*, submit=True, print_sbatch_only=False, wandb_tags=None):
             results_base=f"$RESULTS_DIR/opt/E_debug/{mode}/noise",
             efield_mode=mode,
             mlp_snapshot_interval=500,
-            wandb_tags=(wandb_tags or []) + ["E_debug", "efield", mode, "13trks_nice", "noise"],
+            wandb_tags=(wandb_tags or []) + ["E_debug", "efield", mode, "13trks_nice", "noise", "fixbug2"],
             **shared,
         )
         if not print_sbatch_only:
@@ -144,7 +144,7 @@ def profile_correction_seeds(*, submit=True, print_sbatch_only=False, wandb_tags
             efield_mode="correction",
             mlp_snapshot_interval=500,
             seed=seed,
-            wandb_tags=(wandb_tags or []) + ["correction_seeds", "efield", "correction", "13trks_nice", "noise", f"seed{seed}", "fixbug1"],
+            wandb_tags=(wandb_tags or []) + ["correction_seeds", "efield", "correction", "13trks_nice", "noise", f"seed{seed}", "fixbug2"],
             **shared,
         )
         if not print_sbatch_only:

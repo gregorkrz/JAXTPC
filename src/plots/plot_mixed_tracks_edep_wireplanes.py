@@ -53,10 +53,11 @@ from tools.random_boundary_tracks import (
     N_DEFAULT_BOUNDARY_MUONS,
     filter_track_inside_volumes,
     generate_random_boundary_tracks,
+    generate_random_nice_tracks,
 )
 from tools.simulation import DetectorSimulator
 
-_PLOTS_DIR = os.path.join(os.environ.get('PLOTS_DIR', 'plots'))
+_PLOTS_DIR = os.environ.get('PLOTS_DIR', 'plots')
 
 CONFIG_PATH        = 'config/cubic_wireplane_config.yaml'
 N_SEGMENTS         = 50_000
@@ -1257,13 +1258,20 @@ def write_histograms_html(specs, dist_stats, output_dir):
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument('--output-dir', default=os.path.join(_PLOTS_DIR, '20260605', 'mixed_tracks_edep'),
-                   help='Directory for HTML files and the combined PDF')
+    p.add_argument('--output-dir', default=None,
+                   help='Directory for HTML files and the combined PDF. '
+                        'Default: plots/20260605/mixed_tracks_edep (boundary mode) or '
+                        'plots/20260605/nice_tracks_edep (--nice-tracks mode).')
     p.add_argument('--tracks', default=None,
                    help="If set: '+'-separated name:dx,dy,dz:T specs. "
                         f'If omitted: {N_DEFAULT_BOUNDARY_MUONS} random boundary muons '
                         f'plus three fixed 1000 MeV chords through East+West (random part '
                         f'T ∈ {{100,500,1000}} MeV, --seed).')
+    p.add_argument('--nice-tracks', action='store_true',
+                   help='Use generate_random_nice_tracks: near-cathode y/z-face entries '
+                        'with |x| < 1000 mm and polar angle from x-axis in [30°, 150°].')
+    p.add_argument('--n-nice', type=int, default=10,
+                   help='Number of nice tracks to generate (default: 10, used with --nice-tracks).')
     p.add_argument('--seed', type=int, default=42,
                    help='RNG seed for default random muons (default: 42)')
     p.add_argument('--signal-percentile', type=float, default=99.0,
@@ -1277,6 +1285,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.output_dir is None:
+        args.output_dir = os.path.join(
+            _PLOTS_DIR, '20260605',
+            'nice_tracks_edep' if args.nice_tracks else 'mixed_tracks_edep',
+        )
     os.makedirs(args.output_dir, exist_ok=True)
 
     print(f'JAX devices : {jax.devices()}')
@@ -1300,7 +1313,11 @@ def main():
     simulator.warm_up()
     print(f'Done ({time.time() - t0:.1f} s)')
 
-    if args.tracks is None:
+    if args.nice_tracks:
+        specs = generate_random_nice_tracks(cfg.volumes, n=args.n_nice, seed=args.seed)
+        print(f'Nice-tracks mode: {len(specs)} tracks (|x|<1000 mm y/z-face entries, '
+              f'θ∈[30°,150°] from x-axis, T~U[100,1000] MeV, seed={args.seed})')
+    elif args.tracks is None:
         specs = generate_random_boundary_tracks(
             cfg.volumes, n=N_DEFAULT_BOUNDARY_MUONS, seed=args.seed)
         print(f'Default mode: {len(specs)} tracks ({N_DEFAULT_BOUNDARY_MUONS} random + '
@@ -1313,6 +1330,8 @@ def main():
     east_mm, west_mm = outer_boundary_starts_mm(cfg.volumes)
     if args.start_position_mm is not None:
         print(f'Fixed start for all tracks (mm): {tuple(args.start_position_mm)}')
+    elif args.nice_tracks:
+        print('Per-track starts: random point on y/z face with |x| < 1000 mm')
     elif args.tracks is None:
         print('Per-track starts: random (y,z) on East or West outer x face')
     else:

@@ -84,8 +84,8 @@ Available profiles
                                dependency chain (30 jobs/chain); 4 chains × 30 = 120 jobs total.
   Adam_20260601_cutoff_sweep_v2  Same as Adam_20260601_cutoff_sweep but 13 tracks (TRACKS_13_NICE_EXT:
                                TRACKS_16_NICE_EXT minus Muon9_500MeV, Muon_throughEw..., Muon_throughWe...);
-                               sweeps ADC cutoffs (5, 10, 20, 50), Fourier cutoffs (0, 10, 100) ADC²,
-                               rotate-noise-seeds 5 and -1; 4 chains × 30 = 120 jobs total.
+                               sweeps ADC cutoffs (0, 5, 10, 20, 50), Fourier cutoffs (0, 10, 100) ADC²,
+                               rotate-noise-seeds 5 and -1; 5 chains × 30 = 150 jobs total.
   Adam_diffusionCutoff_collection_only_15tracks_v2  Like Adam_differentCutoffs_trans_and_long…v2 but
                                 the ADC cutoff and collection-only planes are applied only to both
                                 diffusion params; all other params use all planes and no cutoff.
@@ -763,6 +763,8 @@ def make_opt_command(
     sobolev_exponent=None,
     fourier_cutoff=None,
     rotate_noise_seeds=None,
+    n_random_tracks=None,
+    tracks_random_seed=None,
 ):
     """Return a run_optimization.py command string with the given settings."""
     parts = [
@@ -851,6 +853,10 @@ def make_opt_command(
         parts.append(f"--fourier-cutoff {fourier_cutoff}")
     if rotate_noise_seeds is not None:
         parts.append(f"--rotate-noise-seeds {rotate_noise_seeds}")
+    if n_random_tracks is not None:
+        parts.append(f"--N-random-tracks {int(n_random_tracks)}")
+    if tracks_random_seed is not None:
+        parts.append(f"--tracks-random-seed {int(tracks_random_seed)}")
     return " ".join(parts)
 
 
@@ -6209,10 +6215,10 @@ def profile_Adam_20260601_cutoff_sweep(*, submit=True, print_sbatch_only=False, 
 def profile_Adam_20260601_cutoff_sweep_v2(*, submit=True, print_sbatch_only=False, wandb_tags=None, skip_complete=False):
     """13 tracks: TRACKS_16_NICE_EXT minus Muon9_500MeV, Muon_throughEw..., Muon_throughWe...
 
-    Sweeps ADC cutoffs (5, 10, 20, 50), Fourier cutoffs (0, 10, 100) ADC², rotate-noise-seeds 5 and -1;
+    Sweeps ADC cutoffs (0, 5, 10, 20, 50), Fourier cutoffs (0, 10, 100) ADC², rotate-noise-seeds 5 and -1;
     trans+long diffusion only, 5k steps, noisy GT (noise_scale=1), seeds 100–104.
     Each ADC cutoff is a separate dependency chain (same as v1).
-    Total: 4 ADC × 3 FFT × 2 rot × 5 seeds = 120 jobs (4 chains of 30).
+    Total: 5 ADC × 3 FFT × 2 rot × 5 seeds = 150 jobs (5 chains of 30).
     """
     shared = dict(
         tracks=TRACKS_13_NICE_EXT,
@@ -6244,7 +6250,7 @@ def profile_Adam_20260601_cutoff_sweep_v2(*, submit=True, print_sbatch_only=Fals
     params = "diffusion_trans_cm2_us,diffusion_long_cm2_us"
     param_label = "trans_and_long"
     seeds = [100, 101, 102, 103, 104]
-    adc_cutoffs = [5, 10, 20, 50]
+    adc_cutoffs = [0, 5, 10, 20, 50]
     fft_cutoffs = [0, 10, 100]
     rotate_noise_vals = [5, -1]
 

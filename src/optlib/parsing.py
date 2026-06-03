@@ -39,6 +39,9 @@ def parse_args(doc=None):
     p.add_argument('--efield-lr-mult', type=float, default=1.0,
                    help='LR multiplier applied to all Efield MLP weights (default: 1.0). '
                         'MLP weights typically need a different step size than physics scalars.')
+    p.add_argument('--efield-per-volume', action='store_true', default=False,
+                   help='Use separate MLP weights for each drift volume (east + west) '
+                        'instead of one shared model. Doubles the MLP parameter count.')
     p.add_argument('--mlp-snapshot-interval', type=int, default=0,
                    help='Save the full MLP weight vector every N steps into mlp_trajectory '
                         '(0 = disabled, only final_p is saved). Useful for visualising '
@@ -47,6 +50,12 @@ def parse_args(doc=None):
                    help='"+"-separated track presets or name:dx,dy,dz:mom_mev specs '
                         '("+" separates tracks, "," separates direction components). '
                         f'Default: diagonal.  Presets: {", ".join(TRACK_PRESETS)}')
+    p.add_argument('--N-random-tracks', type=int, default=0, metavar='N',
+                   help='If > 0, ignore --tracks and generate N random near-cathode tracks '
+                        'via generate_random_nice_tracks: y/z-face entries with |x| < 1000 mm, '
+                        'polar angle from x-axis in [30°, 150°], T ~ U[100, 1000] MeV.')
+    p.add_argument('--tracks-random-seed', type=int, default=7, metavar='SEED',
+                   help='RNG seed for --N-random-tracks (default: 7).')
     p.add_argument('--loss', default='sobolev_loss_geomean_log1p', choices=VALID_LOSSES,
                    help='Loss function (default: sobolev_loss_geomean_log1p)')
     p.add_argument('--optimizer', default='adam', choices=VALID_OPTIMIZERS,

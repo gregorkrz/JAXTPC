@@ -94,6 +94,7 @@ from tools.losses import (
 )
 from tools.noise import generate_noise
 from tools.particle_generator import generate_muon_track
+from tools.random_boundary_tracks import generate_random_nice_tracks
 from tools.simulation import DetectorSimulator
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -181,12 +182,16 @@ def build_loss_fn(loss_name, fwd_fn, gt_arrays, weights, adc_cutoff=0.0, active_
 
 
 def build_phase_fns(loss_name, simulator, setter, batches, *, return_per_track_loss=False,
-                    return_hessian=False, adc_cutoff=0.0, active_planes=None):
+                    return_hessian=False, adc_cutoff=0.0, active_planes=None,
+                    return_per_vol_loss=False):
     """Return one callable per batch in a phase.
 
     Default ``fn(p) -> (loss, grad)``. When ``return_per_track_loss=True``,
     ``fn(p) -> (loss, grad, per_track_losses)`` where ``per_track_losses`` has
     shape ``(batch_size,)`` and sums to ``loss``.
+    When ``return_per_vol_loss=True`` (requires ``return_per_track_loss=True``),
+    ``per_track_losses`` has shape ``(batch_size, 1+n_vols)`` where column 0 is
+    the per-track total and columns 1..n_vols are per-volume contributions.
     When ``return_hessian=True``, ``fn(p) -> (loss, grad, hessian)`` where
     ``hessian`` has shape ``(n_params, n_params)``. Mutually exclusive with
     ``return_per_track_loss``.
@@ -229,7 +234,7 @@ def build_phase_fns(loss_name, simulator, setter, batches, *, return_per_track_l
     compiled_cache = {}
 
     def _get_compiled(bs):
-        key = (bs, return_per_track_loss, return_hessian)
+        key = (bs, return_per_track_loss, return_hessian, return_per_vol_loss)
         if key in compiled_cache:
             return compiled_cache[key]
 
@@ -293,9 +298,32 @@ def build_phase_fns(loss_name, simulator, setter, batches, *, return_per_track_l
                         lb = l1_loss(pred, gt_b)
                     else:
                         raise ValueError(f'Unknown loss {loss_name!r}')
-                    loss_terms.append(lb)
+                    if return_per_vol_loss:
+                        # Per-volume losses: restrict pred/gt/wts to each volume's planes.
+                        vol_losses = []
+                        for v in range(n_volumes):
+                            lo, hi = v * n_planes_per_vol, (v + 1) * n_planes_per_vol
+                            pred_v = pred[lo:hi]
+                            gt_v   = gt_b[lo:hi]
+                            wts_v  = wts_b[lo:hi]
+                            planes_v = tuple(p - lo for p in planes
+                                             if lo <= p < hi)
+                            if loss_name == 'sobolev_loss':
+                                lv = sobolev_loss(pred_v, gt_v, wts_v, planes_v)
+                            elif loss_name == 'sobolev_loss_geomean_log1p':
+                                lv = sobolev_loss_geomean_log1p(pred_v, gt_v, wts_v, planes_v)
+                            elif loss_name == 'mse_loss':
+                                lv = mse_loss(pred_v, gt_v)
+                            elif loss_name == 'l1_loss':
+                                lv = l1_loss(pred_v, gt_v)
+                            else:
+                                raise ValueError(f'Unknown loss {loss_name!r}')
+                            vol_losses.append(lv)
+                        loss_terms.append(jnp.stack([lb, *vol_losses]))
+                    else:
+                        loss_terms.append(lb)
                 losses_arr = jnp.stack(loss_terms)
-                return jnp.sum(losses_arr), losses_arr
+                return jnp.sum(losses_arr if not return_per_vol_loss else losses_arr[:, 0]), losses_arr
 
             compiled = jax.jit(jax.value_and_grad(fn, argnums=0, has_aux=True))
         else:
@@ -495,9 +523,15 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
         if pt is not None and ph_init_groups is not None:
             groups = ph_init_groups[batch_idx]
             pt_np = np.asarray(pt)
+            _pt_tot = pt_np[:, 0] if pt_np.ndim == 2 else pt_np
+            _pt_vol = pt_np[:, 1:] if pt_np.ndim == 2 else None
             for loc_i, (gi, nm) in enumerate(groups):
                 sk = _wandb_track_metric_suffix(nm)
-                wandb_track_extra_init[f'loss/track/{gi}_{sk}'] = float(pt_np[loc_i])
+                wandb_track_extra_init[f'loss/track/{gi}_{sk}'] = float(_pt_tot[loc_i])
+                if _pt_vol is not None:
+                    for vi, vname in enumerate(('east', 'west')):
+                        if vi < _pt_vol.shape[1]:
+                            wandb_track_extra_init[f'loss/vol/{vname}/{gi}_{sk}'] = float(_pt_vol[loc_i, vi])
     param_traj.append(p[:n_rec].tolist())
     loss_traj.append(lv_init)
     grad_traj.append(gv_init[:n_rec].tolist())
@@ -588,10 +622,16 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
         if use_wandb and _WANDB_AVAILABLE and wandb_track_batch_groups is not None and pt_new is not None:
             groups = wandb_track_batch_groups[ph_idx][last_batch_idx]
             pt_np = np.asarray(pt_new)
+            _pt_tot = pt_np[:, 0] if pt_np.ndim == 2 else pt_np
+            _pt_vol = pt_np[:, 1:] if pt_np.ndim == 2 else None
             thin = {'trial': trial_idx}
             for loc_i, (gi, nm) in enumerate(groups):
                 sk = _wandb_track_metric_suffix(nm)
-                thin[f'loss/track/{gi}_{sk}'] = float(pt_np[loc_i])
+                thin[f'loss/track/{gi}_{sk}'] = float(_pt_tot[loc_i])
+                if _pt_vol is not None:
+                    for vi, vname in enumerate(('east', 'west')):
+                        if vi < _pt_vol.shape[1]:
+                            thin[f'loss/vol/{vname}/{gi}_{sk}'] = float(_pt_vol[loc_i, vi])
             _wandb.log(thin, step=step + 1)
 
         if freeze_enabled and len(param_traj) > patience_per_param:
@@ -767,7 +807,12 @@ def main():
         # Store the raw spec for later; resolution happens below after active_planes is set.
         _planes_per_param_spec = args.planes_per_param
 
-    track_specs = parse_tracks(args.tracks)
+    if args.N_random_tracks > 0:
+        _volumes = generate_detector(CONFIG_PATH).volumes
+        track_specs = generate_random_nice_tracks(
+            _volumes, n=args.N_random_tracks, seed=args.tracks_random_seed)
+    else:
+        track_specs = parse_tracks(args.tracks)
     _range_vals = list(getattr(args, 'range'))
     if len(_range_vals) % 2 != 0:
         raise ValueError(f'--range requires an even number of values, got {len(_range_vals)}')
@@ -1008,6 +1053,7 @@ def main():
                 kw['electric_dist_path'] = args.electric_dist_path
             elif efield_present and role == 'diff':
                 kw['efield_model'] = efield_cfg
+                kw['efield_per_volume'] = args.efield_per_volume
             sim = DetectorSimulator(detector_config, **kw)
             # Diff sim: inject zero MLP weights so warm-up compiles with a valid
             # sce_models pytree (real weights flow in later with same structure).
@@ -1037,12 +1083,19 @@ def main():
         import tools.nonlocal_efield as _nl
         efield_cfg = build_efield_config(
             gt_sim, gt_params, mode=args.efield_mode, hidden=args.efield_hidden)
-        efield_zero_params = _nl.zero_params(efield_cfg)
+        _single_zero = _nl.zero_params(efield_cfg)
+        if args.efield_per_volume:
+            # Stack two independent zero param sets (one per volume) with leading axis 2.
+            efield_zero_params = jax.tree.map(
+                lambda a, b: jnp.stack([a, b], axis=0), _single_zero, _single_zero)
+        else:
+            efield_zero_params = _single_zero
         _flat0, efield_unravel = _nl.flatten_params(efield_zero_params)
         efield_n_mlp = int(_flat0.size)
+        _pv_tag = '  per_volume=True' if args.efield_per_volume else ''
         print(f'Efield MLP    : mode={args.efield_mode}  hidden={tuple(args.efield_hidden)}  '
-              f'weights={efield_n_mlp:,}  lr_mult={args.efield_lr_mult}  '
-              f'GT map={args.electric_dist_path}')
+              f'weights={efield_n_mlp:,}  lr_mult={args.efield_lr_mult}'
+              f'{_pv_tag}  GT map={args.electric_dist_path}')
 
     if args.gt_param_multiplier != 1.0:
         for _pname in param_names:
@@ -1320,7 +1373,8 @@ def main():
                             return_per_track_loss=log_track_losses_wandb,
                             return_hessian=is_newton,
                             adc_cutoff=args.sobolev_loss_cutoff,
-                            active_planes=active_planes)
+                            active_planes=active_planes,
+                            return_per_vol_loss=log_track_losses_wandb and efield_present)
                         for fn in fns:
                             out = fn(p)
                             jax.block_until_ready(out)
@@ -1563,6 +1617,7 @@ def main():
             n_weights     = efield_n_mlp,
             n_scalar      = n_scalar,
             lr_mult       = args.efield_lr_mult,
+            per_volume    = args.efield_per_volume,
             gt_map_path   = args.electric_dist_path,
             center_cm     = list(efield_cfg.center_cm),
             half_cm       = list(efield_cfg.half_cm),

@@ -28,6 +28,9 @@ _FIXED_THROUGH_BOTH_CHORDS = (
 
 _MUON_ENERGIES_MEV = (100, 500, 1000)
 
+_NICE_TRACK_X_RANGE_MM  = 1000.0  # |x| < this for near-cathode face entries
+_NICE_TRACK_THETA_MIN_DEG = 30.0  # min polar angle from x-axis (drift direction)
+
 
 def _balanced_boundary_energies_mev(rng, n: int) -> list[int]:
     """Return ``n`` energies spread as evenly as possible across ``_MUON_ENERGIES_MEV``."""
@@ -180,6 +183,84 @@ def _oblique_through_both_volume_muons():
         _fixed_chord_muon_track(name, a, b, momentum_mev=1000.0)
         for name, a, b in _FIXED_THROUGH_BOTH_CHORDS
     ]
+
+
+def _sample_nice_direction(rng):
+    """Unit direction with polar angle θ from x-axis in [30°, 150°].
+
+    Samples cos θ uniformly in [−cos 30°, +cos 30°] and φ uniformly in [0, 2π).
+    Negating the result maps θ → π−θ, which stays in the same range, so the
+    caller can safely negate to enforce the inward-facing constraint.
+    """
+    cos_max = float(np.cos(np.radians(_NICE_TRACK_THETA_MIN_DEG)))  # ≈ 0.866
+    u = float(rng.uniform(-cos_max, cos_max))
+    phi = float(rng.uniform(0.0, 2.0 * np.pi))
+    sin_theta = float(np.sqrt(1.0 - u * u))
+    return (u, sin_theta * float(np.cos(phi)), sin_theta * float(np.sin(phi)))
+
+
+def _random_nice_face_entry_mm(rng, volumes):
+    """Random point on a y/z face of the combined volume with |x| < _NICE_TRACK_X_RANGE_MM.
+
+    Faces are weighted by area. Returns (start_mm, outward_normal).
+    """
+    east = volumes[0]
+    y0 = east.ranges_cm[1][0] * 10.0
+    y1 = east.ranges_cm[1][1] * 10.0
+    z0 = east.ranges_cm[2][0] * 10.0
+    z1 = east.ranges_cm[2][1] * 10.0
+    x_lo, x_hi = -_NICE_TRACK_X_RANGE_MM, _NICE_TRACK_X_RANGE_MM
+
+    x_span = x_hi - x_lo
+    a_tb = x_span * (z1 - z0)  # top / bottom face area
+    a_fb = x_span * (y1 - y0)  # front / back face area
+    total = 2.0 * a_tb + 2.0 * a_fb
+
+    r = float(rng.uniform(0.0, total))
+    x = float(rng.uniform(x_lo, x_hi))
+    if r < a_tb:
+        return (x, y1, float(rng.uniform(z0, z1))), (0.0,  1.0,  0.0)
+    elif r < 2.0 * a_tb:
+        return (x, y0, float(rng.uniform(z0, z1))), (0.0, -1.0,  0.0)
+    elif r < 2.0 * a_tb + a_fb:
+        return (x, float(rng.uniform(y0, y1)), z1), (0.0,  0.0,  1.0)
+    else:
+        return (x, float(rng.uniform(y0, y1)), z0), (0.0,  0.0, -1.0)
+
+
+def generate_random_nice_tracks(volumes, n=10, seed=7):
+    """Generate n near-cathode muon tracks entering through y/z faces with |x| < 1000 mm.
+
+    Entry points are sampled uniformly on the four y/z faces of the combined TPC
+    volume (weighted by area), restricted to |x| < 1000 mm so tracks sample the
+    near-cathode region rather than the anode region.
+
+    Direction: polar angle from the x-axis (drift direction) drawn uniformly in
+    [30°, 150°] by sampling cos θ ∈ [−cos 30°, cos 30°] and φ ∈ [0, 2π). If the
+    sampled direction points outward from the chosen face it is negated — valid
+    because the angle range is symmetric around 90°, so negation maps θ → π−θ,
+    which stays in [30°, 150°].
+
+    Energy is drawn uniformly (continuous float) from [100, 1000] MeV.
+
+    Returns list[dict] with keys: name, direction, momentum_mev, start_position_mm.
+    """
+    rng = np.random.default_rng(seed)
+    specs = []
+    for i in range(1, n + 1):
+        start_mm, outward_normal = _random_nice_face_entry_mm(rng, volumes)
+        d = _sample_nice_direction(rng)
+        dot = d[0]*outward_normal[0] + d[1]*outward_normal[1] + d[2]*outward_normal[2]
+        if dot > 0.0:
+            d = (-d[0], -d[1], -d[2])
+        t_mev = float(rng.uniform(100.0, 1000.0))
+        specs.append(dict(
+            name=f'NiceMuon{i}_{int(round(t_mev))}MeV',
+            direction=d,
+            momentum_mev=t_mev,
+            start_position_mm=start_mm,
+        ))
+    return specs
 
 
 def generate_random_boundary_tracks(
