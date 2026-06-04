@@ -81,6 +81,43 @@ def _qty(cl, cg, xs, ys, zs):
     }
 
 
+def _corrections_3d_data(co_arr, xs, ys, zs, step=2):
+    """Return subsampled grid + correction values for Plotly Scatter3d."""
+    co = np.asarray(co_arr, dtype=np.float32)
+    xs_s = np.array(xs)[::step]
+    ys_s = np.array(ys)[::step]
+    zs_s = np.array(zs)[::step]
+    co_s = co[::step, ::step, ::step]
+    XG, YG, ZG = np.meshgrid(xs_s, ys_s, zs_s, indexing='ij')
+    return {
+        'x':  XG.ravel().round(2).tolist(),
+        'y':  YG.ravel().round(2).tolist(),
+        'z':  ZG.ravel().round(2).tolist(),
+        'dx': co_s[..., 0].ravel().round(3).tolist(),
+        'dy': co_s[..., 1].ravel().round(3).tolist(),
+        'dz': co_s[..., 2].ravel().round(3).tolist(),
+    }
+
+
+def _build_vol3d(step_snap, gt_data, grid):
+    """Return {side: {learned:…, gt:… or null}} for 3D scatter displays."""
+    out = {}
+    for side in ('east', 'west'):
+        lrn     = step_snap['learned'].get(side, {})
+        gt_side = (gt_data or {}).get(side)
+        if 'corrections_cm' not in lrn:
+            out[side] = None
+            continue
+        xs, ys, zs = _axes(grid[side])
+        co_l = np.array(lrn['corrections_cm'])
+        co_g = np.array(gt_side['corrections_cm']) if gt_side else None
+        out[side] = {
+            'learned': _corrections_3d_data(co_l, xs, ys, zs),
+            'gt':      _corrections_3d_data(co_g, xs, ys, zs) if co_g is not None else None,
+        }
+    return out
+
+
 def _build_quantities(step_snap, gt_data, grid):
     """Return {side: {type: {component: qty_entry}}}.
 
@@ -157,13 +194,15 @@ def load_eval_pkl(path):
     grid    = ev['grid']
     steps_out = []
     for snap in ev['steps']:
-        sides = _build_quantities(snap, gt_data, grid)
+        sides  = _build_quantities(snap, gt_data, grid)
+        vol3d  = _build_vol3d(snap, gt_data, grid)
         if not any(sides.values()):
             continue
         steps_out.append({
             'label': f"step {snap['step']}",
             'step':  snap['step'],
             'sides': sides,
+            'vol3d': vol3d,
         })
     if not steps_out:
         return None
@@ -195,7 +234,9 @@ h2  { margin: 0 0 10px; font-size: 16px; }
 .cg label { font-size: 11px; color: #666; font-weight: 600; }
 .cg select { padding: 5px 8px; border-radius: 5px; border: 1px solid #ccc;
              background: #fafafa; font-size: 13px; }
-.plots { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 10px; }
+.plots    { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 10px; }
+.plots-3d { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-top: 10px; }
+.section-title { font-weight: 700; font-size: 13px; color: #444; margin: 12px 0 4px; }
 .panel { background: #fff; border-radius: 8px; padding: 8px 10px;
          box-shadow: 0 1px 3px rgba(0,0,0,.1); }
 .panel-title { text-align: center; font-weight: 700; font-size: 13px;
@@ -238,12 +279,26 @@ h2  { margin: 0 0 10px; font-size: 16px; }
       <option value="yz">YZ (central x)</option>
     </select>
   </div>
+  <div class="cg">
+    <label>3D source</label>
+    <select id="src3d-sel" onchange="render3d()">
+      <option value="learned">Learned</option>
+      <option value="gt">GT</option>
+      <option value="diff">GT − Learned</option>
+    </select>
+  </div>
 </div>
 <div class="plots">
   <div class="panel"><div class="panel-title">Ground truth</div><div class="panel-info" id="gt-info"></div><div id="gt-div"></div></div>
   <div class="panel"><div class="panel-title">Learned (MLP)</div><div class="panel-info" id="lrn-info"></div><div id="lrn-div"></div></div>
   <div class="panel"><div class="panel-title">Difference (GT − learned)</div><div class="panel-info" id="diff-info"></div><div id="diff-div"></div></div>
   <div class="panel"><div class="panel-title">Relative diff ((GT − learned) / |GT|)</div><div class="panel-info" id="reldiff-info"></div><div id="reldiff-div"></div></div>
+</div>
+<div class="section-title">3D drift corrections [cm]</div>
+<div class="plots-3d">
+  <div class="panel"><div class="panel-title">Δx</div><div id="3d-dx"></div></div>
+  <div class="panel"><div class="panel-title">Δy</div><div id="3d-dy"></div></div>
+  <div class="panel"><div class="panel-title">Δz</div><div id="3d-dz"></div></div>
 </div>
 <script>
 const DATA = /*DATA_PLACEHOLDER*/null/*END*/;
@@ -312,6 +367,74 @@ function plotHeat(id, sl, zmin, zmax, cs, lyt) {
   Plotly.newPlot(id, [heatTrace(sl, zmin, zmax, cs)], lyt, PLOTLY_CFG);
 }
 
+function noData3d(id) {
+  Plotly.newPlot(id, [], {
+    ...LAYOUT_BASE, height: 400,
+    annotations: [{text: 'not available', xref:'paper', yref:'paper',
+                   x:0.5, y:0.5, showarrow:false, font:{size:13, color:'#bbb'}}]
+  }, PLOTLY_CFG);
+}
+
+function render3d() {
+  const ri   = +document.getElementById('run-sel').value;
+  const si   = +document.getElementById('step-sel').value;
+  const side = document.getElementById('side-sel').value;
+  const src  = document.getElementById('src3d-sel').value;
+
+  const step = DATA[ri].steps[si];
+  const vd   = step.vol3d && step.vol3d[side];
+  if (!vd) { ['3d-dx','3d-dy','3d-dz'].forEach(noData3d); return; }
+
+  const lrn = vd.learned;
+  const gt  = vd.gt;
+  if (!lrn) { ['3d-dx','3d-dy','3d-dz'].forEach(noData3d); return; }
+
+  const COMPS = [['dx','Δx [cm]','3d-dx'], ['dy','Δy [cm]','3d-dy'], ['dz','Δz [cm]','3d-dz']];
+  for (const [key, title, pid] of COMPS) {
+    let vals;
+    if (src === 'gt') {
+      if (!gt) { noData3d(pid); continue; }
+      vals = gt[key];
+    } else if (src === 'diff') {
+      if (!gt) { noData3d(pid); continue; }
+      vals = lrn[key].map((v, i) => gt[key][i] - v);
+    } else {
+      vals = lrn[key];
+    }
+
+    const absMax = Math.max(...vals.map(Math.abs));
+    const cRange = absMax > 1e-6
+      ? {cmin: -absMax, cmax: absMax}
+      : {cmin: -1e-6, cmax: 1e-6};
+
+    const trace = {
+      type: 'scatter3d', mode: 'markers',
+      x: lrn.x, y: lrn.y, z: lrn.z,
+      marker: {
+        size: 2.5, opacity: 0.85,
+        color: vals, colorscale: 'RdBu', reversescale: true,
+        ...cRange,
+        colorbar: {thickness: 12, len: 0.7, tickfont: {size: 9},
+                   title: {text: title, font: {size: 10}}},
+      },
+      hovertemplate: `x:%{x:.1f} y:%{y:.1f} z:%{z:.1f}<br>${title}:%{marker.color:.3f}<extra></extra>`,
+    };
+
+    Plotly.newPlot(pid, [trace], {
+      margin: {l: 0, r: 0, t: 4, b: 0},
+      height: 420,
+      paper_bgcolor: '#fff',
+      scene: {
+        xaxis: {title: {text:'x [cm]', font:{size:10}}, tickfont:{size:9}},
+        yaxis: {title: {text:'y [cm]', font:{size:10}}, tickfont:{size:9}},
+        zaxis: {title: {text:'z [cm]', font:{size:10}}, tickfont:{size:9}},
+        aspectmode: 'data',
+      },
+    }, {displayModeBar: true, responsive: false,
+        modeBarButtonsToRemove: ['toImage','sendDataToCloud']});
+  }
+}
+
 function render() {
   const ri   = +document.getElementById('run-sel').value;
   const si   = +document.getElementById('step-sel').value;
@@ -356,6 +479,8 @@ function render() {
     plotHeat('reldiff-div', slR, rmin2, rmax2, 'RdBu', lyt);
     sliceInfo('reldiff-info', slR);
   } else { noData('reldiff-div'); document.getElementById('reldiff-info').textContent = ''; }
+
+  render3d();
 }
 
 function onTypeChange() {

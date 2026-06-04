@@ -1007,7 +1007,39 @@ def write_track_catalog_pdf(specs, path, stats=None):
     print(f'  Saved {path}')
 
 
-def write_histograms_html(specs, dist_stats, output_dir):
+def _compute_edep_hist_data(tracks_raw, n_bins=60):
+    """Pre-bin edep x/y/z per track with shared detector-bounds edges.
+
+    Returns a dict suitable for embedding as EDEP_HIST in histograms.html:
+    ``{x_edges, y_edges, z_edges, tracks: [{hx, hy, hz}, ...]}``.
+    Tracks with no deposits get ``None``.
+    """
+    # Use fixed detector bounds ±2160 mm so edges are stable across runs.
+    lo, hi = -2160.0, 2160.0
+    x_edges = np.linspace(lo, hi, n_bins + 1)
+    y_edges = np.linspace(lo, hi, n_bins + 1)
+    z_edges = np.linspace(lo, hi, n_bins + 1)
+
+    track_hists = []
+    for track in tracks_raw:
+        pos = np.asarray(track['position'])
+        if len(pos) == 0:
+            track_hists.append(None)
+            continue
+        hx = np.histogram(pos[:, 0], bins=x_edges)[0].tolist()
+        hy = np.histogram(pos[:, 1], bins=y_edges)[0].tolist()
+        hz = np.histogram(pos[:, 2], bins=z_edges)[0].tolist()
+        track_hists.append({'hx': hx, 'hy': hy, 'hz': hz})
+
+    return {
+        'x_edges': [round(float(v), 2) for v in x_edges],
+        'y_edges': [round(float(v), 2) for v in y_edges],
+        'z_edges': [round(float(v), 2) for v in z_edges],
+        'tracks': track_hists,
+    }
+
+
+def write_histograms_html(specs, dist_stats, output_dir, edep_hist_data=None):
     """Self-contained interactive HTML: pick muons, see histograms of E / theta / phi / drift distances."""
     _UGLY_TRACKS = ['Muon4_100MeV', 'Muon5_100MeV', 'Muon10_100MeV',
                     'Muon12_100MeV', 'Muon13_100MeV']
@@ -1081,6 +1113,8 @@ def write_histograms_html(specs, dist_stats, output_dir):
         '    svg { display: block; overflow: visible; }\n'
         '    .bar { fill: #4682B4; opacity: 0.72; }\n'
         '    .bar:hover { opacity: 1; }\n'
+        '    .edep-bar { fill: #3a9e6a; opacity: 0.75; }\n'
+        '    .edep-bar:hover { opacity: 1; }\n'
         '  </style>\n'
         '</head>\n'
         '<body>\n'
@@ -1098,10 +1132,13 @@ def write_histograms_html(specs, dist_stats, output_dir):
         '    <a href="index.html" style="font-size:0.82rem;color:#4682B4;display:block;margin-bottom:0.75rem">&#8592; Back to 3D event displays</a>\n'
         '    <h1>Track histograms</h1>\n'
         '    <div class="hist-grid" id="hist-grid"></div>\n'
+        '    <h2 style="font-size:0.9rem;font-weight:600;margin:1rem 0 0.5rem;color:#444">Energy deposit coordinates (mm)</h2>\n'
+        '    <div class="hist-grid" id="edep-hist-grid"></div>\n'
         '  </div>\n'
         '  <script>\n'
         '  __JS_DATA__\n'
         '  var UGLY_TRACKS = __UGLY_JS__;\n'
+        '  var EDEP_HIST = __EDEP_HIST_JS__;\n'
         '  var QUANTITIES = [\n'
         "    {key: 'E',         label: 'T (MeV)'},\n"
         "    {key: 'theta',     label: 'θ (°)'},\n"
@@ -1196,11 +1233,80 @@ def write_histograms_html(specs, dist_stats, output_dir):
         '    return svg;\n'
         '  }\n'
         '\n'
+        '  function buildPreBinnedSVGEl(counts, edges) {\n'
+        '    var n = counts.length;\n'
+        '    var pw = SVG_W - PL - PR, ph = SVG_H - PT - PB;\n'
+        '    var svg = se("svg", {width: SVG_W, height: SVG_H});\n'
+        '    var total = 0;\n'
+        '    for (var i = 0; i < n; i++) total += counts[i];\n'
+        '    if (total === 0) {\n'
+        '      svg.appendChild(st("text", {x: SVG_W/2, y: SVG_H/2, "text-anchor": "middle", "font-size": "12", fill: "#999"}, "no data"));\n'
+        '      return svg;\n'
+        '    }\n'
+        '    var maxCnt = 1;\n'
+        '    for (var mi = 0; mi < n; mi++) { if (counts[mi] > maxCnt) maxCnt = counts[mi]; }\n'
+        '    var bw = pw / n;\n'
+        '    for (var b = 0; b < n; b++) {\n'
+        '      var x = PL + b * bw;\n'
+        '      var cnt = counts[b];\n'
+        '      var bh = (cnt / maxCnt) * ph;\n'
+        '      if (cnt > 0 && bh < 1) bh = 1;\n'
+        '      var y = PT + ph - bh;\n'
+        '      var r = se("rect", {"class": "edep-bar", x: (x+0.5).toFixed(1), y: y.toFixed(1), width: Math.max(1, bw-1).toFixed(1), height: bh.toFixed(1)});\n'
+        '      svg.appendChild(r);\n'
+        '    }\n'
+        '    svg.appendChild(se("line", {x1: PL, y1: PT+ph, x2: PL+pw, y2: PT+ph, stroke: "#888", "stroke-width": "1"}));\n'
+        '    var lo = edges[0], hi = edges[edges.length-1];\n'
+        '    for (var t = 0; t <= 4; t++) {\n'
+        '      var frac = t / 4, xp = PL + frac * pw, xval = lo + frac * (hi - lo);\n'
+        '      svg.appendChild(se("line", {x1: xp.toFixed(1), y1: (PT+ph).toFixed(1), x2: xp.toFixed(1), y2: (PT+ph+4).toFixed(1), stroke: "#888", "stroke-width": "1"}));\n'
+        '      svg.appendChild(st("text", {x: xp.toFixed(1), y: (PT+ph+14).toFixed(1), "text-anchor": "middle", "font-size": "9", fill: "#555"}, fmtVal(xval)));\n'
+        '    }\n'
+        '    svg.appendChild(se("line", {x1: PL, y1: PT, x2: PL, y2: PT+ph, stroke: "#888", "stroke-width": "1"}));\n'
+        '    for (var t2 = 0; t2 <= 4; t2++) {\n'
+        '      var frac2 = t2 / 4, yp = PT + ph - frac2 * ph, ycnt = Math.round(frac2 * maxCnt);\n'
+        '      svg.appendChild(se("line", {x1: (PL-3).toFixed(1), y1: yp.toFixed(1), x2: PL, y2: yp.toFixed(1), stroke: "#888", "stroke-width": "1"}));\n'
+        '      svg.appendChild(st("text", {x: (PL-5).toFixed(1), y: (yp+3).toFixed(1), "text-anchor": "end", "font-size": "9", fill: "#555"}, ycnt));\n'
+        '    }\n'
+        '    return svg;\n'
+        '  }\n'
+        '\n'
+        '  function renderEdepHistograms(selIndices) {\n'
+        '    if (!EDEP_HIST) return;\n'
+        '    var n = EDEP_HIST.x_edges.length - 1;\n'
+        '    var sumX = [], sumY = [], sumZ = [];\n'
+        '    for (var b = 0; b < n; b++) { sumX.push(0); sumY.push(0); sumZ.push(0); }\n'
+        '    for (var ci = 0; ci < selIndices.length; ci++) {\n'
+        '      var d = EDEP_HIST.tracks[selIndices[ci]];\n'
+        '      if (!d) continue;\n'
+        '      for (var b2 = 0; b2 < n; b2++) { sumX[b2] += d.hx[b2]; sumY[b2] += d.hy[b2]; sumZ[b2] += d.hz[b2]; }\n'
+        '    }\n'
+        '    var edepGrid = document.getElementById("edep-hist-grid");\n'
+        '    while (edepGrid.firstChild) edepGrid.removeChild(edepGrid.firstChild);\n'
+        '    var axes = [\n'
+        '      {label: "Edep x (mm)", counts: sumX, edges: EDEP_HIST.x_edges},\n'
+        '      {label: "Edep y (mm)", counts: sumY, edges: EDEP_HIST.y_edges},\n'
+        '      {label: "Edep z (mm)", counts: sumZ, edges: EDEP_HIST.z_edges},\n'
+        '    ];\n'
+        '    for (var ai = 0; ai < axes.length; ai++) {\n'
+        '      var ax = axes[ai];\n'
+        '      var card = document.createElement("div");\n'
+        '      card.className = "hist-card";\n'
+        '      var h3 = document.createElement("h3");\n'
+        '      h3.textContent = ax.label;\n'
+        '      card.appendChild(h3);\n'
+        '      card.appendChild(buildPreBinnedSVGEl(ax.counts, ax.edges));\n'
+        '      edepGrid.appendChild(card);\n'
+        '    }\n'
+        '  }\n'
+        '\n'
         '  function render() {\n'
         '    var cbs = document.querySelectorAll(".muon-cb:checked");\n'
-        '    var selTracks = [], selNames = [];\n'
+        '    var selTracks = [], selNames = [], selIndices = [];\n'
         '    for (var ci = 0; ci < cbs.length; ci++) {\n'
-        '      var tr = TRACKS[+cbs[ci].value];\n'
+        '      var idx = +cbs[ci].value;\n'
+        '      selIndices.push(idx);\n'
+        '      var tr = TRACKS[idx];\n'
         '      selTracks.push(tr);\n'
         '      selNames.push(tr.name);\n'
         '    }\n'
@@ -1219,6 +1325,7 @@ def write_histograms_html(specs, dist_stats, output_dir):
         '      card.appendChild(buildSVGEl(hist, selNames));\n'
         '      grid.appendChild(card);\n'
         '    }\n'
+        '    renderEdepHistograms(selIndices);\n'
         '  }\n'
         '\n'
         '  function selectPreset(preset) {\n'
@@ -1245,9 +1352,11 @@ def write_histograms_html(specs, dist_stats, output_dir):
         '</html>'
     )
 
+    edep_hist_js = json.dumps(edep_hist_data, separators=(',', ':')) if edep_hist_data else 'null'
     page = (_TMPL
             .replace('__JS_DATA__', js_data)
             .replace('__UGLY_JS__', ugly_js)
+            .replace('__EDEP_HIST_JS__', edep_hist_js)
             .replace('__CHECKBOXES__', checkbox_items_html))
     path = os.path.join(output_dir, 'histograms.html')
     with open(path, 'w', encoding='utf-8') as f:
@@ -1457,7 +1566,8 @@ def main():
         })
 
     dist_stats = _compute_drift_dist_stats(tracks_raw)
-    write_histograms_html(specs, dist_stats, args.output_dir)
+    write_histograms_html(specs, dist_stats, args.output_dir,
+                          edep_hist_data=_compute_edep_hist_data(tracks_raw))
     write_edep_index_html(specs, args.output_dir, stats=track_stats,
                           pdf_name=os.path.basename(pdf_path),
                           pixel_counts=pixel_counts,

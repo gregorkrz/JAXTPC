@@ -352,7 +352,7 @@ class DetectorSimulator:
             # For scan, all volumes must share one factory. Use volume 0's maps.
             # (Different per-volume SCE requires stacking maps — future work.)
             efield_fn, corr_fn = sce_per_volume[0]
-            def sce_factory(sim_params=None, ef=efield_fn, cf=corr_fn, nf=_nominal_field):
+            def sce_factory(sim_params=None, vol_params=None, ef=efield_fn, cf=corr_fn, nf=_nominal_field):
                 def _sce(positions_cm):
                     E_local = ef(positions_cm)
                     E_normalized = E_local / nf
@@ -361,7 +361,7 @@ class DetectorSimulator:
                 return _sce
         else:
             # Nominal SCE — identical for all volumes in local frame
-            def sce_factory(sim_params=None):
+            def sce_factory(sim_params=None, vol_params=None):
                 def _sce(pos):
                     N = pos.shape[0]
                     corr = jnp.broadcast_to(

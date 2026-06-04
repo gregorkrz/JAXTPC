@@ -146,6 +146,39 @@ def s3df_submit(command: str, *, time: str = "02:00:00", gpus: int = 1,
     return None
 
 
+def _make_progress_header(n_total: int) -> str:
+    """Bash snippet: progress-tracking variables + _log_progress / _maybe_log helpers."""
+    return f"""\
+_N_TOTAL={n_total}
+_N_DONE=0
+_N_FAILED=0
+_START_SEC=$(date +%s)
+_LAST_LOG_SEC=$_START_SEC
+echo "[progress $(date '+%H:%M:%S')] starting {n_total} commands"
+
+_log_progress() {{
+  local _now; _now=$(date +%s)
+  local _el=$(( _now - _START_SEC ))
+  local _rem=$(( _N_TOTAL - _N_DONE ))
+  local _ts; _ts=$(date '+%H:%M:%S')
+  if (( _el > 0 && _N_DONE > 0 )); then
+    local _eta=$(( _el * _rem / _N_DONE ))
+    echo "[progress $_ts] $_N_DONE/$_N_TOTAL done ($_N_FAILED failed), $_rem remaining | elapsed $((_el/60))m$((_el%60))s | ETA ~$((_eta/3600))h$(((_eta%3600)/60))m$((_eta%60))s"
+  else
+    echo "[progress $_ts] $_N_DONE/$_N_TOTAL done ($_N_FAILED failed)"
+  fi
+  _LAST_LOG_SEC=$_now
+}}
+
+_maybe_log() {{
+  local _now; _now=$(date +%s)
+  if (( (_now - _LAST_LOG_SEC) >= 60 || _N_DONE == _N_TOTAL )); then
+    _log_progress
+  fi
+}}
+"""
+
+
 def s3df_submit_multi(
     commands: List[str],
     *,
@@ -157,11 +190,16 @@ def s3df_submit_multi(
     submit: bool = False,
     print_sbatch_command: bool = False,
     sbatch_commands_out: Optional[List[str]] = None,
+    log_progress: bool = False,
 ) -> Optional[str]:
     """Submit one Slurm job that runs *commands* sequentially on a single GPU.
 
     Each command runs in its own apptainer invocation; a failure is logged but
     does NOT abort the remaining commands (no ``set -e``).
+
+    Pass log_progress=True to emit a timestamped progress line (count done,
+    failures, elapsed, ETA) after each command — rate-limited to once per
+    minute so fast commands don't produce excessive output.
     """
     JOBS_DIR.mkdir(exist_ok=True)
 
@@ -173,13 +211,25 @@ def s3df_submit_multi(
 
     binds = " ".join(f"--bind {m}" for m in BIND_MOUNTS)
 
-    wrapped_lines = []
-    for cmd in commands:
-        esc = shlex.quote(cmd)
-        wrapped_lines.append(
-            f"apptainer exec --nv {binds} {APPTAINER_IMAGE} bash -c {esc}"
-            f" || echo 'FAILED (exit $?): {cmd[:120]}'"
-        )
+    if log_progress:
+        progress_header = _make_progress_header(len(commands))
+        wrapped_lines = [progress_header]
+        for cmd in commands:
+            esc = shlex.quote(cmd)
+            wrapped_lines.append(
+                f"apptainer exec --nv {binds} {APPTAINER_IMAGE} bash -c {esc}"
+                f" || {{ _N_FAILED=$((_N_FAILED+1)); echo 'FAILED (exit $?): {cmd[:120]}'; }}"
+            )
+            wrapped_lines.append("_N_DONE=$((_N_DONE+1))")
+            wrapped_lines.append("_maybe_log")
+    else:
+        wrapped_lines = []
+        for cmd in commands:
+            esc = shlex.quote(cmd)
+            wrapped_lines.append(
+                f"apptainer exec --nv {binds} {APPTAINER_IMAGE} bash -c {esc}"
+                f" || echo 'FAILED (exit $?): {cmd[:120]}'"
+            )
 
     exclude_line = (
         [f"#SBATCH --exclude={','.join(BLACKLISTED_NODES)}"]
