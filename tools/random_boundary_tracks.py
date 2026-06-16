@@ -263,6 +263,80 @@ def generate_random_nice_tracks(volumes, n=10, seed=7):
     return specs
 
 
+def generate_random_boundary_track(volumes, seed, *, min_x_mm: float = 1000.0):
+    """Generate a single random boundary-track starting on a face of the inner box.
+
+    The inner box spans x ∈ [−min_x_mm, +min_x_mm] and y/z over both active volumes.
+    One of the 6 faces is chosen with probability proportional to its area, then a
+    uniform point on that face is picked as the start position.
+
+    Direction: theta (polar angle from x-axis / drift direction) drawn uniformly in
+    [0, π], alpha (azimuthal around x-axis) uniformly in [0, 2π).  The resulting
+    vector is flipped when it points outward from the chosen face so it always aims
+    into the volume.
+
+    Returns:
+        (direction, start_position_mm) — each a tuple of 3 floats.
+    """
+    rng = np.random.default_rng(seed)
+    east = volumes[0]
+    y0, y1 = east.ranges_cm[1][0] * 10.0, east.ranges_cm[1][1] * 10.0
+    z0, z1 = east.ranges_cm[2][0] * 10.0, east.ranges_cm[2][1] * 10.0
+    y_span, z_span = y1 - y0, z1 - z0
+    x_span = 2.0 * min_x_mm
+
+    # 6 faces: 0=x−, 1=x+, 2=y−, 3=y+, 4=z−, 5=z+
+    areas = np.array([
+        y_span * z_span,   # x− face
+        y_span * z_span,   # x+ face
+        x_span * z_span,   # y− face
+        x_span * z_span,   # y+ face
+        x_span * y_span,   # z− face
+        x_span * y_span,   # z+ face
+    ])
+    face = int(rng.choice(6, p=areas / areas.sum()))
+
+    # Outward unit normals for each face
+    normals = ((-1,0,0),(1,0,0),(0,-1,0),(0,1,0),(0,0,-1),(0,0,1))
+
+    if face == 0:   # x = -min_x_mm
+        sx = -min_x_mm
+        sy = float(rng.uniform(y0, y1))
+        sz = float(rng.uniform(z0, z1))
+    elif face == 1: # x = +min_x_mm
+        sx = min_x_mm
+        sy = float(rng.uniform(y0, y1))
+        sz = float(rng.uniform(z0, z1))
+    elif face == 2: # y = y0
+        sx = float(rng.uniform(-min_x_mm, min_x_mm))
+        sy = y0
+        sz = float(rng.uniform(z0, z1))
+    elif face == 3: # y = y1
+        sx = float(rng.uniform(-min_x_mm, min_x_mm))
+        sy = y1
+        sz = float(rng.uniform(z0, z1))
+    elif face == 4: # z = z0
+        sx = float(rng.uniform(-min_x_mm, min_x_mm))
+        sy = float(rng.uniform(y0, y1))
+        sz = z0
+    else:           # z = z1
+        sx = float(rng.uniform(-min_x_mm, min_x_mm))
+        sy = float(rng.uniform(y0, y1))
+        sz = z1
+
+    theta = float(rng.uniform(np.radians(25.0), np.pi))
+    alpha = float(rng.uniform(0.0, 2.0 * np.pi))
+    dx = float(np.cos(theta))
+    dy = float(np.sin(theta) * np.cos(alpha))
+    dz = float(np.sin(theta) * np.sin(alpha))
+
+    nx, ny, nz = normals[face]
+    if dx * nx + dy * ny + dz * nz > 0:
+        dx, dy, dz = -dx, -dy, -dz
+
+    return (dx, dy, dz), (sx, sy, sz)
+
+
 def generate_random_boundary_tracks(
     volumes,
     n=N_DEFAULT_BOUNDARY_MUONS,

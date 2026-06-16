@@ -46,6 +46,12 @@ def wandb_config_dict(args, *, param_names, track_specs, schedule, effective_see
         command=argv_cmd,
         param_names=param_names,
         track_names=[t['name'] for t in track_specs],
+        track_specs_full=[{
+            'name': t['name'],
+            'direction': list(t['direction']),
+            'momentum_mev': t['momentum_mev'],
+            'start_position_mm': list(t['start_position_mm']) if t.get('start_position_mm') else None,
+        } for t in track_specs],
         schedule_phases=[_wandb_json_safe(ph) for ph in schedule],
         output_path=output_path,
         jax_compilation_cache_dir=jax.config.jax_compilation_cache_dir,

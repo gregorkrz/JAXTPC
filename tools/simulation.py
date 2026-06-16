@@ -102,6 +102,7 @@ class DetectorSimulator:
         differentiable=False,
         n_segments=None,
         iterate_mode='scan',
+        include_wire_response=True,
     ):
         print("--- Creating DetectorSimulator ---")
 
@@ -235,6 +236,20 @@ class DetectorSimulator:
                 max_sigma_trans_unitless=global_sigma_trans,
                 max_sigma_long_unitless=global_sigma_long,
             )
+            if not include_wire_response:
+                print("   Wire response DISABLED — using delta kernels (diffusion only)")
+                new_kernels = {}
+                for plane, rk in self.response_kernels.items():
+                    bins_per_wire = int(round(1.0 / rk.wire_spacing))
+                    raw_t = rk.time_zero_bin + 1
+                    raw_w = rk.wire_zero_bin * bins_per_wire
+                    delta_base = jnp.zeros_like(rk.base_kernel).at[raw_t, raw_w].set(1.0)
+                    new_dk = generate_dkernel_table(
+                        global_sigma_trans, global_sigma_long * cfg.time_step_us,
+                        delta_base, rk.kernel_dx, rk.kernel_dy, rk.s_levels,
+                        ks_w=rk.ks_w, ks_t=rk.ks_t)
+                    new_kernels[plane] = rk._replace(DKernel=new_dk, base_kernel=delta_base)
+                self.response_kernels = new_kernels
 
         # Build shared factories
         sce_factory, _build_response_fn, _build_response_fn_diff, _recomb_fn = \

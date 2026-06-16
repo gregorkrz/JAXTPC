@@ -39,6 +39,7 @@ Each pickle contains:
   param_names, param_gts, scales, p_n_gts,
   optimizer, lr, lr_schedule, max_steps, tol, patience, N,
   tol_per_param, patience_per_param  optional; present when coordinate freezing is enabled
+  phase2_params, phase2_start_step  optional; present when --phase2-params is set
   loss_name, tracks,
   range_intervals,     list of (lo, hi) factor pairs
   factor_grid,           list of [f1, ...] per trial
@@ -391,6 +392,7 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
               wandb_track_batch_groups=None,
               tol_per_param=None, patience_per_param=None,
               initial_frozen_mask=None,
+              phase2_start_step=None, phase2_active_mask=None,
               effective_batch_size=1,
               newton_damping=None,
               clip_grad_norm=0.0,
@@ -413,6 +415,15 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
     change from the value ``patience_per_param`` steps ago is below ``tol_per_param``,
     and (ii) every consecutive step in that window has relative step change below
     ``tol_per_param``. Resumed trials restore ``initial_frozen_mask``.
+
+    phase2_start_step / phase2_active_mask: when both set, implements a fixed two-phase
+    gradient mask over the named (scalar) coordinates. ``phase2_active_mask`` is a
+    length-``n_named`` 0/1 vector marking the params active in phase 2. For
+    ``step < phase2_start_step`` the *complement* of this mask is active (i.e. all
+    other named params are optimized, ``phase2_active_mask`` params are frozen); for
+    ``step >= phase2_start_step`` only ``phase2_active_mask`` params are active.
+    Any non-named coordinates (e.g. Efield MLP weights) are always active. Independent
+    of and combinable with ``tol_per_param``/``patience_per_param`` freezing.
 
     checkpoint_callback: ``callback(step, p, opt_state, frozen_mask=None)`` —
     ``frozen_mask`` is a numpy bool vector when per-parameter freezing is enabled.
@@ -450,6 +461,19 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
             raise ValueError(
                 f'initial_frozen_mask length {fm.shape[0]} != n_params {n_dim}')
         frozen_np = fm.copy()
+
+    phase2_enabled = phase2_start_step is not None and phase2_active_mask is not None
+    if phase2_enabled:
+        p2 = np.asarray(phase2_active_mask, dtype=np.float32).reshape(-1)
+        if p2.shape[0] != n_named:
+            raise ValueError(
+                f'phase2_active_mask length {p2.shape[0]} != n_named {n_named}')
+        _phase2_mask = np.ones(n_dim, dtype=np.float32)
+        _phase2_mask[:n_named] = p2
+        _phase1_mask = np.ones(n_dim, dtype=np.float32)
+        _phase1_mask[:n_named] = 1.0 - p2
+        _phase1_mask_jnp = jnp.asarray(_phase1_mask)
+        _phase2_mask_jnp = jnp.asarray(_phase2_mask)
 
     param_traj = []
     loss_traj  = []
@@ -606,6 +630,8 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
             if freeze_enabled:
                 active = jnp.asarray(~frozen_np, dtype=jnp.float32)
                 gv = gv * active
+            if phase2_enabled:
+                gv = gv * (_phase2_mask_jnp if step >= phase2_start_step else _phase1_mask_jnp)
             updates, opt_state = optimizer.update(gv, opt_state)
             p = optax.apply_updates(p, updates)
             fn_eval = batch_fns[last_batch_idx]
@@ -619,20 +645,20 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
         if _mlp_snap and (step + 1) % _mlp_snap == 0:
             mlp_traj.append((step + 1, np.asarray(p).tolist()))
 
+        _pt_extra = None
         if use_wandb and _WANDB_AVAILABLE and wandb_track_batch_groups is not None and pt_new is not None:
             groups = wandb_track_batch_groups[ph_idx][last_batch_idx]
             pt_np = np.asarray(pt_new)
             _pt_tot = pt_np[:, 0] if pt_np.ndim == 2 else pt_np
             _pt_vol = pt_np[:, 1:] if pt_np.ndim == 2 else None
-            thin = {'trial': trial_idx}
+            _pt_extra = {'trial': trial_idx}
             for loc_i, (gi, nm) in enumerate(groups):
                 sk = _wandb_track_metric_suffix(nm)
-                thin[f'loss/track/{gi}_{sk}'] = float(_pt_tot[loc_i])
+                _pt_extra[f'loss/track/{gi}_{sk}'] = float(_pt_tot[loc_i])
                 if _pt_vol is not None:
                     for vi, vname in enumerate(('east', 'west')):
                         if vi < _pt_vol.shape[1]:
-                            thin[f'loss/vol/{vname}/{gi}_{sk}'] = float(_pt_vol[loc_i, vi])
-            _wandb.log(thin, step=step + 1)
+                            _pt_extra[f'loss/vol/{vname}/{gi}_{sk}'] = float(_pt_vol[loc_i, vi])
 
         if freeze_enabled and len(param_traj) > patience_per_param:
             W = patience_per_param
@@ -673,11 +699,14 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
                                 lr_multipliers=lr_multipliers,
                                 phase=ph_idx if multi_phase else None,
                                 extra_metrics={**(freeze_metrics or {}),
-                                               **(newton_step_metrics or {})})
+                                               **(newton_step_metrics or {}),
+                                               **(_pt_extra or {})})
             if checkpoint_callback is not None:
                 checkpoint_callback(
                     step + 1, p, opt_state,
                     frozen_np if freeze_enabled else None)
+        elif _pt_extra is not None and use_wandb and _WANDB_AVAILABLE:
+            _wandb.log(_pt_extra, step=step + 1)
 
     # Ensure the final step is always included in mlp_traj (avoid duplicate if already there).
     if _mlp_snap:
@@ -782,6 +811,42 @@ def main():
             print('error: --init-from-wandb-run is not supported together with "Efield".',
                   file=sys.stderr)
             raise SystemExit(2)
+
+    # Two-phase param schedule: optimize all params except --phase2-params until
+    # --phase2-start-step, then optimize only --phase2-params.
+    if (args.phase2_params is None) ^ (args.phase2_start_step is None):
+        print('error: use both --phase2-params and --phase2-start-step, or neither.',
+              file=sys.stderr)
+        raise SystemExit(2)
+    phase2_enabled = args.phase2_params is not None
+    phase2_active_mask = None
+    phase2_names = None
+    if phase2_enabled:
+        if is_newton:
+            print('error: --phase2-params is not compatible with --optimizer newton.',
+                  file=sys.stderr)
+            raise SystemExit(2)
+        phase2_names = [n.strip() for n in args.phase2_params.split(',') if n.strip()]
+        if not phase2_names:
+            print('error: --phase2-params is empty.', file=sys.stderr)
+            raise SystemExit(2)
+        for n in phase2_names:
+            if n not in param_names:
+                print(f'error: --phase2-params: unknown param {n!r}. '
+                      f'Choose from: {param_names}', file=sys.stderr)
+                raise SystemExit(2)
+        if len(set(phase2_names)) != len(phase2_names):
+            print('error: duplicate param names in --phase2-params.', file=sys.stderr)
+            raise SystemExit(2)
+        if len(phase2_names) == len(param_names):
+            print('error: --phase2-params must be a strict subset of --params.', file=sys.stderr)
+            raise SystemExit(2)
+        if args.phase2_start_step < 0:
+            print('error: --phase2-start-step must be >= 0.', file=sys.stderr)
+            raise SystemExit(2)
+        _phase2_set = set(phase2_names)
+        phase2_active_mask = np.array(
+            [1.0 if n in _phase2_set else 0.0 for n in param_names], dtype=np.float32)
 
     # Per-parameter ADC cutoffs + planes: build a list of (cutoff, planes_tuple, [param_indices])
     # groups. Params sharing the same (cutoff, planes) share one compiled phase-fn set.
@@ -932,6 +997,10 @@ def main():
     if freeze_params_enabled:
         print(f'Freeze coords: tol_per_param={args.tol_per_param}  '
               f'patience_per_param={args.patience_per_param}')
+    if phase2_enabled:
+        _phase1_names = [n for n in param_names if n not in set(phase2_names)]
+        print(f'Phase 1 (steps 0-{args.phase2_start_step}): optimize {_phase1_names}')
+        print(f'Phase 2 (steps {args.phase2_start_step}-{args.max_steps}): optimize {phase2_names}')
     print(f'N            : {args.N}')
     print(f'Seed         : {effective_seed}')
     print(f'Noise scale  : {args.noise_scale}')
@@ -1586,6 +1655,8 @@ def main():
         patience            = args.patience,
         tol_per_param       = args.tol_per_param,
         patience_per_param  = args.patience_per_param,
+        phase2_params       = phase2_names,
+        phase2_start_step   = args.phase2_start_step,
         N                   = args.N,
         loss_name           = args.loss,
         active_planes       = active_planes,
@@ -1681,6 +1752,8 @@ def main():
             patience_per_param=(
                 args.patience_per_param if freeze_params_enabled else None),
             initial_frozen_mask=init_frozen_mask,
+            phase2_start_step=(args.phase2_start_step if phase2_enabled else None),
+            phase2_active_mask=(phase2_active_mask if phase2_enabled else None),
             newton_damping=(args.newton_damping if is_newton else None),
             clip_grad_norm=args.clip_grad_norm,
             rotating_phase_schedules=(_rotating_phase_schedules if _rotate_n > 0 else None),

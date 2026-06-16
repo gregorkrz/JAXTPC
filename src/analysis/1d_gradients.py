@@ -170,6 +170,10 @@ def parse_args():
                    help='Noise amplitude (0 = no noise, 1.0 = realistic; default: 0)')
     p.add_argument('--noise-seed', type=int, default=42,
                    help='RNG seed for noise (default: 42)')
+    p.add_argument('--noise-seeds', default=None,
+                   help='Comma-separated list of noise seeds to run in one invocation. '
+                        'Each seed writes its own pkl; existing pkls are skipped. '
+                        'Cannot be combined with --output.')
     p.add_argument('--sobolev-max-pad', type=int, default=128,
                    help='Max padding for Sobolev weight construction (default: 128)')
     p.add_argument('--sobolev-s', default=None,
@@ -207,6 +211,10 @@ def parse_args():
                    help='Fix this parameter to --fixed-value instead of GT')
     p.add_argument('--fixed-value', type=float, default=None,
                    help='Physical value for --fixed-param')
+    p.add_argument('--no-wire-response', action='store_true',
+                   help='Use delta kernels instead of wire response (diffusion only)')
+    p.add_argument('--overwrite', action='store_true',
+                   help='Recompute and overwrite existing output pkl files instead of skipping them')
     return p.parse_args()
 
 
@@ -434,11 +442,12 @@ def build_fourier_map_fn(n_planes, out_size):
 
 # ── Output path ────────────────────────────────────────────────────────────────
 
-def auto_output_path(args, loss_name, track_specs, factor=None):
+def auto_output_path(args, loss_name, track_specs, factor=None, noise_seed_override=None):
     tracks_tag  = (f'{len(track_specs)}tracks' if len(track_specs) > 1
                    else track_specs[0]['name'])
     if args.noise_scale > 0.0:
-        seed_suffix = f'_seed{args.noise_seed}' if args.noise_seed != 42 else ''
+        effective_seed = noise_seed_override if noise_seed_override is not None else args.noise_seed
+        seed_suffix = f'_seed{effective_seed}' if effective_seed != 42 else ''
         noise_tag = f'_noise{args.noise_scale:.3g}'.replace('.', 'p') + seed_suffix
     else:
         noise_tag = ''
@@ -488,6 +497,14 @@ def main():
     else:
         fourier_cutoffs_list = [args.fourier_cutoff]
 
+    # ── Resolve noise seeds list ──────────────────────────────────────────────
+    if args.noise_seeds is not None:
+        if args.output is not None:
+            raise ValueError('--output cannot be combined with --noise-seeds')
+        noise_seeds_list = [int(s.strip()) for s in args.noise_seeds.split(',')]
+    else:
+        noise_seeds_list = [args.noise_seed]
+
     print(f'JAX devices   : {jax.devices()}')
     print(f'Parameter     : {args.param}')
     print(f'Loss          : {loss_name}')
@@ -496,6 +513,7 @@ def main():
     print(f'Tracks        : {[t["name"] for t in track_specs]}')
     print(f'Step size     : {args.step_size} mm  max deposits={args.max_deposits:,}')
     print(f'Noise scale   : {args.noise_scale}')
+    print(f'Noise seeds   : {noise_seeds_list}')
     print(f'Sobolev pad   : {args.sobolev_max_pad}')
     print(f'Sobolev s     : {sobolev_s_list}')
     print(f'ADC cutoffs   : {cutoffs_list}')
@@ -504,32 +522,34 @@ def main():
     if args.fixed_param:
         print(f'Fixed param   : {args.fixed_param} = {args.fixed_value}')
 
-    # ── Build all (sobolev_s, adc_cutoff, fourier_cutoff) triples; skip done ──
+    # ── Build all (sobolev_s, adc_cutoff, fourier_cutoff) triples ────────────
     all_triples = [(s, ac, fc)
                    for s in sobolev_s_list
                    for ac in cutoffs_list
                    for fc in fourier_cutoffs_list]
-    if args.output is not None:
-        if os.path.exists(args.output):
-            print(f'Output already exists, skipping: {args.output}')
-            return
-        pending_triples = all_triples
-    else:
-        pending_triples = []
-        for s, ac, fc in all_triples:
-            args.sobolev_s      = s
-            args.adc_cutoff     = ac
-            args.fourier_cutoff = fc
-            p = auto_output_path(args, loss_name, track_specs)
-            if os.path.exists(p):
-                print(f'  exists, skip s={s} adc={ac} fourier={fc}: {p}')
-            else:
-                pending_triples.append((s, ac, fc))
-        if not pending_triples:
-            print('All combinations already computed.')
-            return
-        if len(pending_triples) < len(all_triples):
-            print(f'  {len(pending_triples)}/{len(all_triples)} combinations pending.')
+
+    # ── Early-exit if everything is already done (avoids building simulator) ──
+    if not args.overwrite:
+        if args.output is not None:
+            if os.path.exists(args.output):
+                print(f'Output already exists, skipping: {args.output}')
+                return
+        else:
+            pending_total = 0
+            for _seed in noise_seeds_list:
+                for _s, _ac, _fc in all_triples:
+                    args.sobolev_s      = _s
+                    args.adc_cutoff     = _ac
+                    args.fourier_cutoff = _fc
+                    if not os.path.exists(auto_output_path(args, loss_name, track_specs,
+                                                           noise_seed_override=_seed)):
+                        pending_total += 1
+            if pending_total == 0:
+                print('All combinations already computed.')
+                return
+        n_total = len(noise_seeds_list) * len(all_triples)
+        if pending_total < n_total:
+            print(f'  {pending_total}/{n_total} combinations pending.')
 
     # ── Simulator ─────────────────────────────────────────────────────────────
     print('\nBuilding differentiable simulator...')
@@ -545,6 +565,7 @@ def main():
         include_track_hits=False,
         include_digitize=False,
         track_config=None,
+        include_wire_response=not args.no_wire_response,
     )
 
     print('Warming up JIT...')
@@ -571,12 +592,11 @@ def main():
     print(f'GT value      : {args.param} = {param_gt:.6g}  '
           f'(scale={scale:.6g},  p_n_gt={p_n_gt:.6g})')
 
-    # ── Build GT arrays for every track (cutoff-independent) ──────────────────
+    # ── Build clean GT arrays for every track (noise applied per-seed later) ───
     print('\nGenerating GT arrays for all tracks...')
-    per_track_base = []   # (name, deposits, gt_arrays, weights)  — no masks
+    per_track_base_clean = []   # (name, deposits, clean_gt_arrays) — no noise, no masks
 
-    noise_base_key = jax.random.PRNGKey(args.noise_seed)
-    for track_idx, ts in enumerate(track_specs):
+    for ts in track_specs:
         frac_start = ts.get('frac_start', 0.0)
         frac_end   = ts.get('frac_end',   1.0)
         print(f'  track {ts["name"]}  dir={ts["direction"]}  T={ts["momentum_mev"]} MeV'
@@ -606,14 +626,14 @@ def main():
         gt_arrays = tuple(simulator.forward(gt_params, deposits))
         jax.block_until_ready(gt_arrays)
 
-        if args.noise_scale > 0.0:
-            track_noise_key = jax.random.fold_in(noise_base_key, track_idx)
-            gt_arrays = apply_noise(gt_arrays, simulator, args.noise_scale, track_noise_key)
-
         all_abs = jnp.concatenate([jnp.abs(a).ravel() for a in gt_arrays])
         print(f'    Signal ADC: max={float(all_abs.max()):.3g}  '
               f'mean={float(all_abs.mean()):.3g}')
-        per_track_base.append((ts['name'], deposits, gt_arrays))
+        # Keep GT arrays on host (numpy): with many tracks, holding all of them as
+        # device arrays for the whole run is what blows the GPU memory budget, even
+        # though the GPU comfortably fits one track's worth of arrays at a time.
+        gt_arrays_np = tuple(np.asarray(a, dtype=np.float32) for a in gt_arrays)
+        per_track_base_clean.append((ts['name'], deposits, gt_arrays_np))
 
     # ── Plane name list (U1, V1, Y1, U2, V2, Y2) ─────────────────────────────
     cfg = simulator.config
@@ -621,13 +641,6 @@ def main():
     for v in range(cfg.n_volumes):
         for p in range(cfg.volumes[v].n_planes):
             plane_names_all.append(f'{cfg.plane_names[v][p]}{v + 1}')
-
-    # GT arrays collected once for store_arrays (cutoff-independent)
-    if args.store_arrays:
-        per_track_gt_arrays = {
-            name: [np.array(a, dtype=np.float32) for a in gt_arrs]
-            for name, _, gt_arrs in per_track_base
-        }
 
     # ── Parameter grid ────────────────────────────────────────────────────────
     if args.factors is not None:
@@ -647,12 +660,12 @@ def main():
         print(f'  factor={f:.6f}  p_n={pn:.6f}  {args.param}={v:.6g}{marker}')
 
     # ── Compile once (mask/weight values are dynamic — no retrace per combination) ─
-    n_planes = len(per_track_base[0][2])
+    n_planes = len(per_track_base_clean[0][2])
     vag_fn   = build_value_and_grad(loss_name, simulator, _make_params, n_planes)
 
     print('\nCompiling value_and_grad (once for all tracks and combinations)...')
     t0 = time.time()
-    _, _dep0, _gt0 = per_track_base[0]
+    _, _dep0, _gt0 = per_track_base_clean[0]
     _wt0_compile = tuple(
         make_sobolev_weight(a.shape[0], a.shape[1], max_pad=args.sobolev_max_pad, s=sobolev_s_list[0])
         for a in _gt0
@@ -670,7 +683,7 @@ def main():
         pixel_grad_fn = build_pixel_grad_fn(loss_name, n_planes)
         print('\nCompiling pixel_grad_fn...')
         t0 = time.time()
-        _fwd0 = simulator.forward(_make_params(jnp.array(p_n_values[0])), _dep0)
+        _fwd0 = simulator.forward(_make_params(jnp.array(p_n_values[0])), _dep0)  # noqa: uses clean dep0
         _ = pixel_grad_fn(_fwd0, _gt0, _wt0_compile, _allmask0)
         jax.block_until_ready(_)
         _ = pixel_grad_fn(_fwd0, _gt0, _wt0_compile, _allmask0)
@@ -688,275 +701,325 @@ def main():
         jax.block_until_ready(_)
         print(f'Done ({time.time() - t0:.1f} s)')
 
-    # ── Loop over (sobolev_s, adc_cutoff, fourier_cutoff) combinations ───────
-    for sobolev_s, adc_cutoff, fourier_cutoff in pending_triples:
-        print(f'\n{"─" * 60}')
-        print(f'sobolev_s={sobolev_s}  ADC cutoff={adc_cutoff}  Fourier cutoff={fourier_cutoff}  '
-              f'({len(factors)} param points × {len(per_track_base)} tracks)')
+    # ── Outer loop: one iteration per noise seed ──────────────────────────────
+    for noise_seed in noise_seeds_list:
 
-        # Output path for this combination
-        args.sobolev_s      = sobolev_s
-        args.adc_cutoff     = adc_cutoff
-        args.fourier_cutoff = fourier_cutoff
-        output_path = args.output or auto_output_path(args, loss_name, track_specs)
-        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
-
-        # Build per_track_data: sobolev weights, ADC masks, Fourier mask
-        per_track_data = []
-        for name, deposits, gt_arrays in per_track_base:
-            weights = tuple(
-                make_sobolev_weight(a.shape[0], a.shape[1], max_pad=args.sobolev_max_pad, s=sobolev_s)
-                for a in gt_arrays
-            )
-            masks = tuple(
-                jnp.ones(a.shape, dtype=bool) if adc_cutoff == 0.0
-                else (jnp.abs(a) >= adc_cutoff)
-                for a in gt_arrays
-            )
-            if adc_cutoff > 0.0:
-                n_total_px  = sum(m.size for m in masks)
-                n_masked_px = sum(int(jnp.sum(~m)) for m in masks)
-                print(f'  {name}: {n_masked_px:,}/{n_total_px:,} pixels zeroed '
-                      f'({100 * n_masked_px / n_total_px:.1f}%)')
-            if fourier_cutoff > 0.0:
-                eff_weights = tuple(
-                    compute_fourier_masked_weight(w, a, args.sobolev_max_pad, fourier_cutoff)
-                    for w, a in zip(weights, gt_arrays)
-                )
-                n_total_freq  = sum(w.size for w in eff_weights)
-                n_masked_freq = sum(int(jnp.sum(ew == 0.0)) for ew in eff_weights)
-                print(f'  {name}: Fourier cutoff {fourier_cutoff}: '
-                      f'{n_masked_freq:,}/{n_total_freq:,} freq bins zeroed '
-                      f'({100 * n_masked_freq / n_total_freq:.1f}%)')
-            else:
-                eff_weights = weights
-            per_track_data.append((name, deposits, gt_arrays, eff_weights, masks))
-
-        # Per-cutoff accumulators (arrays skipped when save_per_factor — flushed per sweep pt)
-        if args.store_arrays and not args.save_per_factor:
-            per_track_sim_arrays = {name: [] for name, *_ in per_track_data}
-        if args.store_per_pixel_loss_and_grad and not args.save_per_factor:
-            per_track_pixel_loss      = {name: [] for name, *_ in per_track_data}
-            per_track_pixel_grad      = {name: [] for name, *_ in per_track_data}
-            per_track_fourier_C       = {name: [] for name, *_ in per_track_data}
-            per_track_fourier_power   = {name: [] for name, *_ in per_track_data}
-            per_track_fourier_sim_fft = {name: [] for name, *_ in per_track_data}
-        if fourier_map_fn is not None:
-            per_track_fourier_W = {
-                tname: [
-                    np.array(jax.image.resize(jnp.fft.fftshift(w), _fourier_out_size, method='bilinear'),
-                             dtype=np.float32)
-                    for w in weights
-                ]
-                for tname, _, _, weights, _ in per_track_data
-            }
-            # GT signal FFT is fixed per cutoff — compute once per track
-            per_track_fourier_gt_fft = {}
-            for tname, _, gt_arrays, weights, masks in per_track_data:
-                per_track_fourier_gt_fft[tname] = [
-                    np.array(sobolev_signal_fft_power(
-                        jnp.where(masks[pi], jnp.array(gt_arrays[pi]), 0.0),
-                        weights[pi], out_size=_fourier_out_size), dtype=np.float32)
-                    for pi in range(n_planes)
-                ]
-        if args.store_per_plane_loss and not args.save_per_factor:
-            per_plane_loss_values = {
-                name: {pname: [] for pname in plane_names_all}
-                for name, *_ in per_track_data
-            }
-
-        per_track_loss  = {name: [] for name, *_ in per_track_data}
-        per_track_grad  = {name: [] for name, *_ in per_track_data}
-        total_loss_vals = []
-        total_grad_vals = []
-        grad_times_s    = []
-
-        for i, (factor, p_n, pval) in enumerate(zip(factors, p_n_values, param_values)):
-            p_n_arr = jnp.array(float(p_n))
-            t0      = time.time()
-
-            # Temporary per-factor storage (used only when save_per_factor)
-            fac_sim_arrays  = {} if (args.save_per_factor and args.store_arrays) else None
-            fac_pixel_loss    = {} if (args.save_per_factor and args.store_per_pixel_loss_and_grad) else None
-            fac_pixel_grad    = {} if (args.save_per_factor and args.store_per_pixel_loss_and_grad) else None
-            fac_fourier_C       = {} if (args.save_per_factor and fourier_map_fn is not None) else None
-            fac_fourier_power   = {} if (args.save_per_factor and fourier_map_fn is not None) else None
-            fac_fourier_sim_fft = {} if (args.save_per_factor and fourier_map_fn is not None) else None
-            fac_plane_loss  = ({name: {pname: [] for pname in plane_names_all} for name, *_ in per_track_data}
-                               if (args.save_per_factor and args.store_per_plane_loss) else None)
-
-            total_loss = 0.0
-            total_grad = 0.0
-            for tname, dep, gt_arrays, weights, masks in per_track_data:
-                lv, gv = vag_fn(p_n_arr, dep, gt_arrays, weights, masks)
-                jax.block_until_ready((lv, gv))
-                lv, gv = float(lv), float(gv)
-                per_track_loss[tname].append(lv)
-                per_track_grad[tname].append(gv)
-                total_loss += lv
-                total_grad += gv
-                need_fwd = args.store_arrays or args.store_per_pixel_loss_and_grad or args.store_per_plane_loss
-                if need_fwd:
-                    fwd_out = simulator.forward(_make_params(p_n_arr), dep)
-                    jax.block_until_ready(fwd_out)
-                    if args.store_arrays:
-                        arrays_np = [np.array(a, dtype=np.float32) for a in fwd_out]
-                        if args.save_per_factor:
-                            fac_sim_arrays[tname] = arrays_np
-                        else:
-                            per_track_sim_arrays[tname].append(arrays_np)
-                    if args.store_per_pixel_loss_and_grad:
-                        pg = pixel_grad_fn(fwd_out, gt_arrays, weights, masks)
-                        jax.block_until_ready(pg)
-                        pg_np  = [np.array(a, dtype=np.float32) for a in pg]
-                        pl_np  = [np.array((np.array(s, dtype=np.float32) - np.array(g, dtype=np.float32))**2)
-                                  for s, g in zip(fwd_out, gt_arrays)]
-                        if args.save_per_factor:
-                            fac_pixel_grad[tname] = pg_np
-                            fac_pixel_loss[tname] = pl_np
-                        else:
-                            per_track_pixel_grad[tname].append(pg_np)
-                            per_track_pixel_loss[tname].append(pl_np)
-                        fC, fpwr, fsim, _fgt = fourier_map_fn(fwd_out, gt_arrays, weights, masks)
-                        jax.block_until_ready((fC, fpwr, fsim))
-                        fC_np    = [np.array(a, dtype=np.float32) for a in fC]
-                        fpwr_np  = [np.array(a, dtype=np.float32) for a in fpwr]
-                        fsim_np  = [np.array(a, dtype=np.float32) for a in fsim]
-                        if args.save_per_factor:
-                            fac_fourier_C[tname]       = fC_np
-                            fac_fourier_power[tname]   = fpwr_np
-                            fac_fourier_sim_fft[tname] = fsim_np
-                        else:
-                            per_track_fourier_C[tname].append(fC_np)
-                            per_track_fourier_power[tname].append(fpwr_np)
-                            per_track_fourier_sim_fft[tname].append(fsim_np)
-                    if args.store_per_plane_loss:
-                        for pi, pname in enumerate(plane_names_all):
-                            sim_m = jnp.where(masks[pi], fwd_out[pi], 0.0)
-                            gt_m  = jnp.where(masks[pi], gt_arrays[pi], 0.0)
-                            val   = float(_plane_loss_jit(sim_m, gt_m, weights[pi]))
-                            if args.save_per_factor:
-                                fac_plane_loss[tname][pname].append(val)
-                            else:
-                                per_plane_loss_values[tname][pname].append(val)
-
-            elapsed = time.time() - t0
-            total_loss_vals.append(total_loss)
-            total_grad_vals.append(total_grad)
-            grad_times_s.append(elapsed)
-
-            marker = ' ← GT' if factor == 1.0 else ''
-            print(f'  [{i + 1:2d}/{len(factors)}] factor={factor:.6f}  '
-                  f'p_n={p_n:.6f}  {args.param}={pval:.6g}  '
-                  f'loss={total_loss:.4e}  grad={total_grad:+.4e}  '
-                  f'({elapsed * 1e3:.0f} ms){marker}')
-
-            # Flush this factor to its own pkl immediately (frees array memory)
-            if args.save_per_factor:
-                fac_path = auto_output_path(args, loss_name, track_specs,
-                                            factor=float(factor))
-                os.makedirs(os.path.dirname(fac_path) or '.', exist_ok=True)
-                if os.path.exists(fac_path):
-                    print(f'    (exists, skip) {os.path.basename(fac_path)}')
-                else:
-                    fac_result = dict(
-                        param_name    = args.param,
-                        param_gt      = param_gt,
-                        scale         = scale,
-                        p_n_gt        = p_n_gt,
-                        param_values  = [float(pval)],
-                        p_n_values    = [float(p_n)],
-                        factors       = [float(factor)],
-                        loss_values   = [total_loss],
-                        grad_values   = [total_grad],
-                        grad_times_s  = [elapsed],
-                        per_track_loss_values = {t: [per_track_loss[t][-1]] for t in per_track_loss},
-                        per_track_grad_values = {t: [per_track_grad[t][-1]] for t in per_track_grad},
-                        loss_name     = loss_name,
-                        N             = args.N,
-                        range_frac    = args.range_frac,
-                        track_specs   = track_specs,
-                        noise_scale   = args.noise_scale,
-                        noise_seed    = args.noise_seed,
-                        adc_cutoff      = adc_cutoff,
-                        sobolev_max_pad = args.sobolev_max_pad,
-                        sobolev_s       = sobolev_s,
-                        fourier_cutoff  = fourier_cutoff,
-                        fixed_param   = args.fixed_param,
-                        fixed_value   = args.fixed_value,
-                        plane_names   = plane_names_all,
-                    )
-                    if args.store_arrays:
-                        fac_result['per_track_gt_arrays']  = per_track_gt_arrays
-                        fac_result['per_track_sim_arrays'] = {t: [v] for t, v in fac_sim_arrays.items()}
-                    if args.store_per_pixel_loss_and_grad:
-                        fac_result['per_track_pixel_loss'] = {t: [v] for t, v in fac_pixel_loss.items()}
-                        fac_result['per_track_pixel_grad'] = {t: [v] for t, v in fac_pixel_grad.items()}
-                        fac_result['per_track_fourier_C']       = {t: [v] for t, v in fac_fourier_C.items()}
-                        fac_result['per_track_fourier_power']   = {t: [v] for t, v in fac_fourier_power.items()}
-                        fac_result['per_track_fourier_sim_fft'] = {t: [v] for t, v in fac_fourier_sim_fft.items()}
-                        fac_result['per_track_fourier_W']       = per_track_fourier_W
-                        fac_result['per_track_fourier_gt_fft']  = per_track_fourier_gt_fft
-                        fac_result['fourier_map_resolution']    = args.fourier_map_resolution
-                    if args.store_per_plane_loss:
-                        fac_result['per_plane_loss_values'] = fac_plane_loss
-                    with open(fac_path, 'wb') as f:
-                        pickle.dump(fac_result, f)
-                    sz = os.path.getsize(fac_path) / 1e6
-                    print(f'    → {os.path.basename(fac_path)}  ({sz:.1f} MB)')
-
-        result = dict(
-            param_name             = args.param,
-            param_gt               = param_gt,
-            scale                  = scale,
-            p_n_gt                 = p_n_gt,
-            param_values           = list(param_values),
-            p_n_values             = list(p_n_values),
-            factors                = list(factors),
-            loss_values            = total_loss_vals,
-            grad_values            = total_grad_vals,
-            grad_times_s           = grad_times_s,
-            per_track_loss_values  = per_track_loss,
-            per_track_grad_values  = per_track_grad,
-            loss_name              = loss_name,
-            N                      = args.N,
-            range_frac             = args.range_frac,
-            track_specs            = track_specs,
-            noise_scale            = args.noise_scale,
-            noise_seed             = args.noise_seed,
-            adc_cutoff             = adc_cutoff,
-            sobolev_max_pad        = args.sobolev_max_pad,
-            sobolev_s              = sobolev_s,
-            fourier_cutoff         = fourier_cutoff,
-            fixed_param            = args.fixed_param,
-            fixed_value            = args.fixed_value,
-            plane_names            = plane_names_all,
-        )
-        if args.store_arrays and not args.save_per_factor:
-            result['per_track_gt_arrays']  = per_track_gt_arrays
-            result['per_track_sim_arrays'] = per_track_sim_arrays
-        if args.store_per_pixel_loss_and_grad and not args.save_per_factor:
-            result['per_track_pixel_loss']      = per_track_pixel_loss
-            result['per_track_pixel_grad']      = per_track_pixel_grad
-            result['per_track_fourier_C']       = per_track_fourier_C
-            result['per_track_fourier_power']   = per_track_fourier_power
-            result['per_track_fourier_sim_fft'] = per_track_fourier_sim_fft
-            result['per_track_fourier_W']       = per_track_fourier_W
-            result['per_track_fourier_gt_fft']  = per_track_fourier_gt_fft
-            result['fourier_map_resolution']    = args.fourier_map_resolution
-        if args.store_per_plane_loss and not args.save_per_factor:
-            result['per_plane_loss_values'] = per_plane_loss_values
-
-        if args.save_per_factor:
-            # Per-factor pkls already contain all data; a summary pkl would be
-            # loaded alongside them by the viewer and cause duplicate factor
-            # entries and per_plane_loss index misalignment.
-            print(f'(save_per_factor: skipping summary pkl, all data in per-factor files)')
+        # Apply noise for this seed (or reuse clean arrays when noise_scale == 0)
+        if args.noise_scale > 0.0:
+            noise_base_key = jax.random.PRNGKey(noise_seed)
+            per_track_base = []
+            for track_idx, (tname, deposits, clean_gt) in enumerate(per_track_base_clean):
+                track_noise_key = jax.random.fold_in(noise_base_key, track_idx)
+                noisy_gt = apply_noise(clean_gt, simulator, args.noise_scale, track_noise_key)
+                jax.block_until_ready(noisy_gt)
+                noisy_gt_np = tuple(np.asarray(a, dtype=np.float32) for a in noisy_gt)
+                per_track_base.append((tname, deposits, noisy_gt_np))
         else:
-            with open(output_path, 'wb') as f:
-                pickle.dump(result, f)
-            sz = os.path.getsize(output_path) / 1e6
-            print(f'Saved: {output_path}  ({sz:.1f} MB)')
+            per_track_base = per_track_base_clean
+
+        # GT arrays collected per seed for store_arrays
+        if args.store_arrays:
+            per_track_gt_arrays = {
+                name: [np.array(a, dtype=np.float32) for a in gt_arrs]
+                for name, _, gt_arrs in per_track_base
+            }
+
+        # Build pending triples for this seed (skip already-computed pkls)
+        if args.output is not None or args.overwrite:
+            pending_triples = list(all_triples)
+        else:
+            pending_triples = []
+            for _s, _ac, _fc in all_triples:
+                args.sobolev_s      = _s
+                args.adc_cutoff     = _ac
+                args.fourier_cutoff = _fc
+                if not os.path.exists(auto_output_path(args, loss_name, track_specs,
+                                                        noise_seed_override=noise_seed)):
+                    pending_triples.append((_s, _ac, _fc))
+
+        if not pending_triples:
+            print(f'\n[seed {noise_seed}] All combinations already computed, skipping.')
+            continue
+
+        # ── Loop over (sobolev_s, adc_cutoff, fourier_cutoff) combinations ──
+        for sobolev_s, adc_cutoff, fourier_cutoff in pending_triples:
+            print(f'\n{"─" * 60}')
+            print(f'[seed {noise_seed}]  sobolev_s={sobolev_s}  ADC cutoff={adc_cutoff}  '
+                  f'Fourier cutoff={fourier_cutoff}  '
+                  f'({len(factors)} param points × {len(per_track_base)} tracks)')
+
+            # Output path for this combination
+            args.sobolev_s      = sobolev_s
+            args.adc_cutoff     = adc_cutoff
+            args.fourier_cutoff = fourier_cutoff
+            output_path = args.output or auto_output_path(args, loss_name, track_specs,
+                                                           noise_seed_override=noise_seed)
+            os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+
+            # Build per_track_data: sobolev weights, ADC masks, Fourier mask
+            per_track_data = []
+            for name, deposits, gt_arrays in per_track_base:
+                # weights/masks are kept on host (numpy) too — same reasoning as the
+                # GT arrays above. jax ops below transparently accept numpy inputs
+                # and the resulting device buffers are transient (freed after each
+                # np.asarray call), so memory no longer scales with N tracks.
+                weights = tuple(
+                    np.asarray(
+                        make_sobolev_weight(a.shape[0], a.shape[1], max_pad=args.sobolev_max_pad, s=sobolev_s),
+                        dtype=np.float32)
+                    for a in gt_arrays
+                )
+                masks = tuple(
+                    np.ones(a.shape, dtype=bool) if adc_cutoff == 0.0
+                    else (np.abs(a) >= adc_cutoff)
+                    for a in gt_arrays
+                )
+                if adc_cutoff > 0.0:
+                    n_total_px  = sum(m.size for m in masks)
+                    n_masked_px = sum(int(np.sum(~m)) for m in masks)
+                    print(f'  {name}: {n_masked_px:,}/{n_total_px:,} pixels zeroed '
+                          f'({100 * n_masked_px / n_total_px:.1f}%)')
+                if fourier_cutoff > 0.0:
+                    eff_weights = tuple(
+                        np.asarray(compute_fourier_masked_weight(w, a, args.sobolev_max_pad, fourier_cutoff),
+                                   dtype=np.float32)
+                        for w, a in zip(weights, gt_arrays)
+                    )
+                    n_total_freq  = sum(w.size for w in eff_weights)
+                    n_masked_freq = sum(int(np.sum(ew == 0.0)) for ew in eff_weights)
+                    print(f'  {name}: Fourier cutoff {fourier_cutoff}: '
+                          f'{n_masked_freq:,}/{n_total_freq:,} freq bins zeroed '
+                          f'({100 * n_masked_freq / n_total_freq:.1f}%)')
+                else:
+                    eff_weights = weights
+                per_track_data.append((name, deposits, gt_arrays, eff_weights, masks))
+
+            # Per-cutoff accumulators (arrays skipped when save_per_factor — flushed per sweep pt)
+            if args.store_arrays and not args.save_per_factor:
+                per_track_sim_arrays = {name: [] for name, *_ in per_track_data}
+            if args.store_per_pixel_loss_and_grad and not args.save_per_factor:
+                per_track_pixel_loss      = {name: [] for name, *_ in per_track_data}
+                per_track_pixel_grad      = {name: [] for name, *_ in per_track_data}
+                per_track_fourier_C       = {name: [] for name, *_ in per_track_data}
+                per_track_fourier_power   = {name: [] for name, *_ in per_track_data}
+                per_track_fourier_sim_fft = {name: [] for name, *_ in per_track_data}
+            if fourier_map_fn is not None:
+                per_track_fourier_W = {
+                    tname: [
+                        np.array(jax.image.resize(jnp.fft.fftshift(w), _fourier_out_size, method='bilinear'),
+                                 dtype=np.float32)
+                        for w in weights
+                    ]
+                    for tname, _, _, weights, _ in per_track_data
+                }
+                # GT signal FFT is fixed per cutoff — compute once per track
+                per_track_fourier_gt_fft = {}
+                for tname, _, gt_arrays, weights, masks in per_track_data:
+                    per_track_fourier_gt_fft[tname] = [
+                        np.array(sobolev_signal_fft_power(
+                            jnp.where(masks[pi], jnp.array(gt_arrays[pi]), 0.0),
+                            weights[pi], out_size=_fourier_out_size), dtype=np.float32)
+                        for pi in range(n_planes)
+                    ]
+            if args.store_per_plane_loss and not args.save_per_factor:
+                per_plane_loss_values = {
+                    name: {pname: [] for pname in plane_names_all}
+                    for name, *_ in per_track_data
+                }
+
+            per_track_loss  = {name: [] for name, *_ in per_track_data}
+            per_track_grad  = {name: [] for name, *_ in per_track_data}
+            total_loss_vals = []
+            total_grad_vals = []
+            grad_times_s    = []
+
+            for i, (factor, p_n, pval) in enumerate(zip(factors, p_n_values, param_values)):
+                p_n_arr = jnp.array(float(p_n))
+                t0      = time.time()
+
+                # Temporary per-factor storage (used only when save_per_factor)
+                fac_sim_arrays  = {} if (args.save_per_factor and args.store_arrays) else None
+                fac_pixel_loss    = {} if (args.save_per_factor and args.store_per_pixel_loss_and_grad) else None
+                fac_pixel_grad    = {} if (args.save_per_factor and args.store_per_pixel_loss_and_grad) else None
+                fac_fourier_C       = {} if (args.save_per_factor and fourier_map_fn is not None) else None
+                fac_fourier_power   = {} if (args.save_per_factor and fourier_map_fn is not None) else None
+                fac_fourier_sim_fft = {} if (args.save_per_factor and fourier_map_fn is not None) else None
+                fac_plane_loss  = ({name: {pname: [] for pname in plane_names_all} for name, *_ in per_track_data}
+                                   if (args.save_per_factor and args.store_per_plane_loss) else None)
+
+                total_loss = 0.0
+                total_grad = 0.0
+                for tname, dep, gt_arrays, weights, masks in per_track_data:
+                    lv, gv = vag_fn(p_n_arr, dep, gt_arrays, weights, masks)
+                    jax.block_until_ready((lv, gv))
+                    lv, gv = float(lv), float(gv)
+                    per_track_loss[tname].append(lv)
+                    per_track_grad[tname].append(gv)
+                    total_loss += lv
+                    total_grad += gv
+                    need_fwd = args.store_arrays or args.store_per_pixel_loss_and_grad or args.store_per_plane_loss
+                    if need_fwd:
+                        fwd_out = simulator.forward(_make_params(p_n_arr), dep)
+                        jax.block_until_ready(fwd_out)
+                        if args.store_arrays:
+                            arrays_np = [np.array(a, dtype=np.float32) for a in fwd_out]
+                            if args.save_per_factor:
+                                fac_sim_arrays[tname] = arrays_np
+                            else:
+                                per_track_sim_arrays[tname].append(arrays_np)
+                        if args.store_per_pixel_loss_and_grad:
+                            pg = pixel_grad_fn(fwd_out, gt_arrays, weights, masks)
+                            jax.block_until_ready(pg)
+                            pg_np  = [np.array(a, dtype=np.float32) for a in pg]
+                            pl_np  = [np.array((np.array(s, dtype=np.float32) - np.array(g, dtype=np.float32))**2)
+                                      for s, g in zip(fwd_out, gt_arrays)]
+                            if args.save_per_factor:
+                                fac_pixel_grad[tname] = pg_np
+                                fac_pixel_loss[tname] = pl_np
+                            else:
+                                per_track_pixel_grad[tname].append(pg_np)
+                                per_track_pixel_loss[tname].append(pl_np)
+                            fC, fpwr, fsim, _fgt = fourier_map_fn(fwd_out, gt_arrays, weights, masks)
+                            jax.block_until_ready((fC, fpwr, fsim))
+                            fC_np    = [np.array(a, dtype=np.float32) for a in fC]
+                            fpwr_np  = [np.array(a, dtype=np.float32) for a in fpwr]
+                            fsim_np  = [np.array(a, dtype=np.float32) for a in fsim]
+                            if args.save_per_factor:
+                                fac_fourier_C[tname]       = fC_np
+                                fac_fourier_power[tname]   = fpwr_np
+                                fac_fourier_sim_fft[tname] = fsim_np
+                            else:
+                                per_track_fourier_C[tname].append(fC_np)
+                                per_track_fourier_power[tname].append(fpwr_np)
+                                per_track_fourier_sim_fft[tname].append(fsim_np)
+                        if args.store_per_plane_loss:
+                            for pi, pname in enumerate(plane_names_all):
+                                sim_m = jnp.where(masks[pi], fwd_out[pi], 0.0)
+                                gt_m  = jnp.where(masks[pi], gt_arrays[pi], 0.0)
+                                val   = float(_plane_loss_jit(sim_m, gt_m, weights[pi]))
+                                if args.save_per_factor:
+                                    fac_plane_loss[tname][pname].append(val)
+                                else:
+                                    per_plane_loss_values[tname][pname].append(val)
+
+                elapsed = time.time() - t0
+                total_loss_vals.append(total_loss)
+                total_grad_vals.append(total_grad)
+                grad_times_s.append(elapsed)
+
+                marker = ' ← GT' if factor == 1.0 else ''
+                print(f'  [{i + 1:2d}/{len(factors)}] factor={factor:.6f}  '
+                      f'p_n={p_n:.6f}  {args.param}={pval:.6g}  '
+                      f'loss={total_loss:.4e}  grad={total_grad:+.4e}  '
+                      f'({elapsed * 1e3:.0f} ms){marker}')
+
+                # Flush this factor to its own pkl immediately (frees array memory)
+                if args.save_per_factor:
+                    fac_path = auto_output_path(args, loss_name, track_specs,
+                                                factor=float(factor),
+                                                noise_seed_override=noise_seed)
+                    os.makedirs(os.path.dirname(fac_path) or '.', exist_ok=True)
+                    if os.path.exists(fac_path):
+                        print(f'    (exists, skip) {os.path.basename(fac_path)}')
+                    else:
+                        fac_result = dict(
+                            param_name    = args.param,
+                            param_gt      = param_gt,
+                            scale         = scale,
+                            p_n_gt        = p_n_gt,
+                            param_values  = [float(pval)],
+                            p_n_values    = [float(p_n)],
+                            factors       = [float(factor)],
+                            loss_values   = [total_loss],
+                            grad_values   = [total_grad],
+                            grad_times_s  = [elapsed],
+                            per_track_loss_values = {t: [per_track_loss[t][-1]] for t in per_track_loss},
+                            per_track_grad_values = {t: [per_track_grad[t][-1]] for t in per_track_grad},
+                            loss_name     = loss_name,
+                            N             = args.N,
+                            range_frac    = args.range_frac,
+                            track_specs   = track_specs,
+                            noise_scale   = args.noise_scale,
+                            noise_seed    = noise_seed,
+                            adc_cutoff      = adc_cutoff,
+                            sobolev_max_pad = args.sobolev_max_pad,
+                            sobolev_s       = sobolev_s,
+                            fourier_cutoff  = fourier_cutoff,
+                            fixed_param   = args.fixed_param,
+                            fixed_value   = args.fixed_value,
+                            plane_names   = plane_names_all,
+                        )
+                        if args.store_arrays:
+                            fac_result['per_track_gt_arrays']  = per_track_gt_arrays
+                            fac_result['per_track_sim_arrays'] = {t: [v] for t, v in fac_sim_arrays.items()}
+                        if args.store_per_pixel_loss_and_grad:
+                            fac_result['per_track_pixel_loss'] = {t: [v] for t, v in fac_pixel_loss.items()}
+                            fac_result['per_track_pixel_grad'] = {t: [v] for t, v in fac_pixel_grad.items()}
+                            fac_result['per_track_fourier_C']       = {t: [v] for t, v in fac_fourier_C.items()}
+                            fac_result['per_track_fourier_power']   = {t: [v] for t, v in fac_fourier_power.items()}
+                            fac_result['per_track_fourier_sim_fft'] = {t: [v] for t, v in fac_fourier_sim_fft.items()}
+                            fac_result['per_track_fourier_W']       = per_track_fourier_W
+                            fac_result['per_track_fourier_gt_fft']  = per_track_fourier_gt_fft
+                            fac_result['fourier_map_resolution']    = args.fourier_map_resolution
+                        if args.store_per_plane_loss:
+                            fac_result['per_plane_loss_values'] = fac_plane_loss
+                        with open(fac_path, 'wb') as f:
+                            pickle.dump(fac_result, f)
+                        sz = os.path.getsize(fac_path) / 1e6
+                        print(f'    → {os.path.basename(fac_path)}  ({sz:.1f} MB)')
+
+            result = dict(
+                param_name             = args.param,
+                param_gt               = param_gt,
+                scale                  = scale,
+                p_n_gt                 = p_n_gt,
+                param_values           = list(param_values),
+                p_n_values             = list(p_n_values),
+                factors                = list(factors),
+                loss_values            = total_loss_vals,
+                grad_values            = total_grad_vals,
+                grad_times_s           = grad_times_s,
+                per_track_loss_values  = per_track_loss,
+                per_track_grad_values  = per_track_grad,
+                loss_name              = loss_name,
+                N                      = args.N,
+                range_frac             = args.range_frac,
+                track_specs            = track_specs,
+                noise_scale            = args.noise_scale,
+                noise_seed             = noise_seed,
+                adc_cutoff             = adc_cutoff,
+                sobolev_max_pad        = args.sobolev_max_pad,
+                sobolev_s              = sobolev_s,
+                fourier_cutoff         = fourier_cutoff,
+                fixed_param            = args.fixed_param,
+                fixed_value            = args.fixed_value,
+                plane_names            = plane_names_all,
+            )
+            if args.store_arrays and not args.save_per_factor:
+                result['per_track_gt_arrays']  = per_track_gt_arrays
+                result['per_track_sim_arrays'] = per_track_sim_arrays
+            if args.store_per_pixel_loss_and_grad and not args.save_per_factor:
+                result['per_track_pixel_loss']      = per_track_pixel_loss
+                result['per_track_pixel_grad']      = per_track_pixel_grad
+                result['per_track_fourier_C']       = per_track_fourier_C
+                result['per_track_fourier_power']   = per_track_fourier_power
+                result['per_track_fourier_sim_fft'] = per_track_fourier_sim_fft
+                result['per_track_fourier_W']       = per_track_fourier_W
+                result['per_track_fourier_gt_fft']  = per_track_fourier_gt_fft
+                result['fourier_map_resolution']    = args.fourier_map_resolution
+            if args.store_per_plane_loss and not args.save_per_factor:
+                result['per_plane_loss_values'] = per_plane_loss_values
+
+            if args.save_per_factor:
+                # Per-factor pkls already contain all data; a summary pkl would be
+                # loaded alongside them by the viewer and cause duplicate factor
+                # entries and per_plane_loss index misalignment.
+                print(f'(save_per_factor: skipping summary pkl, all data in per-factor files)')
+            else:
+                with open(output_path, 'wb') as f:
+                    pickle.dump(result, f)
+                sz = os.path.getsize(output_path) / 1e6
+                print(f'Saved: {output_path}  ({sz:.1f} MB)')
 
     print('\nDone.')
 

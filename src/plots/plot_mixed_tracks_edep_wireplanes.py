@@ -170,7 +170,7 @@ def _detector_volume_mesh_traces(volumes, *, opacity=0.14):
     return traces
 
 
-def build_simulator():
+def build_simulator(include_wire_response=True):
     detector_config = generate_detector(CONFIG_PATH)
     return DetectorSimulator(
         detector_config,
@@ -183,6 +183,7 @@ def build_simulator():
         include_track_hits=False,
         include_digitize=False,
         track_config=None,
+        include_wire_response=include_wire_response,
     )
 
 

@@ -14,6 +14,11 @@ Handles both old-style pkls (recomb_alpha / recomb_beta_90 axes) and new-style
 generic pair pkls.  For duplicate (track, pair, noise) entries across run dates,
 the latest pkl path wins.
 
+Also writes an ``.npz`` file (next to --output, same stem) with summed
+loss + gradient grids for (diffusion_long_cm2_us, diffusion_trans_cm2_us) and
+(recomb_alpha, recomb_beta_90), each with and without noise. See
+``build_npz_data`` for the array layout.
+
 Usage
 -----
   python src/plots/plot_landscape_interactive.py
@@ -29,6 +34,8 @@ import pickle
 import sys
 from pathlib import Path
 
+import numpy as np
+
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 PARAM_LABELS = {
@@ -41,6 +48,12 @@ PARAM_LABELS = {
     'recomb_beta_90':         'Recombination β₉₀',
     'recomb_R':               'Recombination R',
 }
+
+# (param_y, param_x) pairs to export as summed loss+gradient grids in the npz.
+NPZ_PAIRS = [
+    ('diffusion_long_cm2_us', 'diffusion_trans_cm2_us'),
+    ('recomb_alpha',          'recomb_beta_90'),
+]
 
 
 def parse_args():
@@ -65,6 +78,12 @@ def parse_args():
         '--output',
         default=str(_REPO_ROOT / 'plots' / 'landscape_interactive.html'),
         help='Output HTML path',
+    )
+    p.add_argument(
+        '--output-npz',
+        default=None,
+        help='Output path for summed loss+gradient grids (default: --output '
+             'with its extension replaced by .npz)',
     )
     return p.parse_args()
 
@@ -188,6 +207,83 @@ def build_js_data(records):
     return data, meta
 
 
+# ── NPZ assembly ─────────────────────────────────────────────────────────────────
+
+def build_npz_data(records, pairs=NPZ_PAIRS):
+    """
+    Sum loss + gradient grids across all tracks, for each (param_y, param_x)
+    pair in `pairs`, with and without noise.
+
+    For each pair "{param_y}__{param_x}" and noise_key in ("no_noise", "noise"),
+    the returned dict has:
+      "{pair_key}__{noise_key}__grid"   (ny, nx, 3) float64 — [loss, grad_y, grad_x]
+      "{pair_key}__{noise_key}__vals_y" (ny,)
+      "{pair_key}__{noise_key}__vals_x" (nx,)
+      "{pair_key}__{noise_key}__gt_y"   scalar
+      "{pair_key}__{noise_key}__gt_x"   scalar
+      "{pair_key}__{noise_key}__n_tracks" scalar int
+
+    Tracks lacking gradients are skipped (matching the HTML's "has_grad" gating).
+    For duplicate (track, pair, noise) entries, the latest pkl path wins (records
+    are processed in sorted-path order).
+    """
+    out = {}
+
+    for param_y, param_x in pairs:
+        pair_key = '%s__%s' % (param_y, param_x)
+        for noise_key, want_noise in (('no_noise', False), ('noise', True)):
+            track_map = {}
+            for r in records:
+                if r['param_y'] != param_y or r['param_x'] != param_x:
+                    continue
+                if (r['noise_scale'] > 0) != want_noise:
+                    continue
+                if r['grad_y'] is None or r['grad_x'] is None:
+                    continue
+                track_map[r['track_name']] = r  # latest path wins
+
+            if not track_map:
+                print('  warning: no gradient data for %s (%s); skipping npz entry'
+                      % (pair_key, noise_key), file=sys.stderr)
+                continue
+
+            tracks = list(track_map.values())
+            ref = tracks[0]
+            vals_y = np.array(ref['vals_y'])
+            vals_x = np.array(ref['vals_x'])
+            ny, nx = len(vals_y), len(vals_x)
+
+            loss_sum   = np.zeros((ny, nx))
+            grad_y_sum = np.zeros((ny, nx))
+            grad_x_sum = np.zeros((ny, nx))
+            for r in tracks:
+                loss_sum   += np.array(r['grid'])
+                grad_y_sum += np.array(r['grad_y'])
+                grad_x_sum += np.array(r['grad_x'])
+
+            prefix = '%s__%s' % (pair_key, noise_key)
+            out[prefix + '__grid']     = np.stack([loss_sum, grad_y_sum, grad_x_sum], axis=-1)
+            out[prefix + '__vals_y']   = vals_y
+            out[prefix + '__vals_x']   = vals_x
+            out[prefix + '__gt_y']     = float(ref['gt_y'])
+            out[prefix + '__gt_x']     = float(ref['gt_x'])
+            out[prefix + '__n_tracks'] = len(tracks)
+
+    return out
+
+
+def emit_npz(records, output_path):
+    arrays = build_npz_data(records)
+    if not arrays:
+        print('No data for requested npz pairs. Skipping npz output.')
+        return
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(out, **arrays)
+    size_kb = out.stat().st_size // 1024
+    print('Wrote %s  (%d KB)' % (out, size_kb))
+
+
 # ── HTML emission ──────────────────────────────────────────────────────────────
 
 _HTML_TEMPLATE = """\
@@ -229,6 +325,8 @@ select:focus{outline:none;border-color:#e05070}
 <body>
 <header>
   <h1>2D Loss Landscape Explorer</h1>
+  <a href="{NPZ_LINK}" download style="color:#888;font-size:11px;text-decoration:underline">Download grids (.npz)</a>
+  <a href="{NPZ_INFO_LINK}" target="_blank" style="color:#888;font-size:11px;text-decoration:underline">npz format docs</a>
   <span id="hdr-status"></span>
 </header>
 <div class="main">
@@ -582,7 +680,105 @@ render();
 """
 
 
-def emit_html(data, meta, output_path):
+_NPZ_INFO_TEMPLATE = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Loss landscape grids (.npz) — field reference</title>
+<style>
+body{font-family:system-ui,sans-serif;font-size:14px;line-height:1.5;background:#12121f;color:#ddd;
+     max-width:760px;margin:0 auto;padding:24px}
+h1{font-size:20px;color:#e05070;margin-bottom:4px}
+h2{font-size:15px;color:#e05070;margin-top:28px}
+code,pre{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}
+code{background:#0d1224;padding:1px 5px;border-radius:3px}
+pre{background:#0d1224;padding:12px;border-radius:6px;overflow-x:auto;border:1px solid #2a2a50}
+table{border-collapse:collapse;margin:10px 0;width:100%}
+th,td{border:1px solid #2a2a50;padding:5px 9px;text-align:left;font-size:13px}
+th{background:#1a1a30;color:#bbb}
+ul{padding-left:22px}
+a{color:#e05070}
+</style>
+</head>
+<body>
+<h1>Loss landscape grids (.npz)</h1>
+<p>This file accompanies the 2D Loss Landscape Explorer and contains, for each
+parameter pair and noise setting, the loss and its gradient evaluated on the
+same grid shown in the explorer — <strong>summed over all tracks</strong>.</p>
+
+<h2>Parameter pairs</h2>
+<ul>
+{PAIRS_LIST}
+</ul>
+
+<h2>Noise settings</h2>
+<ul>
+<li><code>no_noise</code> — clean simulated waveforms (noise_scale = 0)</li>
+<li><code>noise</code> — calibrated detector noise added (noise_scale = 1.0)</li>
+</ul>
+
+<h2>Array keys</h2>
+<p>Every (pair, noise) combination contributes 6 arrays, named
+<code>{pair_key}__{noise_key}__{field}</code>, e.g.
+<code>recomb_alpha__recomb_beta_90__no_noise__grid</code>.</p>
+
+<table>
+<tr><th>field</th><th>shape</th><th>meaning</th></tr>
+<tr><td><code>grid</code></td><td>(40, 40, 3)</td>
+    <td>Axis 0 = param A (y-axis / first name in the pair), axis 1 = param B
+        (x-axis / second name). The size-3 last axis is
+        <code>[loss, grad_A, grad_B]</code>:
+        <ul>
+          <li><code>grid[:,:,0]</code> — total loss (sobolev_loss_geomean_log1p)</li>
+          <li><code>grid[:,:,1]</code> — ∂loss/∂param_A</li>
+          <li><code>grid[:,:,2]</code> — ∂loss/∂param_B</li>
+        </ul>
+        All summed across tracks.</td></tr>
+<tr><td><code>vals_y</code></td><td>(40,)</td><td>param A grid values (rows of <code>grid</code>)</td></tr>
+<tr><td><code>vals_x</code></td><td>(40,)</td><td>param B grid values (columns of <code>grid</code>)</td></tr>
+<tr><td><code>gt_y</code></td><td>scalar</td><td>ground-truth value of param A</td></tr>
+<tr><td><code>gt_x</code></td><td>scalar</td><td>ground-truth value of param B</td></tr>
+<tr><td><code>n_tracks</code></td><td>scalar int</td><td>number of tracks summed into <code>grid</code></td></tr>
+</table>
+
+<h2>Example</h2>
+<pre>import numpy as np
+d = np.load('landscape_interactive_20260508.npz')
+
+grid = d['recomb_alpha__recomb_beta_90__no_noise__grid']  # (40, 40, 3)
+loss   = grid[:, :, 0]
+grad_A = grid[:, :, 1]   # d(loss)/d(recomb_alpha)
+grad_B = grid[:, :, 2]   # d(loss)/d(recomb_beta_90)
+
+alpha_vals    = d['recomb_alpha__recomb_beta_90__no_noise__vals_y']
+beta90_vals   = d['recomb_alpha__recomb_beta_90__no_noise__vals_x']
+gt_alpha      = d['recomb_alpha__recomb_beta_90__no_noise__gt_y']
+gt_beta90     = d['recomb_alpha__recomb_beta_90__no_noise__gt_x']
+</pre>
+
+<p>Generated by <code>src/plots/plot_landscape_interactive.py</code>
+(<code>build_npz_data</code>).</p>
+</body>
+</html>
+"""
+
+
+def emit_npz_info(output_path):
+    pairs_list = '\n'.join(
+        '<li><code>%s</code> (A) + <code>%s</code> (B) — %s / %s</li>'
+        % (py, px, PARAM_LABELS.get(py, py), PARAM_LABELS.get(px, px))
+        for py, px in NPZ_PAIRS
+    )
+    html = _NPZ_INFO_TEMPLATE.replace('{PAIRS_LIST}', pairs_list)
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(html, encoding='utf-8')
+    print('Wrote %s' % out)
+
+
+def emit_html(data, meta, output_path, npz_filename, npz_info_filename):
     all_tracks = sorted({
         t
         for pair_dict in data.values()
@@ -600,7 +796,9 @@ def emit_html(data, meta, output_path):
         .replace('{META}',    json.dumps(meta,         separators=sep)) \
         .replace('{TRACKS}',  json.dumps(all_tracks,   separators=sep)) \
         .replace('{PAIRS}',   json.dumps(all_pairs,    separators=sep)) \
-        .replace('{PLABELS}', json.dumps(PARAM_LABELS, separators=sep))
+        .replace('{PLABELS}', json.dumps(PARAM_LABELS, separators=sep)) \
+        .replace('{NPZ_LINK}', npz_filename) \
+        .replace('{NPZ_INFO_LINK}', npz_info_filename)
 
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -617,8 +815,13 @@ def main():
     if not records:
         print('No pkl files found. Nothing to do.')
         sys.exit(0)
+    npz_path = args.output_npz or str(Path(args.output).with_suffix('.npz'))
+    npz_info_path = Path(args.output).parent / 'npz_info.html'
+
     data, meta = build_js_data(records)
-    emit_html(data, meta, args.output)
+    emit_html(data, meta, args.output, Path(npz_path).name, npz_info_path.name)
+    emit_npz(records, npz_path)
+    emit_npz_info(npz_info_path)
 
 
 if __name__ == '__main__':

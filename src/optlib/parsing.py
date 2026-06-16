@@ -80,6 +80,18 @@ def parse_args(doc=None):
                    help='Window length W for --tol-per-param: compare to t-W and check each '
                         'of the W consecutive updates (default: disabled). '
                         'Set both flags together to enable per-parameter freezing.')
+    p.add_argument('--phase2-params', default=None,
+                   help='Comma-separated subset of --params. Before --phase2-start-step, '
+                        'these params are frozen (zero gradient) and all other --params are '
+                        'optimized normally. From --phase2-start-step onward, only these '
+                        'params receive gradient updates and all other --params are frozen. '
+                        'Must be a strict, non-empty subset of --params. '
+                        'Set together with --phase2-start-step (default: disabled, all '
+                        'params optimized throughout). Not compatible with --optimizer newton.')
+    p.add_argument('--phase2-start-step', type=int, default=None,
+                   metavar='STEP',
+                   help='Step at which to switch to optimizing only --phase2-params '
+                        '(required together with --phase2-params).')
     p.add_argument('--N', type=int, default=25,
                    help='Number of random trials (default: 25)')
     p.add_argument('--results-base', default=_RESULTS_DIR,

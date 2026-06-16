@@ -10,13 +10,35 @@ Usage
 
 Available profiles
 ------------------
-  diffusion_startx_study   D_trans / D_long loss vs. start-x position (Muons 4,5,10,12)
-  diffusion_angle_study    D_trans / D_long loss vs. track angle (400 MeV, x=1900 mm)
+  diffusion_startx_study              D_trans / D_long loss vs. start-x position (Muons 4,5,10,12)
+  diffusion_startx_study_no_wire_response
+                                      Same as startx study but delta kernels (no wire response);
+                                      all 4 tracks x 10 x-positions (same grid as startx study)
+  diffusion_angle_study               D_trans / D_long loss vs. track angle (400 MeV, x=1900 mm)
+  diffusion_angle_study_no_wire_response
+                                      Same as angle study but delta kernels (no wire response);
+                                      full angle grid (same as angle study)
+  diffusion_angle_theta_alpha         D_trans / D_long loss vs. (theta, alpha) grid (400 MeV, x=1900 mm)
+  diffusion_angle_theta_alpha_no_wire_response
+                                      Same but delta kernels; full 5x5 (theta, alpha) grid
+  diffusion_angle_theta_alpha_extended
+                                      Same (theta, alpha) study, extended to angles > 20 deg;
+                                      56 new combos (9x9 grid minus the existing 5x5),
+                                      written into the same diffusion_angle_theta_alpha dirs
+  diffusion_angle_theta_alpha_extended_no_wire_response
+                                      Same but delta kernels
+  diffusion_angle_pivot_study         D_trans / D_long loss vs. angle, pivot at x=1000 mm
+  diffusion_angle_pivot_study_no_wire_response
+                                      Same but delta kernels; full angle grid (same as pivot study)
+  diffusion_angle_pivot_theta_alpha   D_trans / D_long loss vs. (theta, alpha) grid, pivot at x=1000 mm
+  diffusion_angle_pivot_theta_alpha_no_wire_response
+                                      Same but delta kernels; full 5x5 (theta, alpha) grid
 """
 
 import math
 import os
 import sys
+import time as _time
 
 sys.path.insert(0, os.path.dirname(__file__))
 from submit_jobs import make_gradient_command, s3df_submit_multi
@@ -72,6 +94,24 @@ def _check_completions(results_dir, invocations, adc_cutoffs):
     return n_complete, n_total, incomplete
 
 
+def _fmt_seconds(s: float) -> str:
+    s = int(s)
+    if s < 60:
+        return f"{s}s"
+    return f"{s // 60}m{s % 60:02d}s"
+
+
+def _log_progress(step: int, total: int, label: str, t_start: float) -> None:
+    elapsed = _time.time() - t_start
+    if step > 1 and elapsed > 0:
+        avg = elapsed / (step - 1)
+        eta = avg * (total - step + 1)
+        suffix = f"  (avg {avg:.1f}s/job, ETA ~{_fmt_seconds(eta)})"
+    else:
+        suffix = ""
+    print(f"  [{step}/{total}] {label}{suffix}")
+
+
 # ---------------------------------------------------------------------------
 # Diffusion start-x study
 # ---------------------------------------------------------------------------
@@ -98,6 +138,8 @@ def submit_diffusion_startx_study(
     print_sbatch_only=False,
     check_complete=False,
     no_noise_only=False,
+    overwrite=False,
+    chain=False,
     time="08:00:00",
 ):
     """1D loss landscape: diffusion coefficients at varying x start positions.
@@ -137,10 +179,17 @@ def submit_diffusion_startx_study(
         _check_completions(results_dir, invocations, adc_cutoffs)
         return
 
+    prev_id = None
+    step = 0
+    n_total =sum(len(xp) for _, _, _, _, xp in _DIFFUSION_STARTX_TRACKS)
+    t_start = _time.time()
     for base_name, direction, energy, z, x_positions in _DIFFUSION_STARTX_TRACKS:
         for start_x in x_positions:
             track_name = f"{base_name}_startx_{start_x}_stepsize_1mm"
             track_spec = f"{track_name}:{direction}:{energy}:{start_x},0,{z}"
+            if not print_sbatch_only:
+                step += 1
+                _log_progress(step, n_total, track_name, t_start)
 
             if not no_noise_only:
                 commands = [
@@ -150,20 +199,20 @@ def submit_diffusion_startx_study(
                         N=100,
                         range_frac=0.2,
                         noise_scale=1.0,
-                        noise_seed=seed,
+                        noise_seeds=seeds,
                         adc_cutoffs=adc_cutoffs,
                         results_dir=results_dir,
                         step_size=1.0,
                         max_deposits=5000,
                         store_per_plane_loss=True,
+                        overwrite=overwrite,
                     )
                     for param in params
-                    for seed in seeds
                 ]
                 label = f"loss_diff_startx_{track_name}"
                 if not print_sbatch_only:
                     print(f"  {label}: {len(commands)} invocations")
-                s3df_submit_multi(
+                prev_id = s3df_submit_multi(
                     commands,
                     job_label=label,
                     time=time,
@@ -171,6 +220,7 @@ def submit_diffusion_startx_study(
                     mem_gb=64,
                     print_sbatch_command=print_sbatch_only,
                     log_progress=True,
+                    dependency=prev_id if chain else None,
                 )
 
             # No-noise job (deterministic: one run per param suffices)
@@ -187,13 +237,14 @@ def submit_diffusion_startx_study(
                     step_size=1.0,
                     max_deposits=5000,
                     store_per_plane_loss=True,
+                    overwrite=overwrite,
                 )
                 for param in params
             ]
             nn_label = f"loss_diff_startx_nonoise_{track_name}"
             if not print_sbatch_only:
                 print(f"  {nn_label}: {len(nn_commands)} invocations (no noise)")
-            s3df_submit_multi(
+            prev_id = s3df_submit_multi(
                 nn_commands,
                 job_label=nn_label,
                 time="01:00:00",
@@ -201,6 +252,129 @@ def submit_diffusion_startx_study(
                 mem_gb=64,
                 print_sbatch_command=print_sbatch_only,
                 log_progress=True,
+                dependency=prev_id if chain else None,
+            )
+
+
+def submit_diffusion_startx_study_no_wire_response(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    check_complete=False,
+    no_noise_only=False,
+    overwrite=False,
+    chain=False,
+    time="08:00:00",
+):
+    """1D loss landscape: diffusion at varying x, delta kernels (no wire response).
+
+    Tracks    : Muon4, Muon5, Muon10, Muon12 (100 MeV) at 10 x positions each (same grid as startx study)
+    Params    : diffusion_trans_cm2_us, diffusion_long_cm2_us
+    Range     : ±20% of GT (N=100)
+    ADC cuts  : [0, 5, 10, 20, 50]
+    Noise     : scale=1.0, seeds 0–49  +  scale=0 no-noise job
+    Wire resp : disabled (--no-wire-response)
+
+    Output    : $RESULTS_DIR/1d_gradients/diffusion_startx_study_no_wire_response/
+                $RESULTS_DIR/1d_gradients/diffusion_startx_study_no_wire_response_nonoise/
+    """
+    results_dir    = "$RESULTS_DIR/1d_gradients/diffusion_startx_study_no_wire_response"
+    results_dir_nn = "$RESULTS_DIR/1d_gradients/diffusion_startx_study_no_wire_response_nonoise"
+    params      = ["diffusion_trans_cm2_us", "diffusion_long_cm2_us"]
+    adc_cutoffs = [0, 5, 10, 20, 50]
+    seeds       = list(range(50))
+
+    if check_complete:
+        invocations = [
+            (f"{base_name}_startx_{start_x}_stepsize_1mm  param={param}  seed={seed}",
+             param,
+             f"{base_name}_startx_{start_x}_stepsize_1mm",
+             seed)
+            for base_name, _, _, _, x_positions in _DIFFUSION_STARTX_TRACKS
+            for start_x in x_positions
+            for param in params
+            for seed in seeds
+        ]
+        print(f"diffusion_startx_study_no_wire_response — checking {len(invocations)} invocations "
+              f"in {results_dir.replace('$RESULTS_DIR', _RESULTS_DIR)}")
+        _check_completions(results_dir, invocations, adc_cutoffs)
+        return
+
+    prev_id = None
+    step = 0
+    n_total =sum(len(xp) for _, _, _, _, xp in _DIFFUSION_STARTX_TRACKS)
+    t_start = _time.time()
+    for base_name, direction, energy, z, x_positions in _DIFFUSION_STARTX_TRACKS:
+        for start_x in x_positions:
+            track_name = f"{base_name}_startx_{start_x}_stepsize_1mm"
+            track_spec = f"{track_name}:{direction}:{energy}:{start_x},0,{z}"
+            if not print_sbatch_only:
+                step += 1
+                _log_progress(step, n_total, track_name, t_start)
+
+            if not no_noise_only:
+                commands = [
+                    make_gradient_command(
+                        param=param,
+                        tracks=track_spec,
+                        N=100,
+                        range_frac=0.2,
+                        noise_scale=1.0,
+                        noise_seeds=seeds,
+                        adc_cutoffs=adc_cutoffs,
+                        results_dir=results_dir,
+                        step_size=1.0,
+                        max_deposits=5000,
+                        store_per_plane_loss=True,
+                        no_wire_response=True,
+                        overwrite=overwrite,
+                    )
+                    for param in params
+                ]
+                label = f"loss_diff_startx_nwr_{track_name}"
+                if not print_sbatch_only:
+                    print(f"  {label}: {len(commands)} invocations")
+                prev_id = s3df_submit_multi(
+                    commands,
+                    job_label=label,
+                    time=time,
+                    submit=submit,
+                    mem_gb=64,
+                    print_sbatch_command=print_sbatch_only,
+                    log_progress=True,
+                    dependency=prev_id if chain else None,
+                )
+
+            nn_commands = [
+                make_gradient_command(
+                    param=param,
+                    tracks=track_spec,
+                    N=100,
+                    range_frac=0.2,
+                    noise_scale=0.0,
+                    noise_seed=0,
+                    adc_cutoffs=adc_cutoffs,
+                    results_dir=results_dir_nn,
+                    step_size=1.0,
+                    max_deposits=5000,
+                    store_per_plane_loss=True,
+                    no_wire_response=True,
+                    overwrite=overwrite,
+                )
+                for param in params
+            ]
+            nn_label = f"loss_diff_startx_nwr_nonoise_{track_name}"
+            if not print_sbatch_only:
+                print(f"  {nn_label}: {len(nn_commands)} invocations (no noise)")
+            prev_id = s3df_submit_multi(
+                nn_commands,
+                job_label=nn_label,
+                time="01:00:00",
+                submit=submit,
+                mem_gb=64,
+                print_sbatch_command=print_sbatch_only,
+                log_progress=True,
+                dependency=prev_id if chain else None,
             )
 
 
@@ -223,6 +397,8 @@ def submit_diffusion_angle_study(
     print_sbatch_only=False,
     check_complete=False,
     no_noise_only=False,
+    overwrite=False,
+    chain=False,
     time="08:00:00",
 ):
     """1D loss landscape: diffusion coefficients vs. track angle.
@@ -259,6 +435,10 @@ def submit_diffusion_angle_study(
         _check_completions(results_dir, invocations, adc_cutoffs)
         return
 
+    prev_id = None
+    step = 0
+    n_total =len(_ANGLE_THETAS)
+    t_start = _time.time()
     for theta_deg in _ANGLE_THETAS:
         theta_rad = math.radians(theta_deg)
         dx = round(-math.cos(theta_rad), 9)
@@ -269,6 +449,9 @@ def submit_diffusion_angle_study(
         track_name = f"Muon_400MeV_theta_{theta_deg}_stepsize_1mm"
         track_spec = (f"{track_name}:{direction}:{_ANGLE_ENERGY}"
                       f":{_ANGLE_START_X},0,0")
+        if not print_sbatch_only:
+            step += 1
+            _log_progress(step, n_total, track_name, t_start)
 
         if not no_noise_only:
             commands = [
@@ -278,20 +461,20 @@ def submit_diffusion_angle_study(
                     N=100,
                     range_frac=0.2,
                     noise_scale=1.0,
-                    noise_seed=seed,
+                    noise_seeds=seeds,
                     adc_cutoffs=adc_cutoffs,
                     results_dir=results_dir,
                     step_size=1.0,
                     max_deposits=5000,
                     store_per_plane_loss=True,
+                    overwrite=overwrite,
                 )
                 for param in params
-                for seed in seeds
             ]
             label = f"loss_diff_angle_{track_name}"
             if not print_sbatch_only:
                 print(f"  {label}: {len(commands)} invocations")
-            s3df_submit_multi(
+            prev_id = s3df_submit_multi(
                 commands,
                 job_label=label,
                 time=time,
@@ -299,6 +482,7 @@ def submit_diffusion_angle_study(
                 mem_gb=64,
                 print_sbatch_command=print_sbatch_only,
                 log_progress=True,
+                dependency=prev_id if chain else None,
             )
 
         # No-noise job
@@ -315,13 +499,14 @@ def submit_diffusion_angle_study(
                 step_size=1.0,
                 max_deposits=5000,
                 store_per_plane_loss=True,
+                overwrite=overwrite,
             )
             for param in params
         ]
         nn_label = f"loss_diff_angle_nonoise_{track_name}"
         if not print_sbatch_only:
             print(f"  {nn_label}: {len(nn_commands)} invocations (no noise)")
-        s3df_submit_multi(
+        prev_id = s3df_submit_multi(
             nn_commands,
             job_label=nn_label,
             time="01:00:00",
@@ -329,6 +514,814 @@ def submit_diffusion_angle_study(
             mem_gb=64,
             print_sbatch_command=print_sbatch_only,
             log_progress=True,
+            dependency=prev_id if chain else None,
+        )
+
+
+def submit_diffusion_angle_study_no_wire_response(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    check_complete=False,
+    no_noise_only=False,
+    overwrite=False,
+    chain=False,
+    time="08:00:00",
+):
+    """1D loss landscape: diffusion vs. track angle, delta kernels (no wire response).
+
+    Track     : 400 MeV muon at (1900, 0, 0) mm
+    Angles    : same full angle grid as diffusion_angle_study (_ANGLE_THETAS)
+    Params    : diffusion_trans_cm2_us, diffusion_long_cm2_us
+    Range     : ±20% of GT (N=100)
+    ADC cuts  : [0, 5, 10, 20, 50]
+    Noise     : scale=1.0, seeds 0–49  +  scale=0 no-noise job
+    Wire resp : disabled (--no-wire-response)
+
+    Output    : $RESULTS_DIR/1d_gradients/diffusion_angle_study_no_wire_response/
+                $RESULTS_DIR/1d_gradients/diffusion_angle_study_no_wire_response_nonoise/
+    """
+    results_dir    = "$RESULTS_DIR/1d_gradients/diffusion_angle_study_no_wire_response"
+    results_dir_nn = "$RESULTS_DIR/1d_gradients/diffusion_angle_study_no_wire_response_nonoise"
+    params      = ["diffusion_trans_cm2_us", "diffusion_long_cm2_us"]
+    adc_cutoffs = [0, 5, 10, 20, 50]
+    seeds       = list(range(50))
+
+    if check_complete:
+        invocations = [
+            (f"Muon_400MeV_theta_{theta_deg}_stepsize_1mm  param={param}  seed={seed}",
+             param,
+             f"Muon_400MeV_theta_{theta_deg}_stepsize_1mm",
+             seed)
+            for theta_deg in _ANGLE_THETAS
+            for param in params
+            for seed in seeds
+        ]
+        print(f"diffusion_angle_study_no_wire_response — checking {len(invocations)} invocations "
+              f"in {results_dir.replace('$RESULTS_DIR', _RESULTS_DIR)}")
+        _check_completions(results_dir, invocations, adc_cutoffs)
+        return
+
+    prev_id = None
+    step = 0
+    n_total =len(_ANGLE_THETAS)
+    t_start = _time.time()
+    for theta_deg in _ANGLE_THETAS:
+        theta_rad = math.radians(theta_deg)
+        dx = round(-math.cos(theta_rad), 9)
+        dy = round( math.sin(theta_rad), 9)
+        dz = 0.0
+        direction = f"{dx:.9f},{dy:.9f},{dz:.1f}"
+
+        track_name = f"Muon_400MeV_theta_{theta_deg}_stepsize_1mm"
+        track_spec = (f"{track_name}:{direction}:{_ANGLE_ENERGY}"
+                      f":{_ANGLE_START_X},0,0")
+        if not print_sbatch_only:
+            step += 1
+            _log_progress(step, n_total, track_name, t_start)
+
+        if not no_noise_only:
+            commands = [
+                make_gradient_command(
+                    param=param,
+                    tracks=track_spec,
+                    N=100,
+                    range_frac=0.2,
+                    noise_scale=1.0,
+                    noise_seeds=seeds,
+                    adc_cutoffs=adc_cutoffs,
+                    results_dir=results_dir,
+                    step_size=1.0,
+                    max_deposits=5000,
+                    store_per_plane_loss=True,
+                    no_wire_response=True,
+                    overwrite=overwrite,
+                )
+                for param in params
+            ]
+            label = f"loss_diff_angle_nwr_{track_name}"
+            if not print_sbatch_only:
+                print(f"  {label}: {len(commands)} invocations")
+            prev_id = s3df_submit_multi(
+                commands,
+                job_label=label,
+                time=time,
+                submit=submit,
+                mem_gb=64,
+                print_sbatch_command=print_sbatch_only,
+                log_progress=True,
+                dependency=prev_id if chain else None,
+            )
+
+        nn_commands = [
+            make_gradient_command(
+                param=param,
+                tracks=track_spec,
+                N=100,
+                range_frac=0.2,
+                noise_scale=0.0,
+                noise_seed=0,
+                adc_cutoffs=adc_cutoffs,
+                results_dir=results_dir_nn,
+                step_size=1.0,
+                max_deposits=5000,
+                store_per_plane_loss=True,
+                no_wire_response=True,
+                overwrite=overwrite,
+            )
+            for param in params
+        ]
+        nn_label = f"loss_diff_angle_nwr_nonoise_{track_name}"
+        if not print_sbatch_only:
+            print(f"  {nn_label}: {len(nn_commands)} invocations (no noise)")
+        prev_id = s3df_submit_multi(
+            nn_commands,
+            job_label=nn_label,
+            time="01:00:00",
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+            log_progress=True,
+            dependency=prev_id if chain else None,
+        )
+
+
+def submit_diffusion_angle_pivot_study_no_wire_response(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    check_complete=False,
+    no_noise_only=False,
+    overwrite=False,
+    chain=False,
+    time="08:00:00",
+):
+    """1D loss landscape: diffusion vs. track angle, pivot at x=1000 mm, delta kernels (no wire response).
+
+    Track     : 400 MeV muon, midpoint fixed at (1000, 0, 0) mm (west volume)
+    Angles    : same full angle grid as diffusion_angle_pivot_study (_ANGLE_THETAS)
+    Params    : diffusion_trans_cm2_us, diffusion_long_cm2_us
+    Range     : ±20% of GT (N=100)
+    ADC cuts  : [0, 5, 10, 20, 50]
+    Noise     : scale=1.0, seeds 0–49  +  scale=0 no-noise job
+    Wire resp : disabled (--no-wire-response)
+
+    Output    : $RESULTS_DIR/1d_gradients/diffusion_angle_pivot_study_no_wire_response/
+                $RESULTS_DIR/1d_gradients/diffusion_angle_pivot_study_no_wire_response_nonoise/
+    """
+    results_dir    = "$RESULTS_DIR/1d_gradients/diffusion_angle_pivot_study_no_wire_response"
+    results_dir_nn = "$RESULTS_DIR/1d_gradients/diffusion_angle_pivot_study_no_wire_response_nonoise"
+    params      = ["diffusion_trans_cm2_us", "diffusion_long_cm2_us"]
+    adc_cutoffs = [0, 5, 10, 20, 50]
+    seeds       = list(range(50))
+
+    if check_complete:
+        invocations = [
+            (f"Muon_400MeV_theta_{theta_deg}_pivot_x1000_stepsize_1mm  param={param}  seed={seed}",
+             param,
+             f"Muon_400MeV_theta_{theta_deg}_pivot_x1000_stepsize_1mm",
+             seed)
+            for theta_deg in _ANGLE_THETAS
+            for param in params
+            for seed in seeds
+        ]
+        print(f"diffusion_angle_pivot_study_no_wire_response — checking {len(invocations)} invocations "
+              f"in {results_dir.replace('$RESULTS_DIR', _RESULTS_DIR)}")
+        _check_completions(results_dir, invocations, adc_cutoffs)
+        return
+
+    prev_id = None
+    step = 0
+    n_total =len(_ANGLE_THETAS)
+    t_start = _time.time()
+    for theta_deg in _ANGLE_THETAS:
+        theta_rad = math.radians(theta_deg)
+        dx = round(-math.cos(theta_rad), 9)
+        dy = round( math.sin(theta_rad), 9)
+        dz = 0.0
+        direction = f"{dx:.9f},{dy:.9f},{dz:.1f}"
+
+        start_x = round(_ANGLE_PIVOT_X_MM + _ANGLE_PIVOT_HALF_LEN_MM * math.cos(theta_rad), 3)
+        start_y = round(-_ANGLE_PIVOT_HALF_LEN_MM * math.sin(theta_rad), 3)
+
+        track_name = f"Muon_400MeV_theta_{theta_deg}_pivot_x1000_stepsize_1mm"
+        track_spec = (f"{track_name}:{direction}:{_ANGLE_ENERGY}"
+                      f":{start_x},{start_y},0")
+        if not print_sbatch_only:
+            step += 1
+            _log_progress(step, n_total, track_name, t_start)
+
+        if not no_noise_only:
+            commands = [
+                make_gradient_command(
+                    param=param,
+                    tracks=track_spec,
+                    N=100,
+                    range_frac=0.2,
+                    noise_scale=1.0,
+                    noise_seeds=seeds,
+                    adc_cutoffs=adc_cutoffs,
+                    results_dir=results_dir,
+                    step_size=1.0,
+                    max_deposits=5000,
+                    store_per_plane_loss=True,
+                    no_wire_response=True,
+                    overwrite=overwrite,
+                )
+                for param in params
+            ]
+            label = f"loss_diff_pivot_nwr_{track_name}"
+            if not print_sbatch_only:
+                print(f"  {label}: {len(commands)} invocations")
+            prev_id = s3df_submit_multi(
+                commands,
+                job_label=label,
+                time=time,
+                submit=submit,
+                mem_gb=64,
+                print_sbatch_command=print_sbatch_only,
+                log_progress=True,
+                dependency=prev_id if chain else None,
+            )
+
+        nn_commands = [
+            make_gradient_command(
+                param=param,
+                tracks=track_spec,
+                N=100,
+                range_frac=0.2,
+                noise_scale=0.0,
+                noise_seed=0,
+                adc_cutoffs=adc_cutoffs,
+                results_dir=results_dir_nn,
+                step_size=1.0,
+                max_deposits=5000,
+                store_per_plane_loss=True,
+                no_wire_response=True,
+                overwrite=overwrite,
+            )
+            for param in params
+        ]
+        nn_label = f"loss_diff_pivot_nwr_nonoise_{track_name}"
+        if not print_sbatch_only:
+            print(f"  {nn_label}: {len(nn_commands)} invocations (no noise)")
+        prev_id = s3df_submit_multi(
+            nn_commands,
+            job_label=nn_label,
+            time="01:00:00",
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+            log_progress=True,
+            dependency=prev_id if chain else None,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Diffusion (theta, alpha) grid study
+# ---------------------------------------------------------------------------
+# Single 400 MeV muon starting at (1900, 0, 0) mm in the west volume.
+# theta = azimuthal angle in the XY plane from the -x axis (as in angle_study).
+# alpha = "lift" angle from the XY plane toward +z (polar elevation).
+#   dx = -cos(theta)*cos(alpha),  dy = sin(theta)*cos(alpha),  dz = sin(alpha)
+# Both angles sweep 0°–20° in 5° steps → 5×5 = 25 grid points.
+# ---------------------------------------------------------------------------
+_TA_THETAS = list(range(0, 21, 5))   # [0, 5, 10, 15, 20]
+_TA_ALPHAS = list(range(0, 21, 5))   # [0, 5, 10, 15, 20]
+
+# Extended grid: adds 25°/30°/35°/40° to both axes (9x9 = 81 combos total).
+# Only the 56 combos with theta>20° or alpha>20° are new (the 5x5=25 combos
+# with both <=20° are already covered by the base theta_alpha study above).
+# Written into the SAME results dirs as the base study so the plot's 9x9
+# (theta, alpha) grid is fully populated.
+_TA_THETAS_EXT = list(range(0, 41, 5))   # [0, 5, ..., 40]
+_TA_ALPHAS_EXT = list(range(0, 41, 5))   # [0, 5, ..., 40]
+_TA_EXTENDED_COMBOS = [
+    (theta_deg, alpha_deg)
+    for theta_deg in _TA_THETAS_EXT
+    for alpha_deg in _TA_ALPHAS_EXT
+    if theta_deg > 20 or alpha_deg > 20
+]
+
+
+def submit_diffusion_angle_theta_alpha_study(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    check_complete=False,
+    no_noise_only=False,
+    overwrite=False,
+    chain=False,
+    time="08:00:00",
+):
+    """1D loss landscape: diffusion coefficients vs. (theta, alpha) grid.
+
+    Track     : 400 MeV muon at (1900, 0, 0) mm.
+                theta — azimuthal angle in XY plane from -x axis (0°–20°, step 5°)
+                alpha — lift angle from XY plane toward +z   (0°–20°, step 5°)
+    Grid      : 5×5 = 25 (theta, alpha) combinations
+    Params    : diffusion_trans_cm2_us, diffusion_long_cm2_us
+    Range     : ±20% of GT (N=100, 201 sweep points)
+    ADC cuts  : [0, 5, 10, 20, 50]
+    Noise     : scale=1.0, seeds 0–49 (50 seeds)  +  scale=0 single no-noise job
+    step_size : 1 mm, max_deposits=5000
+
+    Output    : $RESULTS_DIR/1d_gradients/diffusion_angle_theta_alpha/
+                $RESULTS_DIR/1d_gradients/diffusion_angle_theta_alpha_nonoise/
+    """
+    results_dir    = "$RESULTS_DIR/1d_gradients/diffusion_angle_theta_alpha"
+    results_dir_nn = "$RESULTS_DIR/1d_gradients/diffusion_angle_theta_alpha_nonoise"
+    params      = ["diffusion_trans_cm2_us", "diffusion_long_cm2_us"]
+    adc_cutoffs = [0, 5, 10, 20, 50]
+    seeds       = list(range(50))  # 0–49
+
+    if check_complete:
+        invocations = [
+            (f"Muon_400MeV_theta_{theta_deg}_alpha_{alpha_deg}_stepsize_1mm  param={param}  seed={seed}",
+             param,
+             f"Muon_400MeV_theta_{theta_deg}_alpha_{alpha_deg}_stepsize_1mm",
+             seed)
+            for theta_deg in _TA_THETAS
+            for alpha_deg in _TA_ALPHAS
+            for param in params
+            for seed in seeds
+        ]
+        print(f"diffusion_angle_theta_alpha — checking {len(invocations)} invocations "
+              f"in {results_dir.replace('$RESULTS_DIR', _RESULTS_DIR)}")
+        _check_completions(results_dir, invocations, adc_cutoffs)
+        return
+
+    prev_id = None
+    step = 0
+    n_total =len(_TA_THETAS) * len(_TA_ALPHAS)
+    t_start = _time.time()
+    for theta_deg in _TA_THETAS:
+        for alpha_deg in _TA_ALPHAS:
+            theta_rad = math.radians(theta_deg)
+            alpha_rad = math.radians(alpha_deg)
+            dx = round(-math.cos(theta_rad) * math.cos(alpha_rad), 9)
+            dy = round( math.sin(theta_rad) * math.cos(alpha_rad), 9)
+            dz = round( math.sin(alpha_rad), 9)
+            direction = f"{dx:.9f},{dy:.9f},{dz:.9f}"
+
+            track_name = f"Muon_400MeV_theta_{theta_deg}_alpha_{alpha_deg}_stepsize_1mm"
+            track_spec = (f"{track_name}:{direction}:{_ANGLE_ENERGY}"
+                          f":{_ANGLE_START_X},0,0")
+            if not print_sbatch_only:
+                step += 1
+                _log_progress(step, n_total, track_name, t_start)
+
+            if not no_noise_only:
+                commands = [
+                    make_gradient_command(
+                        param=param,
+                        tracks=track_spec,
+                        N=100,
+                        range_frac=0.2,
+                        noise_scale=1.0,
+                        noise_seeds=seeds,
+                        adc_cutoffs=adc_cutoffs,
+                        results_dir=results_dir,
+                        step_size=1.0,
+                        max_deposits=5000,
+                        store_per_plane_loss=True,
+                        overwrite=overwrite,
+                    )
+                    for param in params
+                ]
+                label = f"loss_diff_ta_{track_name}"
+                if not print_sbatch_only:
+                    print(f"  {label}: {len(commands)} invocations")
+                prev_id = s3df_submit_multi(
+                    commands,
+                    job_label=label,
+                    time=time,
+                    submit=submit,
+                    mem_gb=64,
+                    print_sbatch_command=print_sbatch_only,
+                    log_progress=True,
+                    dependency=prev_id if chain else None,
+                )
+
+            # No-noise job
+            nn_commands = [
+                make_gradient_command(
+                    param=param,
+                    tracks=track_spec,
+                    N=100,
+                    range_frac=0.2,
+                    noise_scale=0.0,
+                    noise_seed=0,
+                    adc_cutoffs=adc_cutoffs,
+                    results_dir=results_dir_nn,
+                    step_size=1.0,
+                    max_deposits=5000,
+                    store_per_plane_loss=True,
+                    overwrite=overwrite,
+                )
+                for param in params
+            ]
+            nn_label = f"loss_diff_ta_nonoise_{track_name}"
+            if not print_sbatch_only:
+                print(f"  {nn_label}: {len(nn_commands)} invocations (no noise)")
+            prev_id = s3df_submit_multi(
+                nn_commands,
+                job_label=nn_label,
+                time="01:00:00",
+                submit=submit,
+                mem_gb=64,
+                print_sbatch_command=print_sbatch_only,
+                log_progress=True,
+                dependency=prev_id if chain else None,
+            )
+
+
+def submit_diffusion_angle_theta_alpha_study_no_wire_response(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    check_complete=False,
+    no_noise_only=False,
+    overwrite=False,
+    chain=False,
+    time="08:00:00",
+):
+    """1D loss landscape: diffusion vs. (theta, alpha) grid, delta kernels (no wire response).
+
+    Track     : 400 MeV muon at (1900, 0, 0) mm.
+                theta — azimuthal angle in XY plane from -x axis (0°–20°, step 5°)
+                alpha — lift angle from XY plane toward +z   (0°–20°, step 5°)
+    Grid      : 5×5 = 25 (theta, alpha) combinations (same as full theta_alpha study)
+    Params    : diffusion_trans_cm2_us, diffusion_long_cm2_us
+    Range     : ±20% of GT (N=100)
+    ADC cuts  : [0, 5, 10, 20, 50]
+    Noise     : scale=1.0, seeds 0–49  +  scale=0 no-noise job
+    Wire resp : disabled (--no-wire-response)
+
+    Output    : $RESULTS_DIR/1d_gradients/diffusion_angle_theta_alpha_no_wire_response/
+                $RESULTS_DIR/1d_gradients/diffusion_angle_theta_alpha_no_wire_response_nonoise/
+    """
+    results_dir    = "$RESULTS_DIR/1d_gradients/diffusion_angle_theta_alpha_no_wire_response"
+    results_dir_nn = "$RESULTS_DIR/1d_gradients/diffusion_angle_theta_alpha_no_wire_response_nonoise"
+    params      = ["diffusion_trans_cm2_us", "diffusion_long_cm2_us"]
+    adc_cutoffs = [0, 5, 10, 20, 50]
+    seeds       = list(range(50))
+
+    if check_complete:
+        invocations = [
+            (f"Muon_400MeV_theta_{theta_deg}_alpha_{alpha_deg}_stepsize_1mm  param={param}  seed={seed}",
+             param,
+             f"Muon_400MeV_theta_{theta_deg}_alpha_{alpha_deg}_stepsize_1mm",
+             seed)
+            for theta_deg in _TA_THETAS
+            for alpha_deg in _TA_ALPHAS
+            for param in params
+            for seed in seeds
+        ]
+        print(f"diffusion_angle_theta_alpha_no_wire_response — checking {len(invocations)} invocations "
+              f"in {results_dir.replace('$RESULTS_DIR', _RESULTS_DIR)}")
+        _check_completions(results_dir, invocations, adc_cutoffs)
+        return
+
+    prev_id = None
+    step = 0
+    n_total =len(_TA_THETAS) * len(_TA_ALPHAS)
+    t_start = _time.time()
+    for theta_deg in _TA_THETAS:
+        for alpha_deg in _TA_ALPHAS:
+            theta_rad = math.radians(theta_deg)
+            alpha_rad = math.radians(alpha_deg)
+            dx = round(-math.cos(theta_rad) * math.cos(alpha_rad), 9)
+            dy = round( math.sin(theta_rad) * math.cos(alpha_rad), 9)
+            dz = round( math.sin(alpha_rad), 9)
+            direction = f"{dx:.9f},{dy:.9f},{dz:.9f}"
+
+            track_name = f"Muon_400MeV_theta_{theta_deg}_alpha_{alpha_deg}_stepsize_1mm"
+            track_spec = (f"{track_name}:{direction}:{_ANGLE_ENERGY}"
+                          f":{_ANGLE_START_X},0,0")
+            if not print_sbatch_only:
+                step += 1
+                _log_progress(step, n_total, track_name, t_start)
+
+            if not no_noise_only:
+                commands = [
+                    make_gradient_command(
+                        param=param,
+                        tracks=track_spec,
+                        N=100,
+                        range_frac=0.2,
+                        noise_scale=1.0,
+                        noise_seeds=seeds,
+                        adc_cutoffs=adc_cutoffs,
+                        results_dir=results_dir,
+                        step_size=1.0,
+                        max_deposits=5000,
+                        store_per_plane_loss=True,
+                        no_wire_response=True,
+                        overwrite=overwrite,
+                    )
+                    for param in params
+                ]
+                label = f"loss_diff_ta_nwr_{track_name}"
+                if not print_sbatch_only:
+                    print(f"  {label}: {len(commands)} invocations")
+                prev_id = s3df_submit_multi(
+                    commands,
+                    job_label=label,
+                    time=time,
+                    submit=submit,
+                    mem_gb=64,
+                    print_sbatch_command=print_sbatch_only,
+                    log_progress=True,
+                    dependency=prev_id if chain else None,
+                )
+
+            nn_commands = [
+                make_gradient_command(
+                    param=param,
+                    tracks=track_spec,
+                    N=100,
+                    range_frac=0.2,
+                    noise_scale=0.0,
+                    noise_seed=0,
+                    adc_cutoffs=adc_cutoffs,
+                    results_dir=results_dir_nn,
+                    step_size=1.0,
+                    max_deposits=5000,
+                    store_per_plane_loss=True,
+                    no_wire_response=True,
+                    overwrite=overwrite,
+                )
+                for param in params
+            ]
+            nn_label = f"loss_diff_ta_nwr_nonoise_{track_name}"
+            if not print_sbatch_only:
+                print(f"  {nn_label}: {len(nn_commands)} invocations (no noise)")
+            prev_id = s3df_submit_multi(
+                nn_commands,
+                job_label=nn_label,
+                time="01:00:00",
+                submit=submit,
+                mem_gb=64,
+                print_sbatch_command=print_sbatch_only,
+                log_progress=True,
+                dependency=prev_id if chain else None,
+            )
+
+
+def submit_diffusion_angle_theta_alpha_extended_study(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    check_complete=False,
+    no_noise_only=False,
+    overwrite=False,
+    chain=False,
+    time="08:00:00",
+):
+    """1D loss landscape: diffusion vs (theta, alpha), extended grid (angles > 20°).
+
+    Track     : 400 MeV muon at (1900, 0, 0) mm (same as diffusion_angle_theta_alpha).
+                theta, alpha each range 0°-40° in 5° steps (9x9 = 81 combos);
+                only the 56 combos with theta>20° or alpha>20° are submitted
+                here — the 5x5=25 combos with both <=20° are covered by
+                diffusion_angle_theta_alpha.
+    Params    : diffusion_trans_cm2_us, diffusion_long_cm2_us
+    Range     : ±20% of GT (N=100, 201 sweep points)
+    ADC cuts  : [0, 5, 10, 20, 50]
+    Noise     : scale=1.0, seeds 0–49 (50 seeds)  +  scale=0 single no-noise job
+    step_size : 1 mm, max_deposits=5000
+
+    Output    : $RESULTS_DIR/1d_gradients/diffusion_angle_theta_alpha/  (same dir as base study)
+                $RESULTS_DIR/1d_gradients/diffusion_angle_theta_alpha_nonoise/
+    """
+    results_dir    = "$RESULTS_DIR/1d_gradients/diffusion_angle_theta_alpha"
+    results_dir_nn = "$RESULTS_DIR/1d_gradients/diffusion_angle_theta_alpha_nonoise"
+    params      = ["diffusion_trans_cm2_us", "diffusion_long_cm2_us"]
+    adc_cutoffs = [0, 5, 10, 20, 50]
+    seeds       = list(range(50))  # 0–49
+
+    if check_complete:
+        invocations = [
+            (f"Muon_400MeV_theta_{theta_deg}_alpha_{alpha_deg}_stepsize_1mm  param={param}  seed={seed}",
+             param,
+             f"Muon_400MeV_theta_{theta_deg}_alpha_{alpha_deg}_stepsize_1mm",
+             seed)
+            for theta_deg, alpha_deg in _TA_EXTENDED_COMBOS
+            for param in params
+            for seed in seeds
+        ]
+        print(f"diffusion_angle_theta_alpha_extended — checking {len(invocations)} invocations "
+              f"in {results_dir.replace('$RESULTS_DIR', _RESULTS_DIR)}")
+        _check_completions(results_dir, invocations, adc_cutoffs)
+        return
+
+    prev_id = None
+    step = 0
+    n_total = len(_TA_EXTENDED_COMBOS)
+    t_start = _time.time()
+    for theta_deg, alpha_deg in _TA_EXTENDED_COMBOS:
+        theta_rad = math.radians(theta_deg)
+        alpha_rad = math.radians(alpha_deg)
+        dx = round(-math.cos(theta_rad) * math.cos(alpha_rad), 9)
+        dy = round( math.sin(theta_rad) * math.cos(alpha_rad), 9)
+        dz = round( math.sin(alpha_rad), 9)
+        direction = f"{dx:.9f},{dy:.9f},{dz:.9f}"
+
+        track_name = f"Muon_400MeV_theta_{theta_deg}_alpha_{alpha_deg}_stepsize_1mm"
+        track_spec = (f"{track_name}:{direction}:{_ANGLE_ENERGY}"
+                      f":{_ANGLE_START_X},0,0")
+        if not print_sbatch_only:
+            step += 1
+            _log_progress(step, n_total, track_name, t_start)
+
+        if not no_noise_only:
+            commands = [
+                make_gradient_command(
+                    param=param,
+                    tracks=track_spec,
+                    N=100,
+                    range_frac=0.2,
+                    noise_scale=1.0,
+                    noise_seeds=seeds,
+                    adc_cutoffs=adc_cutoffs,
+                    results_dir=results_dir,
+                    step_size=1.0,
+                    max_deposits=5000,
+                    store_per_plane_loss=True,
+                    overwrite=overwrite,
+                )
+                for param in params
+            ]
+            label = f"loss_diff_ta_ext_{track_name}"
+            if not print_sbatch_only:
+                print(f"  {label}: {len(commands)} invocations")
+            prev_id = s3df_submit_multi(
+                commands,
+                job_label=label,
+                time=time,
+                submit=submit,
+                mem_gb=64,
+                print_sbatch_command=print_sbatch_only,
+                log_progress=True,
+                dependency=prev_id if chain else None,
+            )
+
+        # No-noise job
+        nn_commands = [
+            make_gradient_command(
+                param=param,
+                tracks=track_spec,
+                N=100,
+                range_frac=0.2,
+                noise_scale=0.0,
+                noise_seed=0,
+                adc_cutoffs=adc_cutoffs,
+                results_dir=results_dir_nn,
+                step_size=1.0,
+                max_deposits=5000,
+                store_per_plane_loss=True,
+                overwrite=overwrite,
+            )
+            for param in params
+        ]
+        nn_label = f"loss_diff_ta_ext_nonoise_{track_name}"
+        if not print_sbatch_only:
+            print(f"  {nn_label}: {len(nn_commands)} invocations (no noise)")
+        prev_id = s3df_submit_multi(
+            nn_commands,
+            job_label=nn_label,
+            time="01:00:00",
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+            log_progress=True,
+            dependency=prev_id if chain else None,
+        )
+
+
+def submit_diffusion_angle_theta_alpha_extended_study_no_wire_response(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    check_complete=False,
+    no_noise_only=False,
+    overwrite=False,
+    chain=False,
+    time="08:00:00",
+):
+    """1D loss landscape: diffusion vs (theta, alpha), extended grid (angles > 20°), delta kernels.
+
+    Same grid and structure as submit_diffusion_angle_theta_alpha_extended_study,
+    but with wire response disabled (--no-wire-response); writes into the same
+    dirs as diffusion_angle_theta_alpha_no_wire_response.
+
+    Output    : $RESULTS_DIR/1d_gradients/diffusion_angle_theta_alpha_no_wire_response/
+                $RESULTS_DIR/1d_gradients/diffusion_angle_theta_alpha_no_wire_response_nonoise/
+    """
+    results_dir    = "$RESULTS_DIR/1d_gradients/diffusion_angle_theta_alpha_no_wire_response"
+    results_dir_nn = "$RESULTS_DIR/1d_gradients/diffusion_angle_theta_alpha_no_wire_response_nonoise"
+    params      = ["diffusion_trans_cm2_us", "diffusion_long_cm2_us"]
+    adc_cutoffs = [0, 5, 10, 20, 50]
+    seeds       = list(range(50))  # 0–49
+
+    if check_complete:
+        invocations = [
+            (f"Muon_400MeV_theta_{theta_deg}_alpha_{alpha_deg}_stepsize_1mm  param={param}  seed={seed}",
+             param,
+             f"Muon_400MeV_theta_{theta_deg}_alpha_{alpha_deg}_stepsize_1mm",
+             seed)
+            for theta_deg, alpha_deg in _TA_EXTENDED_COMBOS
+            for param in params
+            for seed in seeds
+        ]
+        print(f"diffusion_angle_theta_alpha_extended_no_wire_response — checking {len(invocations)} invocations "
+              f"in {results_dir.replace('$RESULTS_DIR', _RESULTS_DIR)}")
+        _check_completions(results_dir, invocations, adc_cutoffs)
+        return
+
+    prev_id = None
+    step = 0
+    n_total = len(_TA_EXTENDED_COMBOS)
+    t_start = _time.time()
+    for theta_deg, alpha_deg in _TA_EXTENDED_COMBOS:
+        theta_rad = math.radians(theta_deg)
+        alpha_rad = math.radians(alpha_deg)
+        dx = round(-math.cos(theta_rad) * math.cos(alpha_rad), 9)
+        dy = round( math.sin(theta_rad) * math.cos(alpha_rad), 9)
+        dz = round( math.sin(alpha_rad), 9)
+        direction = f"{dx:.9f},{dy:.9f},{dz:.9f}"
+
+        track_name = f"Muon_400MeV_theta_{theta_deg}_alpha_{alpha_deg}_stepsize_1mm"
+        track_spec = (f"{track_name}:{direction}:{_ANGLE_ENERGY}"
+                      f":{_ANGLE_START_X},0,0")
+        if not print_sbatch_only:
+            step += 1
+            _log_progress(step, n_total, track_name, t_start)
+
+        if not no_noise_only:
+            commands = [
+                make_gradient_command(
+                    param=param,
+                    tracks=track_spec,
+                    N=100,
+                    range_frac=0.2,
+                    noise_scale=1.0,
+                    noise_seeds=seeds,
+                    adc_cutoffs=adc_cutoffs,
+                    results_dir=results_dir,
+                    step_size=1.0,
+                    max_deposits=5000,
+                    store_per_plane_loss=True,
+                    no_wire_response=True,
+                    overwrite=overwrite,
+                )
+                for param in params
+            ]
+            label = f"loss_diff_ta_ext_nwr_{track_name}"
+            if not print_sbatch_only:
+                print(f"  {label}: {len(commands)} invocations")
+            prev_id = s3df_submit_multi(
+                commands,
+                job_label=label,
+                time=time,
+                submit=submit,
+                mem_gb=64,
+                print_sbatch_command=print_sbatch_only,
+                log_progress=True,
+                dependency=prev_id if chain else None,
+            )
+
+        nn_commands = [
+            make_gradient_command(
+                param=param,
+                tracks=track_spec,
+                N=100,
+                range_frac=0.2,
+                noise_scale=0.0,
+                noise_seed=0,
+                adc_cutoffs=adc_cutoffs,
+                results_dir=results_dir_nn,
+                step_size=1.0,
+                max_deposits=5000,
+                store_per_plane_loss=True,
+                no_wire_response=True,
+                overwrite=overwrite,
+            )
+            for param in params
+        ]
+        nn_label = f"loss_diff_ta_ext_nwr_nonoise_{track_name}"
+        if not print_sbatch_only:
+            print(f"  {nn_label}: {len(nn_commands)} invocations (no noise)")
+        prev_id = s3df_submit_multi(
+            nn_commands,
+            job_label=nn_label,
+            time="01:00:00",
+            submit=submit,
+            mem_gb=64,
+            print_sbatch_command=print_sbatch_only,
+            log_progress=True,
+            dependency=prev_id if chain else None,
         )
 
 
@@ -349,6 +1342,8 @@ def submit_diffusion_angle_pivot_study(
     print_sbatch_only=False,
     check_complete=False,
     no_noise_only=False,
+    overwrite=False,
+    chain=False,
     time="08:00:00",
 ):
     """1D loss landscape: diffusion coefficients vs. track angle, pivot at x=1000 mm.
@@ -386,6 +1381,10 @@ def submit_diffusion_angle_pivot_study(
         _check_completions(results_dir, invocations, adc_cutoffs)
         return
 
+    prev_id = None
+    step = 0
+    n_total =len(_ANGLE_THETAS)
+    t_start = _time.time()
     for theta_deg in _ANGLE_THETAS:
         theta_rad = math.radians(theta_deg)
         dx = round(-math.cos(theta_rad), 9)
@@ -399,6 +1398,9 @@ def submit_diffusion_angle_pivot_study(
         track_name = f"Muon_400MeV_theta_{theta_deg}_pivot_x1000_stepsize_1mm"
         track_spec = (f"{track_name}:{direction}:{_ANGLE_ENERGY}"
                       f":{start_x},{start_y},0")
+        if not print_sbatch_only:
+            step += 1
+            _log_progress(step, n_total, track_name, t_start)
 
         if not no_noise_only:
             commands = [
@@ -408,20 +1410,20 @@ def submit_diffusion_angle_pivot_study(
                     N=100,
                     range_frac=0.2,
                     noise_scale=1.0,
-                    noise_seed=seed,
+                    noise_seeds=seeds,
                     adc_cutoffs=adc_cutoffs,
                     results_dir=results_dir,
                     step_size=1.0,
                     max_deposits=5000,
                     store_per_plane_loss=True,
+                    overwrite=overwrite,
                 )
                 for param in params
-                for seed in seeds
             ]
             label = f"loss_diff_anglepivot_{track_name}"
             if not print_sbatch_only:
                 print(f"  {label}: {len(commands)} invocations")
-            s3df_submit_multi(
+            prev_id = s3df_submit_multi(
                 commands,
                 job_label=label,
                 time=time,
@@ -429,6 +1431,7 @@ def submit_diffusion_angle_pivot_study(
                 mem_gb=64,
                 print_sbatch_command=print_sbatch_only,
                 log_progress=True,
+                dependency=prev_id if chain else None,
             )
 
         # No-noise job
@@ -445,13 +1448,14 @@ def submit_diffusion_angle_pivot_study(
                 step_size=1.0,
                 max_deposits=5000,
                 store_per_plane_loss=True,
+                overwrite=overwrite,
             )
             for param in params
         ]
         nn_label = f"loss_diff_anglepivot_nonoise_{track_name}"
         if not print_sbatch_only:
             print(f"  {nn_label}: {len(nn_commands)} invocations (no noise)")
-        s3df_submit_multi(
+        prev_id = s3df_submit_multi(
             nn_commands,
             job_label=nn_label,
             time="01:00:00",
@@ -459,16 +1463,309 @@ def submit_diffusion_angle_pivot_study(
             mem_gb=64,
             print_sbatch_command=print_sbatch_only,
             log_progress=True,
+            dependency=prev_id if chain else None,
         )
+
+
+# ---------------------------------------------------------------------------
+# Diffusion angle-pivot (theta, alpha) grid study
+# ---------------------------------------------------------------------------
+# Same as angle-pivot study but sweeps a 5×5 (theta, alpha) grid.
+# Midpoint fixed at (_ANGLE_PIVOT_X_MM, 0, 0) mm.
+# start = (pivot_x + L·cos θ·cos α,  −L·sin θ·cos α,  −L·sin α)  where L = half-length
+# ---------------------------------------------------------------------------
+
+def submit_diffusion_angle_pivot_theta_alpha_study(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    check_complete=False,
+    no_noise_only=False,
+    overwrite=False,
+    chain=False,
+    time="08:00:00",
+):
+    """1D loss landscape: diffusion coefficients vs. (theta, alpha) grid, pivot at x=1000 mm.
+
+    Track     : 400 MeV muon, midpoint fixed at (1000, 0, 0) mm (west volume).
+                theta — azimuthal angle in XY plane from -x axis (0°–20°, step 5°)
+                alpha — lift angle from XY plane toward +z   (0°–20°, step 5°)
+                Start: (1000 + L·cos θ·cos α,  −L·sin θ·cos α,  −L·sin α) mm,
+                       where L = 850.3 mm (CSDA half-range of 400 MeV muon in LAr).
+    Grid      : 5×5 = 25 (theta, alpha) combinations
+    Params    : diffusion_trans_cm2_us, diffusion_long_cm2_us
+    Range     : ±20% of GT (N=100, 201 sweep points)
+    ADC cuts  : [0, 5, 10, 20, 50]
+    Noise     : scale=1.0, seeds 0–49 (50 seeds)  +  scale=0 single no-noise job
+    step_size : 1 mm, max_deposits=5000
+
+    Output    : $RESULTS_DIR/1d_gradients/diffusion_angle_pivot_theta_alpha/
+                $RESULTS_DIR/1d_gradients/diffusion_angle_pivot_theta_alpha_nonoise/
+    """
+    results_dir    = "$RESULTS_DIR/1d_gradients/diffusion_angle_pivot_theta_alpha"
+    results_dir_nn = "$RESULTS_DIR/1d_gradients/diffusion_angle_pivot_theta_alpha_nonoise"
+    params      = ["diffusion_trans_cm2_us", "diffusion_long_cm2_us"]
+    adc_cutoffs = [0, 5, 10, 20, 50]
+    seeds       = list(range(50))  # 0–49
+
+    if check_complete:
+        invocations = [
+            (f"Muon_400MeV_theta_{theta_deg}_alpha_{alpha_deg}_pivot_x1000_stepsize_1mm  param={param}  seed={seed}",
+             param,
+             f"Muon_400MeV_theta_{theta_deg}_alpha_{alpha_deg}_pivot_x1000_stepsize_1mm",
+             seed)
+            for theta_deg in _TA_THETAS
+            for alpha_deg in _TA_ALPHAS
+            for param in params
+            for seed in seeds
+        ]
+        print(f"diffusion_angle_pivot_theta_alpha — checking {len(invocations)} invocations "
+              f"in {results_dir.replace('$RESULTS_DIR', _RESULTS_DIR)}")
+        _check_completions(results_dir, invocations, adc_cutoffs)
+        return
+
+    prev_id = None
+    step = 0
+    n_total =len(_TA_THETAS) * len(_TA_ALPHAS)
+    t_start = _time.time()
+    for theta_deg in _TA_THETAS:
+        for alpha_deg in _TA_ALPHAS:
+            theta_rad = math.radians(theta_deg)
+            alpha_rad = math.radians(alpha_deg)
+            dx = round(-math.cos(theta_rad) * math.cos(alpha_rad), 9)
+            dy = round( math.sin(theta_rad) * math.cos(alpha_rad), 9)
+            dz = round( math.sin(alpha_rad), 9)
+            direction = f"{dx:.9f},{dy:.9f},{dz:.9f}"
+
+            start_x = round(_ANGLE_PIVOT_X_MM + _ANGLE_PIVOT_HALF_LEN_MM * math.cos(theta_rad) * math.cos(alpha_rad), 3)
+            start_y = round(-_ANGLE_PIVOT_HALF_LEN_MM * math.sin(theta_rad) * math.cos(alpha_rad), 3)
+            start_z = round(-_ANGLE_PIVOT_HALF_LEN_MM * math.sin(alpha_rad), 3)
+
+            track_name = f"Muon_400MeV_theta_{theta_deg}_alpha_{alpha_deg}_pivot_x1000_stepsize_1mm"
+            track_spec = (f"{track_name}:{direction}:{_ANGLE_ENERGY}"
+                          f":{start_x},{start_y},{start_z}")
+            if not print_sbatch_only:
+                step += 1
+                _log_progress(step, n_total, track_name, t_start)
+
+            if not no_noise_only:
+                commands = [
+                    make_gradient_command(
+                        param=param,
+                        tracks=track_spec,
+                        N=100,
+                        range_frac=0.2,
+                        noise_scale=1.0,
+                        noise_seeds=seeds,
+                        adc_cutoffs=adc_cutoffs,
+                        results_dir=results_dir,
+                        step_size=1.0,
+                        max_deposits=5000,
+                        store_per_plane_loss=True,
+                        overwrite=overwrite,
+                    )
+                    for param in params
+                ]
+                label = f"loss_diff_pivot_ta_{track_name}"
+                if not print_sbatch_only:
+                    print(f"  {label}: {len(commands)} invocations")
+                prev_id = s3df_submit_multi(
+                    commands,
+                    job_label=label,
+                    time=time,
+                    submit=submit,
+                    mem_gb=64,
+                    print_sbatch_command=print_sbatch_only,
+                    log_progress=True,
+                    dependency=prev_id if chain else None,
+                )
+
+            # No-noise job
+            nn_commands = [
+                make_gradient_command(
+                    param=param,
+                    tracks=track_spec,
+                    N=100,
+                    range_frac=0.2,
+                    noise_scale=0.0,
+                    noise_seed=0,
+                    adc_cutoffs=adc_cutoffs,
+                    results_dir=results_dir_nn,
+                    step_size=1.0,
+                    max_deposits=5000,
+                    store_per_plane_loss=True,
+                    overwrite=overwrite,
+                )
+                for param in params
+            ]
+            nn_label = f"loss_diff_pivot_ta_nonoise_{track_name}"
+            if not print_sbatch_only:
+                print(f"  {nn_label}: {len(nn_commands)} invocations (no noise)")
+            prev_id = s3df_submit_multi(
+                nn_commands,
+                job_label=nn_label,
+                time="01:00:00",
+                submit=submit,
+                mem_gb=64,
+                print_sbatch_command=print_sbatch_only,
+                log_progress=True,
+                dependency=prev_id if chain else None,
+            )
+
+
+def submit_diffusion_angle_pivot_theta_alpha_study_no_wire_response(
+    *,
+    submit=True,
+    print_sbatch_only=False,
+    check_complete=False,
+    no_noise_only=False,
+    overwrite=False,
+    chain=False,
+    time="08:00:00",
+):
+    """1D loss landscape: diffusion vs. (theta, alpha) grid, pivot at x=1000 mm, delta kernels (no wire response).
+
+    Track     : 400 MeV muon, midpoint fixed at (1000, 0, 0) mm (west volume).
+                theta — azimuthal angle in XY plane from -x axis (0°–20°, step 5°)
+                alpha — lift angle from XY plane toward +z   (0°–20°, step 5°)
+    Grid      : 5×5 = 25 (theta, alpha) combinations (same as full theta_alpha study)
+    Params    : diffusion_trans_cm2_us, diffusion_long_cm2_us
+    Range     : ±20% of GT (N=100)
+    ADC cuts  : [0, 5, 10, 20, 50]
+    Noise     : scale=1.0, seeds 0–49  +  scale=0 no-noise job
+    Wire resp : disabled (--no-wire-response)
+
+    Output    : $RESULTS_DIR/1d_gradients/diffusion_angle_pivot_theta_alpha_no_wire_response/
+                $RESULTS_DIR/1d_gradients/diffusion_angle_pivot_theta_alpha_no_wire_response_nonoise/
+    """
+    results_dir    = "$RESULTS_DIR/1d_gradients/diffusion_angle_pivot_theta_alpha_no_wire_response"
+    results_dir_nn = "$RESULTS_DIR/1d_gradients/diffusion_angle_pivot_theta_alpha_no_wire_response_nonoise"
+    params      = ["diffusion_trans_cm2_us", "diffusion_long_cm2_us"]
+    adc_cutoffs = [0, 5, 10, 20, 50]
+    seeds       = list(range(50))
+
+    if check_complete:
+        invocations = [
+            (f"Muon_400MeV_theta_{theta_deg}_alpha_{alpha_deg}_pivot_x1000_stepsize_1mm  param={param}  seed={seed}",
+             param,
+             f"Muon_400MeV_theta_{theta_deg}_alpha_{alpha_deg}_pivot_x1000_stepsize_1mm",
+             seed)
+            for theta_deg in _TA_THETAS
+            for alpha_deg in _TA_ALPHAS
+            for param in params
+            for seed in seeds
+        ]
+        print(f"diffusion_angle_pivot_theta_alpha_no_wire_response — checking {len(invocations)} invocations "
+              f"in {results_dir.replace('$RESULTS_DIR', _RESULTS_DIR)}")
+        _check_completions(results_dir, invocations, adc_cutoffs)
+        return
+
+    prev_id = None
+    step = 0
+    n_total =len(_TA_THETAS) * len(_TA_ALPHAS)
+    t_start = _time.time()
+    for theta_deg in _TA_THETAS:
+        for alpha_deg in _TA_ALPHAS:
+            theta_rad = math.radians(theta_deg)
+            alpha_rad = math.radians(alpha_deg)
+            dx = round(-math.cos(theta_rad) * math.cos(alpha_rad), 9)
+            dy = round( math.sin(theta_rad) * math.cos(alpha_rad), 9)
+            dz = round( math.sin(alpha_rad), 9)
+            direction = f"{dx:.9f},{dy:.9f},{dz:.9f}"
+
+            start_x = round(_ANGLE_PIVOT_X_MM + _ANGLE_PIVOT_HALF_LEN_MM * math.cos(theta_rad) * math.cos(alpha_rad), 3)
+            start_y = round(-_ANGLE_PIVOT_HALF_LEN_MM * math.sin(theta_rad) * math.cos(alpha_rad), 3)
+            start_z = round(-_ANGLE_PIVOT_HALF_LEN_MM * math.sin(alpha_rad), 3)
+
+            track_name = f"Muon_400MeV_theta_{theta_deg}_alpha_{alpha_deg}_pivot_x1000_stepsize_1mm"
+            track_spec = (f"{track_name}:{direction}:{_ANGLE_ENERGY}"
+                          f":{start_x},{start_y},{start_z}")
+            if not print_sbatch_only:
+                step += 1
+                _log_progress(step, n_total, track_name, t_start)
+
+            if not no_noise_only:
+                commands = [
+                    make_gradient_command(
+                        param=param,
+                        tracks=track_spec,
+                        N=100,
+                        range_frac=0.2,
+                        noise_scale=1.0,
+                        noise_seeds=seeds,
+                        adc_cutoffs=adc_cutoffs,
+                        results_dir=results_dir,
+                        step_size=1.0,
+                        max_deposits=5000,
+                        store_per_plane_loss=True,
+                        no_wire_response=True,
+                        overwrite=overwrite,
+                    )
+                    for param in params
+                ]
+                label = f"loss_diff_pivot_ta_nwr_{track_name}"
+                if not print_sbatch_only:
+                    print(f"  {label}: {len(commands)} invocations")
+                prev_id = s3df_submit_multi(
+                    commands,
+                    job_label=label,
+                    time=time,
+                    submit=submit,
+                    mem_gb=64,
+                    print_sbatch_command=print_sbatch_only,
+                    log_progress=True,
+                    dependency=prev_id if chain else None,
+                )
+
+            nn_commands = [
+                make_gradient_command(
+                    param=param,
+                    tracks=track_spec,
+                    N=100,
+                    range_frac=0.2,
+                    noise_scale=0.0,
+                    noise_seed=0,
+                    adc_cutoffs=adc_cutoffs,
+                    results_dir=results_dir_nn,
+                    step_size=1.0,
+                    max_deposits=5000,
+                    store_per_plane_loss=True,
+                    no_wire_response=True,
+                    overwrite=overwrite,
+                )
+                for param in params
+            ]
+            nn_label = f"loss_diff_pivot_ta_nwr_nonoise_{track_name}"
+            if not print_sbatch_only:
+                print(f"  {nn_label}: {len(nn_commands)} invocations (no noise)")
+            prev_id = s3df_submit_multi(
+                nn_commands,
+                job_label=nn_label,
+                time="01:00:00",
+                submit=submit,
+                mem_gb=64,
+                print_sbatch_command=print_sbatch_only,
+                log_progress=True,
+                dependency=prev_id if chain else None,
+            )
 
 
 # ---------------------------------------------------------------------------
 # CLI dispatch
 # ---------------------------------------------------------------------------
 _PROFILES = {
-    "diffusion_startx_study":        submit_diffusion_startx_study,
-    "diffusion_angle_study":         submit_diffusion_angle_study,
-    "diffusion_angle_pivot_study":   submit_diffusion_angle_pivot_study,
+    "diffusion_startx_study":                               submit_diffusion_startx_study,
+    "diffusion_startx_study_no_wire_response":              submit_diffusion_startx_study_no_wire_response,
+    "diffusion_angle_study":                                submit_diffusion_angle_study,
+    "diffusion_angle_study_no_wire_response":               submit_diffusion_angle_study_no_wire_response,
+    "diffusion_angle_theta_alpha":                          submit_diffusion_angle_theta_alpha_study,
+    "diffusion_angle_theta_alpha_no_wire_response":         submit_diffusion_angle_theta_alpha_study_no_wire_response,
+    "diffusion_angle_theta_alpha_extended":                 submit_diffusion_angle_theta_alpha_extended_study,
+    "diffusion_angle_theta_alpha_extended_no_wire_response": submit_diffusion_angle_theta_alpha_extended_study_no_wire_response,
+    "diffusion_angle_pivot_study":                          submit_diffusion_angle_pivot_study,
+    "diffusion_angle_pivot_study_no_wire_response":         submit_diffusion_angle_pivot_study_no_wire_response,
+    "diffusion_angle_pivot_theta_alpha":                    submit_diffusion_angle_pivot_theta_alpha_study,
+    "diffusion_angle_pivot_theta_alpha_no_wire_response":   submit_diffusion_angle_pivot_theta_alpha_study_no_wire_response,
 }
 
 if __name__ == "__main__":
@@ -485,6 +1782,11 @@ if __name__ == "__main__":
                    help="Check how many 1d_gradients.py invocations completed and which still need to run")
     p.add_argument("--no-noise-only", action="store_true",
                    help="Only submit the no-noise jobs (noise_scale=0, seed=0); skip the noisy seed sweep")
+    p.add_argument("--overwrite", action="store_true",
+                   help="Delete and rerun even if output pkl files already exist")
+    p.add_argument("--chain", action="store_true",
+                   help="Chain SLURM jobs within the profile: each job depends on the previous "
+                        "(requires --submit; no-op in dry-run mode)")
     args = p.parse_args()
 
     _PROFILES[args.profile](
@@ -492,4 +1794,6 @@ if __name__ == "__main__":
         print_sbatch_only=args.print_sbatch_command,
         check_complete=args.check_complete,
         no_noise_only=args.no_noise_only,
+        overwrite=args.overwrite,
+        chain=args.chain,
     )

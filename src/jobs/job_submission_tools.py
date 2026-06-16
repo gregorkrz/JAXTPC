@@ -191,6 +191,7 @@ def s3df_submit_multi(
     print_sbatch_command: bool = False,
     sbatch_commands_out: Optional[List[str]] = None,
     log_progress: bool = False,
+    dependency: Optional[str] = None,
 ) -> Optional[str]:
     """Submit one Slurm job that runs *commands* sequentially on a single GPU.
 
@@ -270,7 +271,11 @@ def s3df_submit_multi(
     path.write_text(script)
 
     if submit:
-        result = subprocess.run(["sbatch", str(path)], universal_newlines=True,
+        sbatch_cmd = ["sbatch"]
+        if dependency:
+            sbatch_cmd.append(f"--dependency=afterany:{dependency}")
+        sbatch_cmd.append(str(path))
+        result = subprocess.run(sbatch_cmd, universal_newlines=True,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         out = result.stdout.strip() or result.stderr.strip()
         print(out)
@@ -278,6 +283,8 @@ def s3df_submit_multi(
         return parts[-1] if parts and parts[-1].isdigit() else None
     elif print_sbatch_command:
         line = f"sbatch {path.resolve()}"
+        if dependency:
+            line = f"sbatch --dependency=afterany:{dependency} {path.resolve()}"
         if sbatch_commands_out is not None:
             sbatch_commands_out.append(line)
         else:

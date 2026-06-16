@@ -318,6 +318,7 @@ def make_gradient_command(
     factors=None,
     noise_scale=0.0,
     noise_seed=42,
+    noise_seeds=None,
     adc_cutoff=0.0,
     adc_cutoffs=None,
     fourier_cutoffs=None,
@@ -330,6 +331,8 @@ def make_gradient_command(
     store_per_pixel_loss_and_grad=False,
     store_arrays=False,
     save_per_factor=False,
+    no_wire_response=False,
+    overwrite=False,
 ):
     """Return a 1d_gradients.py command string.
 
@@ -338,6 +341,7 @@ def make_gradient_command(
     Pass adc_cutoffs as a list to use --adc-cutoffs (multi-cutoff sweep in one call).
     Pass fourier_cutoffs as a list to use --fourier-cutoffs (Fourier-domain signal masking).
     Pass sobolev_s to override the Sobolev spectral exponent (default 2.0).
+    Pass noise_seeds as a list to bundle multiple seeds into one invocation (--noise-seeds).
     """
     parts = [
         "python src/analysis/1d_gradients.py",
@@ -346,7 +350,12 @@ def make_gradient_command(
         f"--N {N}",
         f"--range-frac {range_frac}",
         f"--noise-scale {noise_scale}",
-        f"--noise-seed {noise_seed}",
+    ]
+    if noise_seeds is not None:
+        parts.append(f"--noise-seeds {','.join(str(s) for s in noise_seeds)}")
+    else:
+        parts.append(f"--noise-seed {noise_seed}")
+    parts += [
         f"--step-size {step_size}",
         f"--max-deposits {max_deposits}",
         f"--sobolev-max-pad {sobolev_max_pad}",
@@ -370,6 +379,10 @@ def make_gradient_command(
         parts.append("--store-arrays")
     if save_per_factor:
         parts.append("--save-per-factor")
+    if no_wire_response:
+        parts.append("--no-wire-response")
+    if overwrite:
+        parts.append("--overwrite")
     return " ".join(parts)
 
 
@@ -749,6 +762,8 @@ def make_opt_command(
     wandb_tags=None,
     tol_per_param=None,
     patience_per_param=None,
+    phase2_params=None,
+    phase2_start_step=None,
     log_interval=None,
     lr_mult_auto_burn_in_steps=None,
     newton_damping=None,
@@ -827,6 +842,10 @@ def make_opt_command(
         parts.append(f"--tol-per-param {tol_per_param}")
     if patience_per_param is not None:
         parts.append(f"--patience-per-param {patience_per_param}")
+    if phase2_params is not None:
+        parts.append(f"--phase2-params {phase2_params}")
+    if phase2_start_step is not None:
+        parts.append(f"--phase2-start-step {int(phase2_start_step)}")
     if log_interval is not None:
         parts.append(f"--log-interval {int(log_interval)}")
     if newton_damping is not None:

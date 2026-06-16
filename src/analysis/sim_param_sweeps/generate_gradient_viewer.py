@@ -26,6 +26,7 @@ import base64
 import json
 import os
 import pickle
+import re
 import zlib
 from collections import defaultdict
 from pathlib import Path
@@ -402,6 +403,11 @@ tr.sel:hover td{background:#BBDEFB}
       </label>
     </div>
 
+    <div class="row" id="seed-picker-row" style="display:none">
+      <span class="lbl">Seed:</span>
+      <div id="seed-btns" style="display:flex;gap:4px"></div>
+    </div>
+
     <div id="evd-param-rows"></div>
 
     <div class="row">
@@ -454,6 +460,10 @@ tr.sel:hover td{background:#BBDEFB}
       <div id="fourier-fcutoff-row" style="display:none;margin-top:4px;margin-bottom:2px">
         <span style="font-size:12px;color:#555">Fourier cutoff:</span>
         <span id="fourier-fcutoff-btns" style="display:inline-flex;gap:4px;margin-left:6px"></span>
+      </div>
+      <div id="fourier-pdf-row" style="display:none;margin-top:4px;margin-bottom:2px">
+        <span style="font-size:12px;color:#555">Fourier loss maps (PDF, factor ×<span id="fourier-pdf-factor"></span>):</span>
+        <span id="fourier-pdf-links" style="display:inline-flex;gap:6px;margin-left:6px"></span>
       </div>
       <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;align-items:start;margin-top:6px">
         <div id="evd-fourier-C"></div>
@@ -873,6 +883,47 @@ let _uiReady          = false;
 let _evdLastTrack     = null;
 let _evdLastPlane     = null;
 
+/* ── noise-seed picker ──────────────────────────────────────────────────────
+   Multiple PARAMS entries can share the same (param_name_base, adc_cutoff,
+   sobolev_s, fourier_cutoff) but differ only in noise_seed (the random GT
+   noise realisation). The seed picker lets the user switch which seed's
+   entry is used everywhere _evdParamIdx / _trParamIdx / _fourierParamIdx
+   point to, without duplicating rows/buttons per seed.
+── */
+const _allSeeds = [...new Set(PARAMS.map(p => p.noise_seed).filter(s => s !== undefined))].sort((a,b) => a-b);
+let _selectedSeed = _allSeeds.length ? _allSeeds[0] : null;
+
+function _paramBase(p) { return p.param_name_base || p.param_name; }
+function _paramKey(p) {
+  return _paramBase(p) + '|' + (p.adc_cutoff||0) + '|' + (p.sobolev_s||2.0) + '|' + (p.fourier_cutoff||0);
+}
+function _seedSibling(pi, seed) {
+  const key = _paramKey(PARAMS[pi]);
+  for (let i = 0; i < PARAMS.length; i++) {
+    if (_paramKey(PARAMS[i]) === key && PARAMS[i].noise_seed === seed) return i;
+  }
+  return pi;
+}
+function _canonicalCutoff(base) {
+  let m = Infinity;
+  PARAMS.forEach(p => { if (_paramBase(p) === base) m = Math.min(m, p.adc_cutoff || 0); });
+  return m;
+}
+/* One representative PARAMS index per param_name_base (at its canonical,
+   lowest adc_cutoff — usually 0), resolved to the currently-selected seed. */
+function _signalParamIndices() {
+  const seenBase = new Set();
+  const out = [];
+  PARAMS.forEach((p, pi) => {
+    const base = _paramBase(p);
+    if (seenBase.has(base)) return;
+    if ((p.adc_cutoff || 0) !== _canonicalCutoff(base)) return;
+    seenBase.add(base);
+    out.push((_selectedSeed !== null && p.noise_seed !== undefined) ? _seedSibling(pi, _selectedSeed) : pi);
+  });
+  return out;
+}
+
 function _nextColor() { return _PALETTE[_pIdx++ % _PALETTE.length]; }
 function _ptLabel(pi, pt) { return PARAMS[pi].pt_labels[pt]; }
 function _makeLabel(e) {
@@ -1081,14 +1132,18 @@ function _resetFourierInited() {
 }
 
 function _findMatchingParam(baseName, adc, sobolevS, fCutoff) {
+  let fallback = -1;
   for (let i = 0; i < PARAMS.length; i++) {
     const p = PARAMS[i];
     if ((p.param_name_base || p.param_name) === baseName &&
         Math.abs((p.adc_cutoff || 0) - adc) < 1e-9 &&
         Math.abs((p.sobolev_s || 2.0) - sobolevS) < 1e-6 &&
-        Math.abs((p.fourier_cutoff || 0) - fCutoff) < 1e-9) return i;
+        Math.abs((p.fourier_cutoff || 0) - fCutoff) < 1e-9) {
+      if (p.noise_seed === undefined || p.noise_seed === _selectedSeed) return i;
+      if (fallback < 0) fallback = i;
+    }
   }
-  return -1;
+  return fallback;
 }
 
 function _updateFourierCutoffBtns() {
@@ -1156,7 +1211,33 @@ function _updateFourierCutoffBtns() {
     v => v === 0 ? 'No cutoff' : 'fc=' + v,
     v => { _fourierSelFcutoff = v; });
 
+  _updatePdfLinks();
+
   if (prevIdx !== _fourierParamIdx) _resetFourierInited();
+}
+
+function _updatePdfLinks() {
+  const p     = PARAMS[_fourierParamIdx];
+  const row   = document.getElementById('fourier-pdf-row');
+  const links = document.getElementById('fourier-pdf-links');
+  const factorSpan = document.getElementById('fourier-pdf-factor');
+  links.innerHTML = '';
+  const pdfs = p.fourier_pdfs;
+  if (!pdfs || Object.keys(pdfs).length === 0) {
+    row.style.display = 'none';
+    return;
+  }
+  row.style.display = '';
+  factorSpan.textContent = (p.fourier_pdf_factor ?? '').toString();
+  for (const [letter, fname] of Object.entries(pdfs)) {
+    const a = document.createElement('a');
+    a.href = fname;
+    a.target = '_blank';
+    a.textContent = letter;
+    a.style.cssText = 'font-size:12px;font-weight:600;color:#1565C0;text-decoration:none;'
+                     + 'border:1px solid #90CAF9;border-radius:4px;padding:2px 8px;background:#E3F2FD';
+    links.appendChild(a);
+  }
 }
 
 function _switchEvdTab(tab) {
@@ -1418,6 +1499,7 @@ function _saveState() {
   sp.set('fadc', String(_fourierSelAdc));
   sp.set('fs',   String(_fourierSelSobolevS));
   sp.set('ffc',  String(_fourierSelFcutoff));
+  if (_selectedSeed !== null) sp.set('seed', String(_selectedSeed));
   const maskEl = document.getElementById('pixel-mask-thresh');
   if (maskEl && parseFloat(maskEl.value) > 0) sp.set('mask', maskEl.value);
   const sfcEl = document.getElementById('signal-fourier-cutoff');
@@ -1429,6 +1511,19 @@ function _saveState() {
 
 function _restoreFromURL() {
   const sp = new URLSearchParams(window.location.search);
+  const seedSp = sp.get('seed');
+  if (seedSp !== null) {
+    const sNum = parseFloat(seedSp);
+    if (_allSeeds.includes(sNum) && sNum !== _selectedSeed) {
+      _selectedSeed = sNum;
+      _allSeeds.forEach(s => {
+        const b = document.getElementById('seed-btn-'+s);
+        if (b) b.className = 'mode-btn'+(s===_selectedSeed?' active':'');
+      });
+      _rebuildParamRows();
+      _rebuildTrParamBtns();
+    }
+  }
   if (!sp.has('t') && !sp.has('sp')) return;
   const allTracks = PARAMS[0].track_names;
   const allPlanes = PARAMS[0].plane_names;
@@ -1447,7 +1542,19 @@ function _restoreFromURL() {
       b.classList.toggle('active', b.dataset.mode === m));
   }
   const pi = parseInt(sp.get('pi'));
-  if (!isNaN(pi) && pi >= 0 && pi < PARAMS.length) _updateEvdParamBtn(pi);
+  if (!isNaN(pi) && pi >= 0 && pi < PARAMS.length) {
+    const piSeed = PARAMS[pi].noise_seed;
+    if (piSeed !== undefined && _allSeeds.includes(piSeed) && piSeed !== _selectedSeed) {
+      _selectedSeed = piSeed;
+      _allSeeds.forEach(s => {
+        const b = document.getElementById('seed-btn-'+s);
+        if (b) b.className = 'mode-btn'+(s===_selectedSeed?' active':'');
+      });
+      _rebuildParamRows();
+      _rebuildTrParamBtns();
+    }
+    _updateEvdParamBtn(pi);
+  }
   const spStr = sp.get('sp');
   if (spStr) spStr.split(',').forEach((v, i) => {
     const pt = parseInt(v);
@@ -1754,12 +1861,102 @@ function _updateTrParamBtn(pi) {
   });
 }
 
+function _selectSeed(seed) {
+  if (seed === _selectedSeed) return;
+  _selectedSeed = seed;
+  _allSeeds.forEach(s => {
+    const b = document.getElementById('seed-btn-'+s);
+    if (b) b.className = 'mode-btn'+(s===seed?' active':'');
+  });
+  _evdParamIdx     = _seedSibling(_evdParamIdx, seed);
+  _trParamIdx      = _seedSibling(_trParamIdx, seed);
+  _fourierParamIdx = _seedSibling(_fourierParamIdx, seed);
+  _fourierSelAdc      = PARAMS[_fourierParamIdx].adc_cutoff || 0;
+  _fourierSelSobolevS = PARAMS[_fourierParamIdx].sobolev_s  || 2.0;
+  _fourierSelFcutoff  = PARAMS[_fourierParamIdx].fourier_cutoff || 0;
+  _resetFourierInited();
+  _rebuildParamRows();
+  _rebuildTrParamBtns();
+  _loadValue(_evdParamIdx, 0);
+  _loadValue(_evdParamIdx, _sweepPt[_evdParamIdx]);
+  _saveState();
+  _drawEvd(); _drawTraces();
+  if (_evdTab === 'fourier') {
+    _loadValue(_fourierParamIdx, 0);
+    _loadValue(_fourierParamIdx, _sweepPt[_fourierParamIdx]);
+    _updateFourierCutoffBtns();
+    _drawFourierMaps();
+  }
+}
+
 function _updateSlLabel(pi) {
   const sl = document.getElementById('evd-sl-'+pi);
   if (!sl) return;
   const pt = +sl.value;
   _sweepPt[pi] = pt;
   document.getElementById('evd-sl-val-'+pi).textContent = _ptLabel(pi, pt);
+}
+
+function _rebuildParamRows() {
+  const paramRows = document.getElementById('evd-param-rows');
+  paramRows.innerHTML = '';
+  _signalParamIndices().forEach(pi => {
+    const param = PARAMS[pi];
+    const row = document.createElement('div');
+    row.className = 'row';
+
+    const lbl = document.createElement('span');
+    lbl.className='lbl'; lbl.style.width='130px';
+    lbl.textContent = param.param_label+':';
+    row.appendChild(lbl);
+
+    const sl = document.createElement('input');
+    sl.type='range'; sl.className='slider'; sl.id='evd-sl-'+pi;
+    sl.min='0'; sl.max=String(param.n_sweep); sl.step='1'; sl.value=String(_sweepPt[pi] || 1);
+    row.appendChild(sl);
+
+    const valSpan = document.createElement('span');
+    valSpan.className='val'; valSpan.id='evd-sl-val-'+pi;
+    row.appendChild(valSpan);
+
+    const viewBtn = document.createElement('button');
+    viewBtn.id='evd-param-view-'+pi; viewBtn.textContent='View';
+    viewBtn.className='plane-btn'+(pi===_evdParamIdx?' active':'');
+    viewBtn.style.marginLeft='8px';
+    row.appendChild(viewBtn);
+
+    paramRows.appendChild(row);
+
+    _updateSlLabel(pi);
+    sl.oninput = () => {
+      _updateSlLabel(pi);
+      const vi = _sweepPt[pi];
+      _loadValue(pi, 0);
+      _loadValue(pi, vi);
+      if (_evdParamIdx === pi) _drawEvd();
+      else if (_evdTab === 'fourier' && _fourierParamIdx === pi) _drawFourierMaps();
+      _drawTraces();
+    };
+    viewBtn.onclick = () => {
+      _loadValue(pi, 0);
+      _loadValue(pi, _sweepPt[pi]);
+      _updateEvdParamBtn(pi);
+      _syncRefInputs(); _drawEvd();
+    };
+  });
+}
+
+function _rebuildTrParamBtns() {
+  const trParamBtns = document.getElementById('tr-param-btns');
+  trParamBtns.innerHTML = '';
+  _signalParamIndices().forEach(pi => {
+    const param = PARAMS[pi];
+    const b = document.createElement('button');
+    b.id='tr-pb-param-'+pi; b.textContent=param.param_label;
+    b.className='plane-btn'+(pi===_trParamIdx?' active':'');
+    b.onclick = () => { _updateTrParamBtn(pi); _drawTraces(); };
+    trParamBtns.appendChild(b);
+  });
 }
 
 /* ── init ── */
@@ -1807,53 +2004,25 @@ function _initUI() {
     evdPb.appendChild(b);
   });
 
-  // Per-param slider rows + View button (signal tab: cutoff=0 only)
-  const paramRows = document.getElementById('evd-param-rows');
-  paramRows.innerHTML = '';
-  PARAMS.forEach((param, pi) => {
-    if ((param.adc_cutoff || 0) !== 0) return; // non-zero cutoffs live in Fourier tab only
-    const row = document.createElement('div');
-    row.className = 'row';
+  // Seed picker (only shown when the data has multiple noise seeds)
+  const seedRow  = document.getElementById('seed-picker-row');
+  const seedBtns = document.getElementById('seed-btns');
+  seedBtns.innerHTML = '';
+  if (_allSeeds.length > 1) {
+    seedRow.style.display = '';
+    _allSeeds.forEach(seed => {
+      const b = document.createElement('button');
+      b.id='seed-btn-'+seed; b.textContent='Seed '+seed;
+      b.className = 'mode-btn'+(seed===_selectedSeed?' active':'');
+      b.onclick = () => _selectSeed(seed);
+      seedBtns.appendChild(b);
+    });
+  } else {
+    seedRow.style.display = 'none';
+  }
 
-    const lbl = document.createElement('span');
-    lbl.className='lbl'; lbl.style.width='130px';
-    lbl.textContent = param.param_label+':';
-    row.appendChild(lbl);
-
-    const sl = document.createElement('input');
-    sl.type='range'; sl.className='slider'; sl.id='evd-sl-'+pi;
-    sl.min='0'; sl.max=String(param.n_sweep); sl.step='1'; sl.value='1';
-    row.appendChild(sl);
-
-    const valSpan = document.createElement('span');
-    valSpan.className='val'; valSpan.id='evd-sl-val-'+pi;
-    row.appendChild(valSpan);
-
-    const viewBtn = document.createElement('button');
-    viewBtn.id='evd-param-view-'+pi; viewBtn.textContent='View';
-    viewBtn.className='plane-btn'+(pi===0?' active':'');
-    viewBtn.style.marginLeft='8px';
-    row.appendChild(viewBtn);
-
-    paramRows.appendChild(row);
-
-    _updateSlLabel(pi);
-    sl.oninput = () => {
-      _updateSlLabel(pi);
-      const vi = _sweepPt[pi];
-      _loadValue(pi, 0);
-      _loadValue(pi, vi);
-      if (_evdParamIdx === pi) _drawEvd();
-      else if (_evdTab === 'fourier' && _fourierParamIdx === pi) _drawFourierMaps();
-      _drawTraces();
-    };
-    viewBtn.onclick = () => {
-      _loadValue(pi, 0);
-      _loadValue(pi, _sweepPt[pi]);
-      _updateEvdParamBtn(pi);
-      _syncRefInputs(); _drawEvd();
-    };
-  });
+  // Per-param slider rows + View button (one row per param_name_base)
+  _rebuildParamRows();
 
   // Trace: track dropdown
   const trTrackSel = document.getElementById('tr-track');
@@ -1864,17 +2033,8 @@ function _initUI() {
   });
   trTrackSel.onchange = () => { _trTrack = trTrackSel.value; _drawTraces(); };
 
-  // Trace: param buttons (cutoff=0 only)
-  const trParamBtns = document.getElementById('tr-param-btns');
-  trParamBtns.innerHTML = '';
-  PARAMS.forEach((param, pi) => {
-    if ((param.adc_cutoff || 0) !== 0) return;
-    const b = document.createElement('button');
-    b.id='tr-pb-param-'+pi; b.textContent=param.param_label;
-    b.className='plane-btn'+(pi===0?' active':'');
-    b.onclick = () => { _updateTrParamBtn(pi); _drawTraces(); };
-    trParamBtns.appendChild(b);
-  });
+  // Trace: param buttons (one per param_name_base)
+  _rebuildTrParamBtns();
 
   // Histogram plane buttons
   _histPlane = p0.plane_names[0];
@@ -2084,18 +2244,158 @@ def _merge_pkl_group(pkls: list) -> dict:
     return merged
 
 
-def _scan_dir_groups(dir_path: Path) -> dict:
-    """Scan pkls for grouping metadata only; return {merge_key: [Path, ...]}.
+def _pick_target_sweep_idx(factors, target=0.75):
+    """Return (sweep_idx, factor) for the sweep point closest to ``target``.
+
+    Used to pick an off-GT sweep point for the Fourier loss PDF — at
+    factor=1.0 (param == GT) the diff is exactly zero everywhere.
+    """
+    if not factors:
+        return None, None
+    idx = min(range(len(factors)), key=lambda i: abs(factors[i] - target))
+    return idx, factors[idx]
+
+
+def _extract_fourier_raw(raw: dict, idx: int) -> dict:
+    """Extract {track: {plane: {'C':, 'power':}}} for one sweep index from a raw pkl.
+
+    Small (N x N float32) arrays only — safe to keep around for many pkls at once.
+    """
+    fc = raw.get('per_track_fourier_C')
+    fp = raw.get('per_track_fourier_power')
+    if fc is None or fp is None:
+        return {}
+    plane_names = raw.get('plane_names', [])
+    out = {}
+    for track, c_sweeps in fc.items():
+        if idx >= len(c_sweeps):
+            continue
+        c_planes = c_sweeps[idx]
+        p_planes = fp[track][idx]
+        out[track] = {}
+        for pi, plane in enumerate(plane_names):
+            if pi < len(c_planes):
+                out[track][plane] = {
+                    'C':     np.asarray(c_planes[pi], dtype=np.float32),
+                    'power': np.asarray(p_planes[pi], dtype=np.float32),
+                }
+    return out
+
+
+def _pick_fourier_for_paths(paths: list, fourier_cache: dict, target=0.75):
+    """Return (fourier_raw, factor) from whichever path's cached factor is closest to target."""
+    best_path, best_diff = None, None
+    for pkl_path in paths:
+        info = fourier_cache.get(pkl_path)
+        if not info or info['factor'] is None:
+            continue
+        diff = abs(info['factor'] - target)
+        if best_diff is None or diff < best_diff:
+            best_diff, best_path = diff, pkl_path
+    if best_path is None:
+        return {}, None
+    info = fourier_cache[best_path]
+    return info['fourier'], info['factor']
+
+
+def _short_track_label(track_name: str) -> str:
+    m = re.search(r'theta_(-?\d+)_alpha_(-?\d+)', track_name)
+    if m:
+        return f'θ={m.group(1)}°, α={m.group(2)}°'
+    return track_name
+
+
+def _write_fourier_pdfs(param_label, factor, clean_fourier, noisy_fourier_by_seed,
+                         track_names, plane_names, out_dir: Path, out_stem: str) -> dict:
+    """Write one PDF per plane-letter (e.g. U/V/Y), rows=tracks, cols=[raw, raw×W, seed...].
+
+    For each track, the plane within a letter group (e.g. U1 vs U2) with the
+    largest total |C| is used. Returns {letter: pdf_filename} for letters that
+    produced at least one row.
+    """
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    letters = []
+    for plane in plane_names:
+        letter = plane[0]
+        if letter not in letters:
+            letters.append(letter)
+    seeds = sorted(noisy_fourier_by_seed.keys())
+
+    pdf_paths = {}
+    for letter in letters:
+        cands = [pl for pl in plane_names if pl.startswith(letter)]
+        rows = []
+        for track in track_names:
+            best_plane, best_score = None, 0.0
+            for plane in cands:
+                d = clean_fourier.get(track, {}).get(plane)
+                if d is None:
+                    continue
+                score = float(np.abs(d['C']).sum())
+                if score > best_score:
+                    best_score, best_plane = score, plane
+            if best_plane is not None:
+                rows.append((track, best_plane))
+        if not rows:
+            continue
+
+        n_cols = 2 + len(seeds)
+        n_rows = len(rows)
+        col_titles = ['Raw loss  |D̂|²/N', 'Raw loss × W(f)'] + [f'Raw loss (seed {s})' for s in seeds]
+
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(3.0 * n_cols, 2.7 * n_rows), squeeze=False)
+        for r, (track, plane) in enumerate(rows):
+            d = clean_fourier[track][plane]
+            cells = [d['power'], d['C']]
+            for seed in seeds:
+                nd = noisy_fourier_by_seed[seed].get(track, {}).get(plane)
+                cells.append(nd['power'] if nd is not None else None)
+            for c in range(n_cols):
+                ax = axes[r][c]
+                arr = cells[c]
+                if arr is None:
+                    ax.axis('off')
+                    continue
+                im = ax.imshow(arr, cmap='viridis', origin='lower', aspect='equal')
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+                ax.set_xticks([])
+                ax.set_yticks([])
+                if r == 0:
+                    ax.set_title(col_titles[c], fontsize=11)
+                if c == 0:
+                    ax.set_ylabel(f'{_short_track_label(track)}\n[{plane}]', fontsize=9)
+
+        fig.suptitle(f'{param_label} — factor ×{factor:.2f} — plane {letter}', fontsize=13)
+        fig.tight_layout(rect=(0, 0, 1, 0.96))
+
+        pdf_name = f'{out_stem}_fourier_{letter}.pdf'
+        fig.savefig(out_dir / pdf_name)
+        plt.close(fig)
+        print(f'  -> {out_dir / pdf_name}')
+        pdf_paths[letter] = pdf_name
+
+    return pdf_paths
+
+
+def _scan_dir_groups(dir_path: Path):
+    """Scan pkls for grouping metadata; return ({merge_key: [Path, ...]}, fourier_cache).
 
     Loads each pkl fully (pickle has no partial-read API) but drops array data
-    immediately so only one pkl's heap is live at a time.
+    immediately so only one pkl's heap is live at a time. While each pkl is
+    loaded, also extracts the small per-track Fourier C/power maps (at the
+    sweep point closest to factor=0.75) into ``fourier_cache`` for later PDF
+    generation, so those arrays don't require a second full load.
     """
     pkls_paths = sorted(dir_path.glob('*.pkl'))
     if not pkls_paths:
         print(f'No *.pkl files found in {dir_path}')
-        return {}
+        return {}, {}
     print(f'Found {len(pkls_paths)} pkl file(s) in {dir_path}')
     groups: dict = defaultdict(list)
+    fourier_cache: dict = {}
     for pkl_path in pkls_paths:
         print(f'  Scanning {pkl_path.name} …')
         try:
@@ -2108,8 +2408,13 @@ def _scan_dir_groups(dir_path: Path) -> dict:
             print(f'  SKIP {pkl_path.name}: no array data (re-run with --store-arrays)')
             continue
         groups[_merge_key(raw)].append(pkl_path)
+        idx, factor = _pick_target_sweep_idx(raw.get('factors', []))
+        fourier_cache[pkl_path] = {
+            'factor':  factor,
+            'fourier': _extract_fourier_raw(raw, idx) if idx is not None else {},
+        }
         # raw goes out of scope; large arrays freed
-    return dict(groups)
+    return dict(groups), fourier_cache
 
 
 def _load_and_merge_paths(paths: list) -> dict:
@@ -2391,20 +2696,27 @@ def main():
     else:
         dir_path = Path(args.dir)
         # Pass 1: scan all pkls for grouping metadata (arrays freed after each file).
-        groups = _scan_dir_groups(dir_path)
+        groups, fourier_cache = _scan_dir_groups(dir_path)
         if not groups:
             print('No datasets with array data found.')
             return
 
-        # Organise groups by (param_name, adc_cutoff, sobolev_s, fourier_cutoff)
-        by_param: dict = {}
+        # Organise groups by (param_name, adc_cutoff, sobolev_s, fourier_cutoff).
+        # Noisy variants are kept per noise_seed, so multiple seeds for the same
+        # param/cutoff combination each become their own entry, paired with the
+        # same clean baseline.
+        clean_by_param: dict = {}
+        noisy_by_param: dict = defaultdict(list)
         for key, paths in sorted(groups.items()):
-            param_name, noise_scale, _seed, adc_cutoff, sobolev_s, fourier_cutoff = (
+            param_name, noise_scale, seed, adc_cutoff, sobolev_s, fourier_cutoff = (
                 key[0], key[1], key[2], key[3], key[4], key[5])
-            variant = 'noisy' if noise_scale > 0 else 'clean'
-            by_param.setdefault((param_name, adc_cutoff, sobolev_s, fourier_cutoff), {})[variant] = (key, paths)
+            pkey = (param_name, adc_cutoff, sobolev_s, fourier_cutoff)
+            if noise_scale > 0:
+                noisy_by_param[pkey].append((seed, key, paths))
+            else:
+                clean_by_param[pkey] = (key, paths)
 
-        param_keys = sorted(by_param.keys())
+        param_keys = sorted(set(clean_by_param) | set(noisy_by_param))
         print(f'  Grouped into {len(param_keys)} param(s): {param_keys}')
 
         out_path = Path(args.output) if args.output else _auto_out(dir_path, 'viewer.html')
@@ -2418,38 +2730,82 @@ def main():
         all_params_meta = []
         pi_global = 0
 
-        for (param_name, adc_cutoff, sobolev_s, fourier_cutoff) in param_keys:
-            variants = by_param[(param_name, adc_cutoff, sobolev_s, fourier_cutoff)]
+        for pkey in param_keys:
+            param_name, adc_cutoff, sobolev_s, fourier_cutoff = pkey
+
+            # Fourier loss PDFs: cheap, built from fourier_cache (no extra pkl loads).
+            clean_fourier, factor = ({}, None)
+            if pkey in clean_by_param:
+                _, cpaths = clean_by_param[pkey]
+                clean_fourier, factor = _pick_fourier_for_paths(cpaths, fourier_cache)
+
+            noisy_seeds = sorted(noisy_by_param.get(pkey, []), key=lambda t: t[0])
+            multi_seed  = len(noisy_seeds) > 1
+
+            noisy_fourier_by_seed = {}
+            for seed, _key, npaths in noisy_seeds:
+                nf, nfactor = _pick_fourier_for_paths(npaths, fourier_cache)
+                noisy_fourier_by_seed[seed] = nf
+                if factor is None:
+                    factor = nfactor
+
+            pdf_map = {}
+            if clean_fourier and factor is not None:
+                track_names = list(clean_fourier.keys())
+                plane_names = list(next(iter(clean_fourier.values())).keys())
+                param_label = PARAM_PRETTY.get(param_name, param_name)
+                out_stem = f'{out_path.stem}_{param_name}'
+                if adc_cutoff:
+                    out_stem += f'_cut{adc_cutoff:g}'
+                pdf_map = _write_fourier_pdfs(param_label, factor, clean_fourier, noisy_fourier_by_seed,
+                                               track_names, plane_names, out_path.parent, out_stem)
 
             clean_data = None
-            if 'clean' in variants:
-                _, paths = variants['clean']
+            if pkey in clean_by_param:
+                _, paths = clean_by_param[pkey]
                 raw = _load_and_merge_paths(paths)
                 print(f'  Building data for {param_name} cutoff={adc_cutoff:g} s={sobolev_s:g} fc={fourier_cutoff:g} clean …')
                 clean_data = build_data(raw)
                 del raw
 
-            noisy_data = None
-            if 'noisy' in variants:
-                _, paths = variants['noisy']
+            if not noisy_seeds:
+                param_entry_list = _group_by_param([clean_data]) if clean_data else []
+                for p in param_entry_list:
+                    p['fourier_pdfs'] = pdf_map
+                    p['fourier_pdf_factor'] = factor
+                    param_meta = _write_param_js(pi_global, p, data_dir, data_dir_name)
+                    all_params_meta.append(param_meta)
+                    pi_global += 1
+                    # p's large arrays are now freed by _write_param_js
+                del clean_data
+                continue
+
+            for seed, _key, paths in noisy_seeds:
                 raw = _load_and_merge_paths(paths)
-                print(f'  Building data for {param_name} cutoff={adc_cutoff:g} s={sobolev_s:g} fc={fourier_cutoff:g} noisy …')
+                print(f'  Building data for {param_name} cutoff={adc_cutoff:g} s={sobolev_s:g} fc={fourier_cutoff:g} noisy (seed {seed}) …')
                 if clean_data:
                     print(f'  Using clean bbox for noisy …')
+                # _group_by_param pairs clean+noisy; since no _raw_pkl is set, noisy arrays
+                # are already bbox-corrected and used as-is.
                 noisy_data = build_data(raw, bbox_override=clean_data['bboxes'] if clean_data else None)
                 del raw
 
-            # _group_by_param pairs clean+noisy; since no _raw_pkl is set, noisy arrays
-            # are already bbox-corrected and used as-is.
-            param_entry_list = _group_by_param(
-                [d for d in [clean_data, noisy_data] if d is not None])
-            del clean_data, noisy_data
+                param_entry_list = _group_by_param(
+                    [d for d in [clean_data, noisy_data] if d is not None])
+                del noisy_data
 
-            for p in param_entry_list:
-                param_meta = _write_param_js(pi_global, p, data_dir, data_dir_name)
-                all_params_meta.append(param_meta)
-                pi_global += 1
-                # p's large arrays are now freed by _write_param_js
+                for p in param_entry_list:
+                    if multi_seed:
+                        p['param_label'] += f' (seed {seed})'
+                    p['noise_seed'] = seed
+                    p['fourier_pdfs'] = pdf_map
+                    p['fourier_pdf_factor'] = factor
+                    param_meta = _write_param_js(pi_global, p, data_dir, data_dir_name)
+                    all_params_meta.append(param_meta)
+                    pi_global += 1
+                    # p's large arrays are now freed by _write_param_js
+
+            del clean_data
 
         _write_html_shell(all_params_meta, data_dir_name, out_path, title)
 
