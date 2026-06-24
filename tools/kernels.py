@@ -448,8 +448,12 @@ def load_response_kernels(response_path=None, num_s=16,
         # wire_zero_bin is in kernel bins, convert to output wire position
         wire_zero_bin_out = wire_zero_bin // bins_per_wire
 
-        # Compute static conv filter sizes for differentiable path
-        sigma_w_bins = (max_sigma_trans_unitless * wire_spacing) / dx
+        # Compute static conv filter sizes for differentiable path.
+        # sigma_w_bins: max_sigma_trans_unitless is in wire pitches; divide by dx
+        # (wire pitches per bin) to get bins.  The old formula simplified to
+        # max_sigma_trans_unitless because wire_spacing==dx, producing a value
+        # in wire pitches rather than bins — making ks_w ~10× too small.
+        sigma_w_bins = max_sigma_trans_unitless / dx
         sigma_t_bins = (max_sigma_long_unitless * time_spacing) / dy
         ks_w = int(2 * ((sigma_w_bins * 2 * _N_SIGMAS_BLUR) // 2) + 1)
         ks_t = int(2 * ((sigma_t_bins * 2 * _N_SIGMAS_BLUR) // 2) + 1)

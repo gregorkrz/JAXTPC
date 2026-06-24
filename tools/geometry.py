@@ -50,6 +50,14 @@ def calculate_max_diffusion_sigmas(
     max_sigma_long_us = np.sqrt(2.0 * D_long_temporal * max_drift_time_us)
     max_sigma_trans_unitless = max_sigma_trans_cm / wire_spacing_cm
     max_sigma_long_unitless = max_sigma_long_us / time_spacing_us
+    print("Calculated max diffusion sigmas:")
+    print(f"  Transverse (cm): {max_sigma_trans_cm:.4f}")
+    print(f"  Longitudinal (us): {max_sigma_long_us:.4f}")
+    print(f"  Transverse (unitless): {max_sigma_trans_unitless:.4f}")
+    print(f"  Longitudinal (unitless): {max_sigma_long_unitless:.4f}")
+    print("Max drift time (us): {:.2f}".format(max_drift_time_us)
+          + f" (max_drift_cm={max_drift_cm:.1f} cm, "
+          + f"drift_velocity={drift_velocity_cm_us:.3f} cm/us)")
     return max_sigma_trans_cm, max_sigma_long_us, max_sigma_trans_unitless, max_sigma_long_unitless
 
 
