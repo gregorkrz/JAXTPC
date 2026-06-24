@@ -95,11 +95,14 @@ class DetectorSimulator:
         recombination_model=None,
         include_electric_dist=False,
         electric_dist_path=None,
+        efield_model=None,
+        efield_per_volume=False,
         include_digitize=False,
         digitization_config=None,
         differentiable=False,
         n_segments=None,
         iterate_mode='scan',
+        include_wire_response=True,
     ):
         print("--- Creating DetectorSimulator ---")
 
@@ -166,7 +169,15 @@ class DetectorSimulator:
 
         # Load SCE maps (per-volume, converted to local frame)
         sce_per_volume = self._load_sce(include_electric_dist, electric_dist_path)
-        self._include_sce = sce_per_volume is not None
+        # Differentiable MLP SCE model (FieldConfig); field read from SimParams.sce_models.
+        # Mutually exclusive with a static SCE map.
+        self._efield_model = efield_model
+        self._per_volume_sce = efield_per_volume and efield_model is not None
+        if efield_model is not None and sce_per_volume is not None:
+            raise ValueError(
+                "efield_model (MLP SCE) and include_electric_dist (static SCE map) "
+                "are mutually exclusive; pass only one.")
+        self._include_sce = sce_per_volume is not None or efield_model is not None
 
         # Volume iteration mode
         self._iterate = scan_over if iterate_mode == 'scan' else vmap_over
@@ -225,10 +236,25 @@ class DetectorSimulator:
                 max_sigma_trans_unitless=global_sigma_trans,
                 max_sigma_long_unitless=global_sigma_long,
             )
+            if not include_wire_response:
+                print("   Wire response DISABLED — using delta kernels (diffusion only)")
+                new_kernels = {}
+                for plane, rk in self.response_kernels.items():
+                    bins_per_wire = int(round(1.0 / rk.wire_spacing))
+                    raw_t = rk.time_zero_bin + 1
+                    raw_w = rk.wire_zero_bin * bins_per_wire
+                    delta_base = jnp.zeros_like(rk.base_kernel).at[raw_t, raw_w].set(1.0)
+                    new_dk = generate_dkernel_table(
+                        global_sigma_trans, global_sigma_long * cfg.time_step_us,
+                        delta_base, rk.kernel_dx, rk.kernel_dy, rk.s_levels,
+                        ks_w=rk.ks_w, ks_t=rk.ks_t)
+                    new_kernels[plane] = rk._replace(DKernel=new_dk, base_kernel=delta_base)
+                self.response_kernels = new_kernels
 
         # Build shared factories
         sce_factory, _build_response_fn, _build_response_fn_diff, _recomb_fn = \
-            self._setup_shared_factories(sce_per_volume)
+            self._setup_shared_factories(sce_per_volume, efield_model,
+                                         per_volume=self._per_volume_sce)
 
         # Build post-processing factories (once, shared)
         self.electronics_chunk_size = None
@@ -307,20 +333,41 @@ class DetectorSimulator:
         print(f"   Volumes: {cfg.n_volumes} (iterate={self._volume_mode})")
         print("--- DetectorSimulator Ready ---")
 
-    def _setup_shared_factories(self, sce_per_volume):
-        """Build SCE, response, and recombination factories (shared across volumes)."""
+    def _setup_shared_factories(self, sce_per_volume, efield_model=None, per_volume=False):
+        """Build SCE, response, and recombination factories (shared across volumes).
+
+        SCE factories take ``sim_params`` so the differentiable MLP path can read
+        its weights from ``sim_params.sce_models``; the static-map and nominal
+        factories ignore the argument.
+        """
         from tools.recombination import compute_quanta, XI_FN
 
         cfg = self._sim_config
         _nominal_field = float(self._default_sim_params.recomb_params.field_strength_Vcm)
 
         # ── SCE factory (local frame) ──
-        if sce_per_volume is not None:
+        if efield_model is not None:
+            # Differentiable MLP SCE — field computed from sim_params.sce_models.
+            # The static FieldConfig is captured here; only weights flow through
+            # SimParams, so jax.grad reaches them.
+            # When per_volume=True, vol_params is the slice of sce_models for this
+            # volume (stacked leading axis sliced by scan/vmap); otherwise None and
+            # the full sim_params.sce_models (shared across volumes) is used.
+            from tools import nonlocal_efield as _nl
+            def sce_factory(sim_params, vol_params=None, fcfg=efield_model, nf=_nominal_field):
+                mlp_params = vol_params if vol_params is not None else sim_params.sce_models
+                def _sce(positions_cm):
+                    efield_corr, drift_corr = _nl.sce_outputs(
+                        mlp_params, positions_cm, fcfg, nf)
+                    return SCEOutputs(efield_correction=efield_corr,
+                                      drift_corr_cm=drift_corr)
+                return _sce
+        elif sce_per_volume is not None:
             # Real SCE — maps already in local frame from load_sce_per_volume.
             # For scan, all volumes must share one factory. Use volume 0's maps.
             # (Different per-volume SCE requires stacking maps — future work.)
             efield_fn, corr_fn = sce_per_volume[0]
-            def sce_factory(ef=efield_fn, cf=corr_fn, nf=_nominal_field):
+            def sce_factory(sim_params=None, vol_params=None, ef=efield_fn, cf=corr_fn, nf=_nominal_field):
                 def _sce(positions_cm):
                     E_local = ef(positions_cm)
                     E_normalized = E_local / nf
@@ -329,7 +376,7 @@ class DetectorSimulator:
                 return _sce
         else:
             # Nominal SCE — identical for all volumes in local frame
-            def sce_factory():
+            def sce_factory(sim_params=None, vol_params=None):
                 def _sce(pos):
                     N = pos.shape[0]
                     corr = jnp.broadcast_to(
@@ -349,7 +396,11 @@ class DetectorSimulator:
                 dkernel = pk.DKernel
                 def response_fn(positions_cm, drift_distance_cm,
                                 py_offsets, pz_offsets, time_offsets):
-                    s_values = jnp.clip(jnp.sqrt(drift_distance_cm / _global_max_drift), 0.0, 1.0)
+                    # Add eps inside sqrt so the gradient 1/(2*sqrt(x)) is always
+                    # finite.  jnp.where alone is not sufficient: JAX still
+                    # evaluates sqrt(0) in both branches and produces 0/0=NaN.
+                    safe = jnp.maximum(drift_distance_cm, 0.0) / _global_max_drift
+                    s_values = jnp.clip(jnp.sqrt(safe + 1e-12), 0.0, 1.0)
                     return apply_pixel_diffusion_response(
                         dkernel, s_values, py_offsets, pz_offsets, time_offsets,
                         pk.pixel_spacing, pk.kernel_py, pk.kernel_pz, pk.rebin_factor)
@@ -360,11 +411,18 @@ class DetectorSimulator:
                 kernel = kernels[plane_type]
                 dkernel = kernel.DKernel
                 def response_fn(positions_cm, drift_distance_cm, wire_offsets, time_offsets):
-                    s_values = jnp.clip(jnp.sqrt(drift_distance_cm / _global_max_drift), 0.0, 1.0)
+                    safe = jnp.maximum(drift_distance_cm, 0.0) / _global_max_drift
+                    s_values = jnp.clip(jnp.sqrt(safe + 1e-12), 0.0, 1.0)
                     return apply_diffusion_response(
                         dkernel, s_values, wire_offsets, time_offsets,
                         kernel.wire_spacing, kernel.num_wires)
                 return response_fn
+
+            # Map plane type → physical wire spacing (cm) for sigma unit conversion.
+            _plane_wire_spacings_cm = {
+                name: cfg.volumes[0].wire_spacings_cm[idx]
+                for idx, name in enumerate(cfg.plane_names[0])
+            }
 
             def _build_response_fn_diff(sim_params, plane_type):
                 """Diff response — recomputes DKernel from SimParams diffusion.
@@ -373,15 +431,21 @@ class DetectorSimulator:
                 max_drift_time = _global_max_drift / sim_params.velocity_cm_us
                 sigma_trans_max_cm = jnp.sqrt(
                     2.0 * sim_params.diffusion_trans_cm2_us * max_drift_time)
+                # generate_dkernel_table expects sigma in wire-pitch units (same as
+                # kernel_dx).  Divide by physical wire pitch to convert from cm.
+                sigma_trans_max_wp = sigma_trans_max_cm / _plane_wire_spacings_cm[plane_type]
                 sigma_long_max_us = jnp.sqrt(
                     2.0 * (sim_params.diffusion_long_cm2_us
                            / sim_params.velocity_cm_us**2) * max_drift_time)
                 dkernel = generate_dkernel_table(
-                    sigma_trans_max_cm, sigma_long_max_us,
+                    sigma_trans_max_wp, sigma_long_max_us,
                     kernel.base_kernel, kernel.kernel_dx, kernel.kernel_dy,
                     kernel.s_levels, ks_w=kernel.ks_w, ks_t=kernel.ks_t)
                 def response_fn(positions_cm, drift_distance_cm, wire_offsets, time_offsets):
-                    s_values = jnp.clip(jnp.sqrt(drift_distance_cm / _global_max_drift), 0.0, 1.0)
+                    # eps inside sqrt keeps 1/(2*sqrt(x)) bounded — jnp.where alone
+                    # is not safe because JAX evaluates both branches and 0/0=NaN.
+                    safe = jnp.maximum(drift_distance_cm, 0.0) / _global_max_drift
+                    s_values = jnp.clip(jnp.sqrt(safe + 1e-12), 0.0, 1.0)
                     return apply_diffusion_response(
                         dkernel, s_values, wire_offsets, time_offsets,
                         kernel.wire_spacing, kernel.num_wires)
@@ -415,11 +479,12 @@ class DetectorSimulator:
         include_track_hits = cfg.include_track_hits
 
         # ── Build process_one_volume body ──
+        _pv = self._per_volume_sce
         if self._readout_type == 'pixel':
             pk = kernels  # PixelResponseKernel
 
-            def process_one_volume(vol_deps, vol_key, sim_params):
-                sce_fn = sce_factory()
+            def process_one_volume(vol_deps, vol_key, sim_params, vol_params=None):
+                sce_fn = sce_factory(sim_params, vol_params)
                 vol_int = compute_volume_physics(
                     vol_deps, sim_params, vol_geom, sce_fn, _recomb_fn)
 
@@ -470,8 +535,8 @@ class DetectorSimulator:
             n_planes = vol_geom.n_planes
             _PLANE_LABELS = tuple(cfg.plane_names[0])
 
-            def process_one_volume(vol_deps, vol_key, sim_params):
-                sce_fn = sce_factory()
+            def process_one_volume(vol_deps, vol_key, sim_params, vol_params=None):
+                sce_fn = sce_factory(sim_params, vol_params)
                 vol_int = compute_volume_physics(
                     vol_deps, sim_params, vol_geom, sce_fn, _recomb_fn)
 
@@ -552,14 +617,17 @@ class DetectorSimulator:
         @jax.jit
         def _calculator_jit(sim_params, stacked_deps, noise_key):
             vol_keys = jax.random.split(noise_key, n_volumes)
+            if _pv:
+                fn = lambda deps, key, vp: process_one_volume(deps, key, sim_params, vp)
+                return iterate(fn, (stacked_deps, vol_keys, sim_params.sce_models))
             fn = lambda deps, key: process_one_volume(deps, key, sim_params)
             return iterate(fn, (stacked_deps, vol_keys))
 
         self._calculator_jit = _calculator_jit
 
         # ── Light-only JIT ──
-        def light_one_volume(vol_deps, sim_params):
-            sce_fn = sce_factory()
+        def light_one_volume(vol_deps, sim_params, vol_params=None):
+            sce_fn = sce_factory(sim_params, vol_params)
             vol_int = compute_volume_physics(
                 vol_deps, sim_params, vol_geom, sce_fn, _recomb_fn)
             return (vol_int.charges, vol_int.photons, vol_int.positions_cm,
@@ -567,6 +635,9 @@ class DetectorSimulator:
 
         @jax.jit
         def _light_calculator_jit(sim_params, stacked_deps):
+            if _pv:
+                fn = lambda deps, vp: light_one_volume(deps, sim_params, vp)
+                return iterate(fn, (stacked_deps, sim_params.sce_models))
             fn = lambda deps: light_one_volume(deps, sim_params)
             return iterate(fn, (stacked_deps,))
 
@@ -576,11 +647,9 @@ class DetectorSimulator:
         if self.n_segments is not None and self._readout_type == 'wire':
             n_segments = self.n_segments
 
-            def diff_one_volume(vol_deps, sim_params):
-                sce_fn = sce_factory()
+            def _diff_volume_body(vol_deps, sim_params, sce_fn):
                 vol_int = compute_volume_physics(
                     vol_deps, sim_params, vol_geom, sce_fn, _recomb_fn)
-
                 readout_window_us = cfg.num_time_steps * cfg.time_step_us
                 plane_signals = []
                 for plane_idx in range(vol_geom.n_planes):
@@ -600,10 +669,18 @@ class DetectorSimulator:
                           for s in plane_signals]
                 return jnp.stack(padded)
 
-            @jax.remat
-            def _forward_diff(params, stacked_deps):
-                fn = lambda deps: diff_one_volume(deps, params)
-                return iterate(fn, (stacked_deps,))
+            if _pv:
+                @jax.remat
+                def _forward_diff(params, stacked_deps):
+                    fn = lambda deps, vp: _diff_volume_body(
+                        deps, params, sce_factory(params, vp))
+                    return iterate(fn, (stacked_deps, params.sce_models))
+            else:
+                @jax.remat
+                def _forward_diff(params, stacked_deps):
+                    sce_fn = sce_factory(params)
+                    fn = lambda deps: _diff_volume_body(deps, params, sce_fn)
+                    return iterate(fn, (stacked_deps,))
 
             self._forward_diff = _forward_diff
 

@@ -346,6 +346,27 @@ _DEFAULT_SCE_PATH = os.path.join(
 )
 
 
+def _load_sce_npz(npz_path):
+    """Load the per-side SCE ``.npz`` written by this module's CLI into the same
+    per-volume dict list that ``tools.utils.load_sce_data`` returns for HDF5.
+
+    The CLI saves east/west keys (``{side}_efield``, ``{side}_corrections``,
+    ``{side}_origin``, ``{side}_spacing``) in the **global** frame; east maps to
+    volume 0, west to volume 1.  The caller (``load_sce_per_volume``) applies the
+    local-frame conversion afterwards, identical to the HDF5 path.
+    """
+    data = np.load(npz_path)
+    vol_data_list = []
+    for side in ('east', 'west'):
+        vol_data_list.append({
+            'efield_map': np.asarray(data[f'{side}_efield']),
+            'drift_correction_map': np.asarray(data[f'{side}_corrections']),
+            'origin_cm': np.asarray(data[f'{side}_origin']),
+            'spacing_cm': np.asarray(data[f'{side}_spacing']),
+        })
+    return vol_data_list
+
+
 def load_sce_per_volume(h5_path=_DEFAULT_SCE_PATH, volumes=None):
     """
     Load per-volume SCE maps and build JIT-compatible interpolation functions.
@@ -369,9 +390,11 @@ def load_sce_per_volume(h5_path=_DEFAULT_SCE_PATH, volumes=None):
         efield_fn: ``fn(positions_cm) -> (N, 3)`` E-field in V/cm.
         corr_fn: ``fn(positions_cm) -> (N, 3)`` drift corrections in cm.
     """
-    from tools.utils import load_sce_data
-
-    vol_data_list = load_sce_data(h5_path)
+    if str(h5_path).endswith('.npz'):
+        vol_data_list = _load_sce_npz(h5_path)
+    else:
+        from tools.utils import load_sce_data
+        vol_data_list = load_sce_data(h5_path)
 
     results = []
     for i, vol_data in enumerate(vol_data_list):
@@ -409,3 +432,67 @@ def load_sce_per_volume(h5_path=_DEFAULT_SCE_PATH, volumes=None):
         results.append((efield_fn, corr_fn))
 
     return results
+
+
+# =========================================================================
+# CLI entry point
+# =========================================================================
+
+if __name__ == "__main__":
+    import argparse
+    import yaml
+
+    _DETECTOR_CONFIGS = {
+        "jaxtpc": os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "config", "cubic_wireplane_config.yaml"
+        ),
+    }
+
+    parser = argparse.ArgumentParser(description="Generate toy SCE maps for a JAXTPC detector.")
+    parser.add_argument("--detector", required=True, choices=list(_DETECTOR_CONFIGS),
+                        help="Detector name (maps to a config YAML).")
+    parser.add_argument("--Nxo", type=int, default=41, help="Grid points in x per TPC side.")
+    parser.add_argument("--Nyo", type=int, default=41, help="Grid points in y.")
+    parser.add_argument("--Nzo", type=int, default=41, help="Grid points in z.")
+    parser.add_argument("--output", required=True, help="Output .npz path.")
+    args = parser.parse_args()
+
+    with open(_DETECTOR_CONFIGS[args.detector]) as f:
+        config = yaml.safe_load(f)
+
+    east_ranges = config["volumes"][0]["geometry"]["ranges"]
+    half_x = abs(east_ranges[0][1] - east_ranges[0][0])   # e.g. 216 cm
+    half_y = (east_ranges[1][1] - east_ranges[1][0]) / 2.0
+    half_z = (east_ranges[2][1] - east_ranges[2][0]) / 2.0
+    nominal_field = float(config["electric_field"]["field_strength"])
+    drift_velocity_cm_us = float(config["simulation"]["drift"]["velocity"]) / 10.0
+
+    grid_shape = (args.Nxo, args.Nyo, args.Nzo)
+    print(f"[efield_distortions] detector={args.detector}  "
+          f"half_x={half_x} cm  half_y={half_y} cm  half_z={half_z} cm  "
+          f"E0={nominal_field} V/cm  v_drift={drift_velocity_cm_us} cm/μs  grid={grid_shape}")
+
+    (east_ef, east_orig, east_sp), (west_ef, west_orig, west_sp) = generate_toy_efield_map(
+        half_x, half_y, half_z, nominal_field, grid_shape=grid_shape)
+
+    print("[efield_distortions] computing drift corrections (east)...")
+    east_corr = compute_drift_corrections(
+        east_ef, east_orig, east_sp,
+        anode_x_cm=-half_x, nominal_field_Vcm=nominal_field,
+        drift_velocity_cm_us=drift_velocity_cm_us)
+
+    print("[efield_distortions] computing drift corrections (west)...")
+    west_corr = compute_drift_corrections(
+        west_ef, west_orig, west_sp,
+        anode_x_cm=+half_x, nominal_field_Vcm=nominal_field,
+        drift_velocity_cm_us=drift_velocity_cm_us)
+
+    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+    np.savez(
+        args.output,
+        east_efield=east_ef,      east_origin=east_orig,  east_spacing=east_sp,
+        west_efield=west_ef,      west_origin=west_orig,  west_spacing=west_sp,
+        east_corrections=east_corr,
+        west_corrections=west_corr,
+    )
+    print(f"[efield_distortions] saved → {args.output}")
