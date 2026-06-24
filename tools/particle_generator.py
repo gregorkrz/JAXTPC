@@ -17,11 +17,13 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 import os
+import urllib.request
 from typing import Tuple, Optional, Dict, Any
 
 # Path to PDG data file
 _DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 _DEDX_FILE = os.path.join(_DATA_DIR, "muon_dedx_lar.csv")
+_DEDX_URL = "https://pdg.lbl.gov/2025/AtomicNuclearProperties/MUE/muE_argon_liquid.txt"
 
 # Liquid argon density (g/cm³)
 LAR_DENSITY = 1.396
@@ -30,10 +32,38 @@ LAR_DENSITY = 1.396
 _DEDX_TABLE = None
 
 
+def _download_dedx_table():
+    """Download PDG muon dE/dx table for liquid argon and save as CSV."""
+    os.makedirs(_DATA_DIR, exist_ok=True)
+    print(f"Downloading muon dE/dx table from PDG...")
+    with urllib.request.urlopen(_DEDX_URL) as resp:
+        lines = resp.read().decode("utf-8").splitlines()
+
+    # PDG MUE format columns: T(MeV), p(MeV/c), -dE/dx(MeV cm2/g),
+    #   CSDA range(g/cm2), projected range(g/cm2), detour factor, beta
+    rows = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or not stripped[0].isdigit():
+            continue
+        parts = stripped.split()
+        if len(parts) < 7:
+            continue
+        # Extract: T_MeV, p_MeV, dedx_MeVcm2g, csda_range_gcm2, beta
+        rows.append(f"{parts[0]},{parts[1]},{parts[2]},{parts[3]},{parts[6]}")
+
+    with open(_DEDX_FILE, "w") as f:
+        f.write("# T_MeV,p_MeV,dedx_MeVcm2g,csda_range_gcm2,beta\n")
+        f.write("\n".join(rows) + "\n")
+    print(f"Saved to {_DEDX_FILE}")
+
+
 def _load_dedx_table():
-    """Load PDG dE/dx table (cached)."""
+    """Load PDG dE/dx table (cached), downloading it if not present."""
     global _DEDX_TABLE
     if _DEDX_TABLE is None:
+        if not os.path.exists(_DEDX_FILE):
+            _download_dedx_table()
         data = np.loadtxt(_DEDX_FILE, delimiter=",", comments="#")
         # Columns: T_MeV, p_MeV, dedx_MeVcm2g, csda_range_gcm2, beta
         T_MeV = data[:, 0]
