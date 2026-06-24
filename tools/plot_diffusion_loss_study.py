@@ -56,6 +56,15 @@ _NWR_TA_ALPHAS     = (0, 5, 10, 15, 20, 25, 30, 35, 40)   # α values for θ×α
 _PIVOT_TA_THETAS   = (0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50)  # θ values for pivot θ×α grid (extended)
 _PIVOT_TA_ALPHAS   = (0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50)  # α values for pivot θ×α grid (extended)
 
+# High-angle (25-50 deg) diagonal-only extension of the pivot θ×α grid, run via
+# scripts/20260611/pivot_theta_alpha_landscape_diagonal.sh (local) /
+# submit_pivot_theta_alpha_diagonal_high.py (Slurm). Lives outside the
+# official theta_alpha_pivot_subdir as one bundled 6-track pkl per
+# (param, noise seed, adc_cutoff) instead of one pkl per (theta, alpha).
+# Seeds found here accumulate on top of (rather than only filling gaps in)
+# the official per-(theta, alpha) pkls in _compute_theta_alpha_bias.
+_DIAG_TA_SUBDIR = "cutoff_loss_landscape_20260611_pivot_ta_diag"
+
 # Pivot-angle study: 400 MeV muon, midpoint fixed at (1000, 0, 0) mm (west volume).
 # CSDA range of 400 MeV muon in LAr ≈ 1700.6 mm → half-length 850.3 mm.
 # start = (1000 + 850.3·cos θ,  −850.3·sin θ,  0)  mm
@@ -171,6 +180,21 @@ def _nonoise_pkl_path(study_subdir, param, track_name, adc_cutoff):
     fname = (f"sobolev_loss_geomean_log1p_N100{range_tag}_{param}"
              f"_{track_name}{cutoff_tag}_perplane.pkl")
     return os.path.join(RESULTS_DIR, "1d_gradients", study_subdir, fname)
+
+
+def _load_diag_ta_pkl(param, seed, adc_cutoff):
+    """Load the bundled 6-track diagonal high-angle pkl (cached per call site)."""
+    cutoff_tag = f"_cutoff{adc_cutoff:.3g}".replace(".", "p") if adc_cutoff > 0.0 else ""
+    fname = (f"sobolev_loss_geomean_log1p_N100_range0p2_{param}"
+             f"_6tracks_noise1_seed{seed}{cutoff_tag}.pkl")
+    path = os.path.join(RESULTS_DIR, "1d_gradients", _DIAG_TA_SUBDIR, fname)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except (EOFError, pickle.UnpicklingError):
+        return None
 
 
 def load_landscape_data(study_subdir, track_names):
@@ -675,19 +699,32 @@ def _compute_theta_alpha_bias(mode, subdir, pivot, verbose=True):
                     seed_factors = []
                     plane_seed_factors = {}
                     for seed in all_seeds:
+                        sources = []  # list of (seed_label, d, factors, losses)
                         path = _pkl_path(subdir, param, track_name, seed, adc)
                         if os.path.exists(path):
                             try:
                                 with open(path, "rb") as f:
                                     d = pickle.load(f)
-                                factors = np.array(d["factors"])
-                                losses  = np.array(d["loss_values"])
-                                seed_factors.append((seed, float(factors[np.argmin(losses)])))
-                                for grp, gf in _plane_group_argmins(d).items():
-                                    plane_seed_factors.setdefault(grp, []).append((seed, gf))
-                                n_found += 1
+                                sources.append((seed, d, np.array(d["factors"]), np.array(d["loss_values"])))
                             except (EOFError, pickle.UnpicklingError):
-                                n_miss += 1
+                                pass
+                        # Extra bundled sources (e.g. ad-hoc local diagonal runs) accumulate
+                        # on top of the primary per-track pkl instead of only filling gaps —
+                        # the same (theta, alpha) may have been run multiple times.
+                        # The diagonal bundle was generated with wire response enabled, so
+                        # it must only feed the "full" (wire-response) bias, never NWR.
+                        if pivot and mode.name == "full":
+                            d = _load_diag_ta_pkl(param, seed, adc)
+                            if d is not None and track_name in d.get("per_track_loss_values", {}):
+                                sources.append((f"diag{seed}", d,
+                                                np.array(d["factors"]),
+                                                np.array(d["per_track_loss_values"][track_name])))
+                        if sources:
+                            for seed_label, d, factors, losses in sources:
+                                seed_factors.append((seed_label, float(factors[np.argmin(losses)])))
+                                for grp, gf in _plane_group_argmins(d).items():
+                                    plane_seed_factors.setdefault(grp, []).append((seed_label, gf))
+                            n_found += len(sources)
                         else:
                             n_miss += 1
                     if verbose:
