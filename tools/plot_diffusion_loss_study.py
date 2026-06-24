@@ -53,6 +53,8 @@ _ANGLE_THETAS_FULL = tuple(sorted(set(range(-90, 91, 20)) | {25, 15, 5, -5, -15,
 _ANGLE_THETAS_NWR  = (0, 5, 10, 20)
 _NWR_TA_THETAS     = (0, 5, 10, 15, 20, 25, 30, 35, 40)   # θ values for θ×α grid studies
 _NWR_TA_ALPHAS     = (0, 5, 10, 15, 20, 25, 30, 35, 40)   # α values for θ×α grid studies
+_PIVOT_TA_THETAS   = (0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50)  # θ values for pivot θ×α grid (extended)
+_PIVOT_TA_ALPHAS   = (0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50)  # α values for pivot θ×α grid (extended)
 
 # Pivot-angle study: 400 MeV muon, midpoint fixed at (1000, 0, 0) mm (west volume).
 # CSDA range of 400 MeV muon in LAr ≈ 1700.6 mm → half-length 850.3 mm.
@@ -88,6 +90,8 @@ class StudyMode:
     theta_alpha_pivot_subdir: str = ""
     ta_thetas: tuple = ()
     ta_alphas: tuple = ()
+    ta_pivot_thetas: tuple = ()
+    ta_pivot_alphas: tuple = ()
     include_pivot_nwr: bool = False
     include_theta_alpha: bool = False
 
@@ -114,6 +118,8 @@ STUDY_MODES = {
         theta_alpha_pivot_subdir="diffusion_angle_pivot_theta_alpha",
         ta_thetas=_NWR_TA_THETAS,
         ta_alphas=_NWR_TA_ALPHAS,
+        ta_pivot_thetas=_PIVOT_TA_THETAS,
+        ta_pivot_alphas=_PIVOT_TA_ALPHAS,
         include_theta_alpha=True,
     ),
     "no_wire_response": StudyMode(
@@ -137,6 +143,8 @@ STUDY_MODES = {
         theta_alpha_pivot_subdir="diffusion_angle_pivot_theta_alpha_no_wire_response",
         ta_thetas=_NWR_TA_THETAS,
         ta_alphas=_NWR_TA_ALPHAS,
+        ta_pivot_thetas=_PIVOT_TA_THETAS,
+        ta_pivot_alphas=_PIVOT_TA_ALPHAS,
         include_pivot_nwr=True,
         include_theta_alpha=True,
     ),
@@ -647,8 +655,8 @@ def _compute_theta_alpha_bias(mode, subdir, pivot, verbose=True):
     flat = {}
     n_found = n_miss = 0
     all_seeds = list(range(mode.all_seeds))
-    thetas = mode.ta_thetas
-    alphas = mode.ta_alphas
+    thetas = mode.ta_pivot_thetas if pivot else mode.ta_thetas
+    alphas = mode.ta_pivot_alphas if pivot else mode.ta_alphas
     n_total = len(PARAMS) * len(ADC_CUTOFFS) * len(thetas) * len(alphas)
     done = 0
 
@@ -821,7 +829,7 @@ def build_data(mode, drift_bias_cache=None, angle_bias_cache=None,
         result["nonoise_theta_alpha_bias"] = compute_nonoise_theta_alpha_bias(
             nn_ta_subdir, mode.ta_thetas, mode.ta_alphas, pivot=False)
         result["nonoise_theta_alpha_pivot_bias"] = compute_nonoise_theta_alpha_bias(
-            nn_ta_pivot_subdir, mode.ta_thetas, mode.ta_alphas, pivot=True)
+            nn_ta_pivot_subdir, mode.ta_pivot_thetas, mode.ta_pivot_alphas, pivot=True)
     return result
 
 

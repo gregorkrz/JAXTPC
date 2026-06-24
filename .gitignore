@@ -6,3 +6,4 @@ results/
 tools/data
 *.txt
 .claude
+jobs/
