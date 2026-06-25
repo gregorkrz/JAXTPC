@@ -33,7 +33,7 @@ JAXTPC/
 ├── optlib/                       # Calibration optimizer building blocks
 │   ├── constants.py              # Valid params/losses/optimizers, typical param scales
 │   ├── parsing.py                # run_optimization.py CLI argument definitions
-│   ├── params.py                 # SimParams getters/setters, Efield config builder
+│   ├── params.py                 # SimParams getters/setters
 │   ├── optim.py                  # Adam/SGD/momentum_sgd schedules, Newton-step plumbing
 │   ├── paths.py                  # Result-folder naming, atomic pickle I/O
 │   └── wandb_utils.py            # Weights & Biases logging (optional)
@@ -167,21 +167,6 @@ position (near-cathode) and minimum polar angle from the drift direction, to avo
 near-degenerate track geometries. `filter_track_inside_volumes()` drops any propagated steps
 that fall outside the active volume.
 
-### Differentiable space-charge-effect (SCE) calibration (`tools/nonlocal_efield.py`)
-
-`tools/efield_distortions.py` generates non-differentiable analytic SCE maps (toy E-field +
-drift-correction integration) used as a ground-truth distortion to fit against; it accepts
-both HDF5 and `.npz` map formats and ships a CLI to produce them.
-
-`tools/nonlocal_efield.py` is the differentiable counterpart: an MLP that maps detector
-position to an E-field correction. `FieldConfig` selects between three parameterizations
-(`potential`, `efield`, `correction`); `mode='potential'` is conservative by construction
-(`E = E_bg - grad(phi)`, via `jax.grad`). `nominal_start_params` initializes the MLP with
-random hidden-layer weights but a zeroed output layer, so it starts at the nominal field
-(zero distortion) while still having a nonzero gradient — an all-zero MLP would have none.
-`DetectorSimulator(..., efield_model=FieldConfig)` reads the MLP weights from
-`SimParams.sce_models`, so `jax.grad` reaches them during optimization.
-
 ### Loss-landscape sweeps (`scripts/`)
 
 `scripts/2d_loss_landscape.py` evaluates the loss over a 2D grid of two `SimParams` scalars
@@ -194,7 +179,10 @@ submits one Slurm job per (track × parameter-pair) using the boundary-track ens
 ### `run_optimization.py` + `optlib/`
 
 `run_optimization.py` runs gradient-based optimization over any number of detector parameters
-from N random starting points, against one or more muon tracks:
+from N random starting points. See `python run_optimization.py --help` (or the module
+docstring) for the full option reference.
+
+**Synthetic tracks** (generated on-the-fly from named presets or custom directions):
 
 ```bash
 python run_optimization.py \
@@ -206,6 +194,24 @@ python run_optimization.py \
   --N 25
 ```
 
+**Real or pre-generated events from HDF5** (deposits used as-is; step sizes ignored):
+
+```bash
+# Generate an HDF5 file first (or use a GEANT4-derived muon.h5):
+python generate_muon_tracks.py --n 20 --energy 1000 --step-size 0.1 --output muon.h5
+
+python run_optimization.py \
+  --params recomb_alpha \
+  --events-file muon.h5 \
+  --range 0.95 1.05 \
+  --loss sobolev_loss_geomean_log1p \
+  --optimizer adam --lr 0.01 --max-steps 300 --lr-schedule cosine \
+  --N 10
+```
+
+The HDF5 format follows the `pstep/lar_vol` layout produced by `generate_muon_tracks.py`
+and compatible with GEANT4-derived files; see `tools/event_io.py` for the schema.
+
 - **Optimizers**: `adam`, `sgd`, `momentum_sgd` (via `optax`, with warmup + cosine-decay
   schedule), or `newton` (damped Newton step using the per-batch Hessian). The optimizer is a
   whole-run choice via `--optimizer`; there is no built-in Adam-then-Newton phase switch.
@@ -215,9 +221,6 @@ python run_optimization.py \
   ground-truth signal once before optimization (`--rotate-noise-seeds` to vary it per restart),
   so the simulation can be fit against a *noisy* GT while staying noise-free itself — the
   realistic calibration scenario.
-- **Efield/SCE optimization**: pass `Efield` in `--params` (combinable with scalar params) plus
-  `--electric-dist-path <npz-or-h5>` to fit the differentiable MLP SCE model above against a
-  static ground-truth distortion map. Not compatible with `--optimizer newton`.
 - Implementation is split into `optlib/`: CLI parsing, `SimParams` getters/setters, the
   optimizer/schedule plumbing, result-folder naming + atomic pickle I/O, and optional W&B
   logging.
