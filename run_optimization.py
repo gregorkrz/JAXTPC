@@ -81,6 +81,7 @@ import numpy as np
 import optax
 
 from tools.config import pad_deposit_data
+from tools.event_io import load_events_h5
 from tools.geometry import generate_detector
 from tools.loader import build_deposit_data
 from tools.losses import (
@@ -870,7 +871,21 @@ def main():
         # Store the raw spec for later; resolution happens below after active_planes is set.
         _planes_per_param_spec = args.planes_per_param
 
-    if args.N_random_tracks > 0:
+    if args.events_file is not None:
+        if args.N_random_tracks > 0:
+            print('error: --events-file is mutually exclusive with --N-random-tracks.',
+                  file=sys.stderr)
+            raise SystemExit(2)
+        loaded_events = load_events_h5(args.events_file)
+        track_specs = [
+            dict(name=ev['name'], direction=(0.0, 0.0, 0.0),
+                 momentum_mev=float(np.sum(ev['de'])), start_position_mm=None,
+                 precomputed=ev)
+            for ev in loaded_events
+        ]
+        print(f'Loaded {len(track_specs)} event(s) from {args.events_file} '
+              f'(GT/forward step sizes are ignored — using stored deposits as-is)')
+    elif args.N_random_tracks > 0:
         _volumes = generate_detector(CONFIG_PATH).volumes
         track_specs = generate_random_nice_tracks(
             _volumes, n=args.N_random_tracks, seed=args.tracks_random_seed)
@@ -1212,14 +1227,18 @@ def main():
 
     noise_base_key = jax.random.PRNGKey(noise_seed)
     for track_idx, ts in enumerate(track_specs):
-        print(f'  track {ts["name"]}  dir={ts["direction"]}  T={ts["momentum_mev"]} MeV')
-        track_gt = generate_muon_track(
-            start_position_mm=ts['start_position_mm'] if ts['start_position_mm'] is not None else track_start_mm,
-            direction=ts['direction'],
-            kinetic_energy_mev=ts['momentum_mev'],
-            step_size_mm=args.gt_step_size,
-            track_id=1,
-        )
+        if 'precomputed' in ts:
+            print(f'  event {ts["name"]}  {len(ts["precomputed"]["de"])} deposits (from file)')
+            track_gt = ts['precomputed']
+        else:
+            print(f'  track {ts["name"]}  dir={ts["direction"]}  T={ts["momentum_mev"]} MeV')
+            track_gt = generate_muon_track(
+                start_position_mm=ts['start_position_mm'] if ts['start_position_mm'] is not None else track_start_mm,
+                direction=ts['direction'],
+                kinetic_energy_mev=ts['momentum_mev'],
+                step_size_mm=args.gt_step_size,
+                track_id=1,
+            )
         deposits_gt = build_deposit_data(
             track_gt['position'], track_gt['de'], track_gt['dx'], gt_sim.config,
             theta=track_gt['theta'], phi=track_gt['phi'],
@@ -1317,13 +1336,16 @@ def main():
         _deps, _gts, _wts = [], [], []
 
         for ti, ts in enumerate(track_specs):
-            track_ph = generate_muon_track(
-                start_position_mm=ts['start_position_mm'] if ts['start_position_mm'] is not None else track_start_mm,
-                direction=ts['direction'],
-                kinetic_energy_mev=ts['momentum_mev'],
-                step_size_mm=phase['step_size'],
-                track_id=1,
-            )
+            if 'precomputed' in ts:
+                track_ph = ts['precomputed']
+            else:
+                track_ph = generate_muon_track(
+                    start_position_mm=ts['start_position_mm'] if ts['start_position_mm'] is not None else track_start_mm,
+                    direction=ts['direction'],
+                    kinetic_energy_mev=ts['momentum_mev'],
+                    step_size_mm=phase['step_size'],
+                    track_id=1,
+                )
             deposits_ph = build_deposit_data(
                 track_ph['position'], track_ph['de'], track_ph['dx'], sim_ph.config,
                 theta=track_ph['theta'], phi=track_ph['phi'],

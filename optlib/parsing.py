@@ -56,6 +56,13 @@ def parse_args(doc=None):
                         'polar angle from x-axis in [30°, 150°], T ~ U[100, 1000] MeV.')
     p.add_argument('--tracks-random-seed', type=int, default=7, metavar='SEED',
                    help='RNG seed for --N-random-tracks (default: 7).')
+    p.add_argument('--events-file', default=None, metavar='PATH',
+                   help='Load events from an HDF5 file (muon.h5-compatible pstep/lar_vol '
+                        'format; see tools/event_io.py and generate_muon_tracks.py) instead '
+                        'of generating tracks from --tracks/--N-random-tracks. Each event\'s '
+                        'deposits are used as-is (already at a fixed step size) for both the '
+                        'GT and all forward phases — --gt-step-size and per-phase step sizes '
+                        'are ignored. Mutually exclusive with --tracks/--N-random-tracks.')
     p.add_argument('--loss', default='sobolev_loss_geomean_log1p', choices=VALID_LOSSES,
                    help='Loss function (default: sobolev_loss_geomean_log1p)')
     p.add_argument('--optimizer', default='adam', choices=VALID_OPTIMIZERS,
