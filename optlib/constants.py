@@ -19,11 +19,6 @@ CONFIG_PATH        = 'config/cubic_wireplane_config.yaml'
 N_SEGMENTS         = 50_000
 MAX_ACTIVE_BUCKETS = 1000
 
-# Special non-scalar param: a differentiable MLP E-field distortion model whose
-# weights live in SimParams.sce_models (see tools/nonlocal_efield.py). It is
-# stripped from the scalar param list in main() and handled separately.
-EFIELD_PARAM = 'Efield'
-
 VALID_PARAMS = (
     'velocity_cm_us',
     'lifetime_us',
@@ -33,12 +28,11 @@ VALID_PARAMS = (
     'recomb_beta',
     'recomb_beta_90',
     'recomb_R',
-    EFIELD_PARAM,
 )
 
 # "All params" = all non-beta scalar params + at least one beta variant (model-specific).
 _BETA_VARIANTS = frozenset({'recomb_beta', 'recomb_beta_90'})
-_BASE_PARAMS   = frozenset(VALID_PARAMS) - _BETA_VARIANTS - {EFIELD_PARAM}
+_BASE_PARAMS   = frozenset(VALID_PARAMS) - _BETA_VARIANTS
 
 VALID_LOSSES     = ('sobolev_loss', 'sobolev_loss_geomean_log1p', 'mse_loss', 'l1_loss')
 VALID_OPTIMIZERS = ('adam', 'sgd', 'momentum_sgd', 'newton')

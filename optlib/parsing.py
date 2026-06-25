@@ -25,27 +25,6 @@ def parse_args(doc=None):
                         'starting points. Must be an even count. A single pair "LO HI" draws '
                         'uniformly from [LO, HI]. Multiple pairs e.g. "0.8 0.9 1.1 1.2" draw '
                         'from the union [0.8,0.9]∪[1.1,1.2] (default: 0.95 1.05)')
-    # ── Efield (MLP E-field distortion) options ──
-    p.add_argument('--electric-dist-path', default=None,
-                   help='Path to the ground-truth SCE distortion map (.npz from '
-                        'tools.efield_distortions, or .h5). Required when "Efield" is in --params: '
-                        'the GT simulator runs WITH this distortion and the MLP learns to match it.')
-    p.add_argument('--efield-mode', default='potential',
-                   choices=('potential', 'efield', 'correction'),
-                   help='MLP parameterization for the Efield model (default: potential, '
-                        'i.e. conservative E=-grad(phi)).')
-    p.add_argument('--efield-hidden', type=int, nargs='+', default=[64, 64, 64],
-                   help='Hidden layer widths for the Efield MLP (default: 64 64 64).')
-    p.add_argument('--efield-lr-mult', type=float, default=1.0,
-                   help='LR multiplier applied to all Efield MLP weights (default: 1.0). '
-                        'MLP weights typically need a different step size than physics scalars.')
-    p.add_argument('--efield-per-volume', action='store_true', default=False,
-                   help='Use separate MLP weights for each drift volume (east + west) '
-                        'instead of one shared model. Doubles the MLP parameter count.')
-    p.add_argument('--mlp-snapshot-interval', type=int, default=0,
-                   help='Save the full MLP weight vector every N steps into mlp_trajectory '
-                        '(0 = disabled, only final_p is saved). Useful for visualising '
-                        'how the learned field evolves during training.')
     p.add_argument('--tracks', default='diagonal',
                    help='"+"-separated track presets or name:dx,dy,dz:mom_mev specs '
                         '("+" separates tracks, "," separates direction components). '

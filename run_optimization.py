@@ -16,8 +16,30 @@ Usage
     --max-steps 200 --lr-schedule cosine \\
     --N 25
 
-Named track presets
--------------------
+  To optimize over real (GEANT4-derived) or pre-generated events in HDF5 format:
+
+  python run_optimization.py \\
+    --params recomb_alpha \\
+    --events-file muon.h5 \\
+    --range 0.95 1.05 \\
+    --loss sobolev_loss_geomean_log1p \\
+    --optimizer adam --lr 0.01 \\
+    --max-steps 300 --lr-schedule cosine \\
+    --N 10
+
+  The HDF5 file must follow the pstep/lar_vol layout (see tools/event_io.py and
+  generate_muon_tracks.py).  Each event's deposits are used as-is for both the GT
+  simulation and all forward phases — --gt-step-size and per-phase step sizes are
+  ignored.  --events-file is mutually exclusive with --tracks and --N-random-tracks.
+
+  Generate a compatible HDF5 file with the bundled helper:
+
+    python generate_muon_tracks.py \\
+      --n 20 --energy 1000 --step-size 0.1 \\
+      --output muon.h5
+
+Named track presets (used with --tracks)
+-----------------------------------------
   diagonal  (1,1,1)        1000 MeV
   X         (1,0,0)        1000 MeV
   Y         (0,1,0)        1000 MeV
@@ -102,7 +124,7 @@ from tools.simulation import DetectorSimulator
 from optlib.constants import (  # noqa: E402  (constants live in optlib now)
     WANDB_PER_TRACK_LOSS_MAX_TRACKS, GT_LIFETIME_US, GT_VELOCITY_CM_US, SOBOLEV_MAX_PAD,
     CONFIG_PATH, N_SEGMENTS, MAX_ACTIVE_BUCKETS,
-    EFIELD_PARAM, VALID_PARAMS, _BETA_VARIANTS, _BASE_PARAMS,
+    VALID_PARAMS, _BETA_VARIANTS, _BASE_PARAMS,
     VALID_LOSSES, VALID_OPTIMIZERS, TYPICAL_SCALES, TRACK_PRESETS,
     ADAM_BETA1, ADAM_BETA2, ADAM_EPS, MOMENTUM, PLANE_NAME_MAP,
 )
@@ -111,7 +133,7 @@ from optlib.paths import (  # noqa: E402
     _serialize_opt_state, _safe_pickle_dump, optimization_run_complete,
 )
 from optlib.params import (  # noqa: E402
-    _get_gt_val, _apply_param, make_nparam_setter, build_efield_config,
+    _get_gt_val, _apply_param, make_nparam_setter,
 )
 from optlib.parsing import (  # noqa: E402
     parse_args, parse_params, parse_tracks, parse_planes,
@@ -395,10 +417,8 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
               effective_batch_size=1,
               newton_damping=None,
               clip_grad_norm=0.0,
-              rotating_phase_schedules=None,
-              n_record_coords=None,
-              mlp_snapshot_interval=0):
-    """Run one optimization trial from starting p_n vector p0 (any length).
+              rotating_phase_schedules=None):
+    """Run one optimization trial from starting p_n vector p0.
 
     phase_schedule: list of (until_step, build_fn) sorted by until_step.
     build_fn(p) -> list[batch_fn] compiles and warms up on first call (cached).
@@ -421,8 +441,7 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
     ``step < phase2_start_step`` the *complement* of this mask is active (i.e. all
     other named params are optimized, ``phase2_active_mask`` params are frozen); for
     ``step >= phase2_start_step`` only ``phase2_active_mask`` params are active.
-    Any non-named coordinates (e.g. Efield MLP weights) are always active. Independent
-    of and combinable with ``tol_per_param``/``patience_per_param`` freezing.
+    Independent of and combinable with ``tol_per_param``/``patience_per_param`` freezing.
 
     checkpoint_callback: ``callback(step, p, opt_state, frozen_mask=None)`` —
     ``frozen_mask`` is a numpy bool vector when per-parameter freezing is enabled.
@@ -445,11 +464,7 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
 
     freeze_enabled = tol_per_param is not None and patience_per_param is not None
     n_dim = int(p.shape[0])
-    # Coordinates recorded in the param/grad trajectories. When optimizing an MLP
-    # (Efield), only the leading scalar coords are recorded to keep pickles small;
-    # the full vector is still saved via checkpoints and `final_p`.
-    n_rec = int(n_record_coords) if n_record_coords is not None else n_dim
-    n_rec = max(0, min(n_rec, n_dim))
+    n_rec = n_dim
     # Per-param features (freezing, wandb) only apply to named (scalar) coords.
     n_named = len(param_names) if param_names is not None else n_dim
     n_named = min(n_named, n_dim)
@@ -477,8 +492,6 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
     param_traj = []
     loss_traj  = []
     grad_traj  = []
-    mlp_traj   = []   # [(step, flat_p)] snapshots; populated when mlp_snapshot_interval > 0
-    _mlp_snap  = int(mlp_snapshot_interval) if mlp_snapshot_interval and mlp_snapshot_interval > 0 else 0
 
     _freeze_eps = 1e-30
 
@@ -558,8 +571,6 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
     param_traj.append(p[:n_rec].tolist())
     loss_traj.append(lv_init)
     grad_traj.append(gv_init[:n_rec].tolist())
-    if _mlp_snap:
-        mlp_traj.append((start_step, np.asarray(p).tolist()))
 
     # Skip initial W&B row when resuming — that step was already logged before checkpoint.
     if use_wandb and _WANDB_AVAILABLE and start_step == 0:
@@ -641,8 +652,6 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
         param_traj.append(p[:n_rec].tolist())
         loss_traj.append(float(lv_new))
         grad_traj.append(gv_new[:n_rec].tolist())
-        if _mlp_snap and (step + 1) % _mlp_snap == 0:
-            mlp_traj.append((step + 1, np.asarray(p).tolist()))
 
         _pt_extra = None
         if use_wandb and _WANDB_AVAILABLE and wandb_track_batch_groups is not None and pt_new is not None:
@@ -707,12 +716,6 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
         elif _pt_extra is not None and use_wandb and _WANDB_AVAILABLE:
             _wandb.log(_pt_extra, step=step + 1)
 
-    # Ensure the final step is always included in mlp_traj (avoid duplicate if already there).
-    if _mlp_snap:
-        final_step = len(param_traj) - 1 + start_step
-        if not mlp_traj or mlp_traj[-1][0] != final_step:
-            mlp_traj.append((final_step, np.asarray(p).tolist()))
-
     out = dict(
         param_trajectory = param_traj,
         grad_trajectory  = grad_traj,
@@ -721,10 +724,8 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
         stopped_early    = stopped_early,
         steps_run        = len(param_traj) - 1,
         final_opt_state  = (_serialize_opt_state(opt_state) if opt_state is not None else None),
-        final_p          = np.asarray(p).tolist(),  # full vector incl. any MLP block
+        final_p          = np.asarray(p).tolist(),
     )
-    if _mlp_snap:
-        out['mlp_trajectory'] = mlp_traj  # list of (step, flat_p) pairs
     if freeze_enabled:
         out['frozen_mask_final'] = frozen_np.tolist()
         out['tol_per_param'] = tol_per_param
@@ -788,28 +789,7 @@ def main():
         print('error: --patience-per-param must be >= 1.', file=sys.stderr)
         raise SystemExit(2)
 
-    _all_param_names = parse_params(args.params)
-    # 'Efield' is a non-scalar MLP model handled separately from the scalar
-    # param machinery; strip it out and keep param_names as scalars only.
-    efield_present = EFIELD_PARAM in _all_param_names
-    param_names = [n for n in _all_param_names if n != EFIELD_PARAM]
-    if efield_present:
-        if args.electric_dist_path is None:
-            print('error: --electric-dist-path is required when "Efield" is in --params.',
-                  file=sys.stderr)
-            raise SystemExit(2)
-        if not os.path.exists(args.electric_dist_path):
-            print(f'error: --electric-dist-path not found: {args.electric_dist_path}',
-                  file=sys.stderr)
-            raise SystemExit(2)
-        if args.optimizer == 'newton':
-            print('error: "Efield" optimization is not supported with --optimizer newton '
-                  '(dense Hessian over MLP weights is intractable).', file=sys.stderr)
-            raise SystemExit(2)
-        if args.init_from_wandb_run:
-            print('error: --init-from-wandb-run is not supported together with "Efield".',
-                  file=sys.stderr)
-            raise SystemExit(2)
+    param_names = parse_params(args.params)
 
     # Two-phase param schedule: optimize all params except --phase2-params until
     # --phase2-start-step, then optimize only --phase2-params.
@@ -932,10 +912,8 @@ def main():
     start_rng        = np.random.default_rng(start_ss)
     noise_seed       = int(noise_ss.generate_state(1)[0])
 
-    _folder_param_names = list(param_names) + (
-        [f'{EFIELD_PARAM}-{args.efield_mode}'] if efield_present else [])
     folder_name = make_folder_name(
-        _folder_param_names, track_specs, args.loss, args.optimizer,
+        param_names, track_specs, args.loss, args.optimizer,
         args.lr, args.lr_schedule, args.max_steps, args.N, range_intervals,
         noise_scale=args.noise_scale,
         step_size=schedule[-1]['step_size'],
@@ -1106,21 +1084,14 @@ def main():
                   f'deposits={ph["max_num_deposits"]:,}  '
                   f'batch_size={ph["batch_size"]}')
 
-    # ── Simulators (cached by n_segments, role) ───────────────────────────────
+    # ── Simulators (cached by n_segments) ────────────────────────────────────
     detector_config = generate_detector(CONFIG_PATH)
     _sim_cache: dict = {}
-    # FieldConfig + zero-init weights for the MLP SCE model. Assigned after gt_sim
-    # is built (needs geometry); read lazily by _get_sim when building diff sims.
-    efield_cfg = None
-    efield_zero_params = None
 
-    def _get_sim(n_seg, role='diff'):
-        # role 'gt' uses the static GT distortion map; role 'diff' uses the
-        # differentiable MLP SCE model (when Efield is being optimized).
-        key = (n_seg, role)
-        if key not in _sim_cache:
-            print(f'\nBuilding {role} simulator (n_segments={n_seg:,})...')
-            kw = dict(
+    def _get_sim(n_seg):
+        if n_seg not in _sim_cache:
+            print(f'\nBuilding simulator (n_segments={n_seg:,})...')
+            sim = DetectorSimulator(detector_config,
                 differentiable=True,
                 n_segments=n_seg,
                 use_bucketed=True,
@@ -1130,26 +1101,14 @@ def main():
                 include_track_hits=False,
                 include_digitize=False,
             )
-            if efield_present and role == 'gt':
-                kw['include_electric_dist'] = True
-                kw['electric_dist_path'] = args.electric_dist_path
-            elif efield_present and role == 'diff':
-                kw['efield_model'] = efield_cfg
-                kw['efield_per_volume'] = args.efield_per_volume
-            sim = DetectorSimulator(detector_config, **kw)
-            # Diff sim: inject zero MLP weights so warm-up compiles with a valid
-            # sce_models pytree (real weights flow in later with same structure).
-            if efield_present and role == 'diff':
-                sim._default_sim_params = sim._default_sim_params._replace(
-                    sce_models=efield_zero_params)
             print('Warming up JIT...')
             t0 = time.time()
             sim.warm_up()
             print(f'Done ({time.time() - t0:.1f} s)')
-            _sim_cache[key] = sim
-        return _sim_cache[key]
+            _sim_cache[n_seg] = sim
+        return _sim_cache[n_seg]
 
-    gt_sim = _get_sim(args.gt_max_deposits, role='gt')
+    gt_sim = _get_sim(args.gt_max_deposits)
     gt_lifetime = args.gt_lifetime_us if args.gt_lifetime_us is not None else GT_LIFETIME_US
     gt_params = gt_sim.default_sim_params._replace(
         lifetime_us    = jnp.array(gt_lifetime),
@@ -1157,27 +1116,6 @@ def main():
     )
     if args.gt_lifetime_us is not None:
         print(f'GT lifetime overridden: {gt_lifetime:.0f} μs ({gt_lifetime / 1000:.1f} ms)')
-
-    # Build the MLP field config + zero starting weights now that geometry is known.
-    efield_n_mlp = 0
-    efield_unravel = None
-    if efield_present:
-        import tools.nonlocal_efield as _nl
-        efield_cfg = build_efield_config(
-            gt_sim, gt_params, mode=args.efield_mode, hidden=args.efield_hidden)
-        _single_zero = _nl.zero_params(efield_cfg)
-        if args.efield_per_volume:
-            # Stack two independent zero param sets (one per volume) with leading axis 2.
-            efield_zero_params = jax.tree.map(
-                lambda a, b: jnp.stack([a, b], axis=0), _single_zero, _single_zero)
-        else:
-            efield_zero_params = _single_zero
-        _flat0, efield_unravel = _nl.flatten_params(efield_zero_params)
-        efield_n_mlp = int(_flat0.size)
-        _pv_tag = '  per_volume=True' if args.efield_per_volume else ''
-        print(f'Efield MLP    : mode={args.efield_mode}  hidden={tuple(args.efield_hidden)}  '
-              f'weights={efield_n_mlp:,}  lr_mult={args.efield_lr_mult}'
-              f'{_pv_tag}  GT map={args.electric_dist_path}')
 
     if args.gt_param_multiplier != 1.0:
         for _pname in param_names:
@@ -1195,18 +1133,7 @@ def main():
         print(f'  {name}: GT={gt_val:.6g}  scale={scale:.6g}  log(GT/scale)={p_n_gt:.6g}')
 
     n_scalar = len(param_names)
-    if efield_present:
-        # The optimized vector is [scalar block | flattened MLP weights]. The
-        # scalar block keeps the existing log-normalization; the MLP block is raw
-        # (no log-norm) and is reshaped into SimParams.sce_models.
-        _unravel = efield_unravel
-        _n_scalar = n_scalar
-        def setter(p_n_vec):
-            base = scalar_setter(p_n_vec[:_n_scalar])
-            mlp = _unravel(p_n_vec[_n_scalar:])
-            return base._replace(sce_models=mlp)
-    else:
-        setter = scalar_setter
+    setter = scalar_setter
 
     # ── GT signals (computed once at fixed fine resolution) ────────────────────
     print(f'\nComputing GT signals '
@@ -1463,7 +1390,7 @@ def main():
                             return_hessian=is_newton,
                             adc_cutoff=args.sobolev_loss_cutoff,
                             active_planes=active_planes,
-                            return_per_vol_loss=log_track_losses_wandb and efield_present)
+                            return_per_vol_loss=False)
                         for fn in fns:
                             out = fn(p)
                             jax.block_until_ready(out)
@@ -1521,19 +1448,7 @@ def main():
         _p_n_scalar = np.log(factors) + np.array(p_n_gts)               # (N, n_scalar)
     else:
         _p_n_scalar = np.zeros((args.N, 0))
-    if efield_present:
-        # MLP block: random hidden + zeroed output layer ⇒ the field starts at
-        # nominal (no distortion) yet has nonzero gradient so it can learn.
-        # Distinct seed per trial so trials explore different hidden features.
-        import tools.nonlocal_efield as _nl
-        mlp_blocks = []
-        for _t in range(args.N):
-            _k = jax.random.PRNGKey(int(effective_seed) + 7919 + _t)
-            _ip = _nl.nominal_start_params(efield_cfg, _k)
-            _flat, _ = _nl.flatten_params(_ip)
-            mlp_blocks.append(np.asarray(_flat, dtype=np.float64))
-        _p_n_scalar = np.hstack([_p_n_scalar, np.stack(mlp_blocks)])
-    p_n_starts    = _p_n_scalar.tolist()
+    p_n_starts = _p_n_scalar.tolist()
 
     if args.init_from_wandb_run:
         _step_label = (f'step {args.init_from_wandb_step}'
@@ -1639,12 +1554,6 @@ def main():
         lr_multipliers = parse_lr_multipliers(lr_spec, param_names)
 
     if not is_newton:
-        if efield_present:
-            # Extend per-param multipliers to per-coordinate: keep the scalar
-            # block, set every MLP weight to the single Efield multiplier. The
-            # optimizer's _scale_by_vector needs length = len(p) = n_coords.
-            lr_multipliers = (list(lr_multipliers[:n_scalar])
-                              + [args.efield_lr_mult] * efield_n_mlp)
         if not want_auto and any(s != 1.0 for s in lr_multipliers[:n_scalar]):
             pairs = ', '.join(f'{n}×{s}' for n, s in zip(param_names, lr_multipliers) if s != 1.0)
             print(f'LR multipliers : {pairs}')
@@ -1685,36 +1594,15 @@ def main():
         seed                = effective_seed,
         noise_scale         = args.noise_scale,
         factor_grid         = factor_grid,
-        # Store only the scalar block of starts / multipliers (MLP block is all
-        # zeros / a constant) to keep the pickle small and resume-compatible.
-        starting_p_n_values = ([row[:n_scalar] for row in p_n_starts]
-                               if efield_present else p_n_starts),
+        starting_p_n_values = p_n_starts,
         command             = _argv_cmd,
         trials              = all_trials,
         run_complete        = False,
         wandb_run_id        = wb_run_id_for_result,
-        lr_multipliers      = (list(lr_multipliers[:n_scalar])
-                               if efield_present else lr_multipliers),
+        lr_multipliers      = lr_multipliers,
     )
     if lr_mult_auto_meta is not None:
         result['lr_mult_auto_meta'] = lr_mult_auto_meta
-    if efield_present:
-        # Everything needed to reconstruct the learned field from a trial's
-        # `final_p` (the trailing block after the scalar coords).
-        result['efield'] = dict(
-            present       = True,
-            mode          = efield_cfg.mode,
-            hidden        = list(efield_cfg.hidden),
-            n_weights     = efield_n_mlp,
-            n_scalar      = n_scalar,
-            lr_mult       = args.efield_lr_mult,
-            per_volume    = args.efield_per_volume,
-            gt_map_path   = args.electric_dist_path,
-            center_cm     = list(efield_cfg.center_cm),
-            half_cm       = list(efield_cfg.half_cm),
-            bg_field_Vcm  = list(efield_cfg.bg_field_Vcm),
-            out_scale     = efield_cfg.out_scale,
-        )
     preemption_state['result'] = result
 
     # ── Intra-trial checkpoint ────────────────────────────────────────────────
@@ -1738,9 +1626,8 @@ def main():
             continue  # already completed in a previous run
 
         factors_str = ', '.join(f'{f:.4f}' for f in factors_i)
-        pn_str      = ', '.join(f'{v:.4f}' for v in pn_start[:n_scalar])  # scalar coords only
-        _ef_tag     = f'  +Efield[{efield_n_mlp}w@0]' if efield_present else ''
-        print(f'\nTrial [{gi+1}/{args.N}]  factors=({factors_str})  p_n=({pn_str}){_ef_tag}',
+        pn_str      = ', '.join(f'{v:.4f}' for v in pn_start)
+        print(f'\nTrial [{gi+1}/{args.N}]  factors=({factors_str})  p_n=({pn_str})',
               end='', flush=True)
 
         pn0            = pn_start
@@ -1777,8 +1664,6 @@ def main():
             newton_damping=(args.newton_damping if is_newton else None),
             clip_grad_norm=args.clip_grad_norm,
             rotating_phase_schedules=(_rotating_phase_schedules if _rotate_n > 0 else None),
-            n_record_coords=(n_scalar if efield_present else None),
-            mlp_snapshot_interval=(args.mlp_snapshot_interval if efield_present else 0),
         )
         all_trials.append(trial)
         result.pop('live_checkpoint', None)

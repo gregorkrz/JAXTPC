@@ -95,8 +95,6 @@ class DetectorSimulator:
         recombination_model=None,
         include_electric_dist=False,
         electric_dist_path=None,
-        efield_model=None,
-        efield_per_volume=False,
         include_digitize=False,
         digitization_config=None,
         differentiable=False,
@@ -169,15 +167,8 @@ class DetectorSimulator:
 
         # Load SCE maps (per-volume, converted to local frame)
         sce_per_volume = self._load_sce(include_electric_dist, electric_dist_path)
-        # Differentiable MLP SCE model (FieldConfig); field read from SimParams.sce_models.
-        # Mutually exclusive with a static SCE map.
-        self._efield_model = efield_model
-        self._per_volume_sce = efield_per_volume and efield_model is not None
-        if efield_model is not None and sce_per_volume is not None:
-            raise ValueError(
-                "efield_model (MLP SCE) and include_electric_dist (static SCE map) "
-                "are mutually exclusive; pass only one.")
-        self._include_sce = sce_per_volume is not None or efield_model is not None
+        self._per_volume_sce = False
+        self._include_sce = sce_per_volume is not None
 
         # Volume iteration mode
         self._iterate = scan_over if iterate_mode == 'scan' else vmap_over
@@ -253,8 +244,7 @@ class DetectorSimulator:
 
         # Build shared factories
         sce_factory, _build_response_fn, _build_response_fn_diff, _recomb_fn = \
-            self._setup_shared_factories(sce_per_volume, efield_model,
-                                         per_volume=self._per_volume_sce)
+            self._setup_shared_factories(sce_per_volume)
 
         # Build post-processing factories (once, shared)
         self.electronics_chunk_size = None
@@ -333,36 +323,15 @@ class DetectorSimulator:
         print(f"   Volumes: {cfg.n_volumes} (iterate={self._volume_mode})")
         print("--- DetectorSimulator Ready ---")
 
-    def _setup_shared_factories(self, sce_per_volume, efield_model=None, per_volume=False):
-        """Build SCE, response, and recombination factories (shared across volumes).
-
-        SCE factories take ``sim_params`` so the differentiable MLP path can read
-        its weights from ``sim_params.sce_models``; the static-map and nominal
-        factories ignore the argument.
-        """
+    def _setup_shared_factories(self, sce_per_volume):
+        """Build SCE, response, and recombination factories (shared across volumes)."""
         from tools.recombination import compute_quanta, XI_FN
 
         cfg = self._sim_config
         _nominal_field = float(self._default_sim_params.recomb_params.field_strength_Vcm)
 
         # ── SCE factory (local frame) ──
-        if efield_model is not None:
-            # Differentiable MLP SCE — field computed from sim_params.sce_models.
-            # The static FieldConfig is captured here; only weights flow through
-            # SimParams, so jax.grad reaches them.
-            # When per_volume=True, vol_params is the slice of sce_models for this
-            # volume (stacked leading axis sliced by scan/vmap); otherwise None and
-            # the full sim_params.sce_models (shared across volumes) is used.
-            from tools import nonlocal_efield as _nl
-            def sce_factory(sim_params, vol_params=None, fcfg=efield_model, nf=_nominal_field):
-                mlp_params = vol_params if vol_params is not None else sim_params.sce_models
-                def _sce(positions_cm):
-                    efield_corr, drift_corr = _nl.sce_outputs(
-                        mlp_params, positions_cm, fcfg, nf)
-                    return SCEOutputs(efield_correction=efield_corr,
-                                      drift_corr_cm=drift_corr)
-                return _sce
-        elif sce_per_volume is not None:
+        if sce_per_volume is not None:
             # Real SCE — maps already in local frame from load_sce_per_volume.
             # For scan, all volumes must share one factory. Use volume 0's maps.
             # (Different per-volume SCE requires stacking maps — future work.)

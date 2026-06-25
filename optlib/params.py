@@ -1,4 +1,4 @@
-"""Parameter helpers: GT value extraction, SimParams setters, Efield config.
+"""Parameter helpers: GT value extraction and SimParams setters.
 
 Extracted verbatim from ``src/opt/run_optimization.py`` (no logic changes).
 """
@@ -63,34 +63,3 @@ def make_nparam_setter(param_names, gt_params, recomb_model):
         return params
 
     return setter, gt_vals, scales, p_n_gts
-
-
-def build_efield_config(sim, gt_params, mode='potential', hidden=(64, 64, 64)):
-    """Build a local-frame ``FieldConfig`` for the MLP SCE model.
-
-    The simulator works in volume-local coordinates (anode at x_local=0, drift
-    along +x, yz centered).  In that frame the nominal field is +E0 along x for
-    both volumes, so a single MLP serves both.  Weights are zero-initialised
-    elsewhere, so ``out_scale`` only sets the natural output magnitude (combined
-    with the LR multiplier it controls learning speed), not the starting point.
-    """
-    from tools.nonlocal_efield import FieldConfig
-    vol0 = sim._sim_config.volumes[0]
-    E0 = float(gt_params.recomb_params.field_strength_Vcm)
-    (xlo, xhi), (ylo, yhi), (zlo, zhi) = vol0.ranges_cm
-    half_x = float(vol0.max_drift_cm) / 2.0          # local x ∈ [0, max_drift]
-    half_y = abs(yhi - ylo) / 2.0
-    half_z = abs(zhi - zlo) / 2.0
-    center = (half_x, 0.0, 0.0)
-    half = (max(half_x, 1e-6), max(half_y, 1e-6), max(half_z, 1e-6))
-    mean_half = (half[0] + half[1] + half[2]) / 3.0
-    if mode == 'potential':
-        out_scale = E0 * 0.05 * mean_half            # φ ~ field × length
-    elif mode == 'efield':
-        out_scale = E0 * 0.05                         # distortion ~ few % of E0
-    else:  # correction (cm)
-        out_scale = 1.0
-    return FieldConfig(
-        mode=mode, center_cm=center, half_cm=half,
-        bg_field_Vcm=(E0, 0.0, 0.0), out_scale=out_scale, hidden=tuple(hidden),
-    )
