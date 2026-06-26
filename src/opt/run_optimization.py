@@ -82,7 +82,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from tools.config import pad_deposit_data
+from tools.config import pad_deposit_data, create_sim_config
 from tools.geometry import generate_detector
 from tools.loader import build_deposit_data
 from tools.losses import (
@@ -112,7 +112,7 @@ from optlib.paths import (  # noqa: E402
     _serialize_opt_state, _safe_pickle_dump, optimization_run_complete,
 )
 from optlib.params import (  # noqa: E402
-    _get_gt_val, _apply_param, make_nparam_setter, build_efield_config,
+    _get_gt_val, _apply_param, make_nparam_setter, build_siren_config,
 )
 from optlib.parsing import (  # noqa: E402
     parse_args, parse_params, parse_tracks, parse_planes,
@@ -182,9 +182,68 @@ def build_loss_fn(loss_name, fwd_fn, gt_arrays, weights, adc_cutoff=0.0, active_
     return jax.jit(jax.value_and_grad(fn))
 
 
+def make_curl_penalty_fn(efield_cfg, efield_unravel, n_scalar, n_weights, vol,
+                         per_volume=False, n_pts=200):
+    """Return jit-compiled fn(flat_p) -> mean |∇×E| [V/cm²] on a fixed interior grid.
+
+    Uses forward-mode autodiff (jax.jacfwd) to get ∂E/∂pos at each sample point,
+    then assembles the curl (∇×E) and averages its magnitude over the grid.
+    """
+    from tools.sce_siren import recover_efield
+    no = jnp.array(efield_cfg.norm_offsets)
+    ns = jnp.array(efield_cfg.norm_scales)
+    E0 = float(efield_cfg.E0)
+    v0 = float(efield_cfg.v0)
+    v_table = efield_cfg.v_table
+    E_table = efield_cfg.E_table
+    omega_0 = float(efield_cfg.omega_0)
+
+    # Fixed interior sample grid — avoid boundaries where BC forces Δ→0.
+    max_x = float(vol.max_drift_cm)
+    (_, _), (ylo, yhi), (zlo, zhi) = vol.ranges_cm
+    hy = (yhi - ylo) / 2.0
+    hz = (zhi - zlo) / 2.0
+    nx = max(2, round(n_pts ** (1/3) * 1.5))
+    nyz = max(2, round((n_pts / nx) ** 0.5))
+    xs = jnp.linspace(max_x * 0.05, max_x * 0.95, nx)
+    ys = jnp.linspace(-hy * 0.9, hy * 0.9, nyz)
+    zs = jnp.linspace(-hz * 0.9, hz * 0.9, nyz)
+    XG, YG, ZG = jnp.meshgrid(xs, ys, zs, indexing='ij')
+    sample_pts = jnp.stack([XG.ravel(), YG.ravel(), ZG.ravel()], axis=-1)  # (M, 3)
+
+    def _E_single(params, pos):
+        return recover_efield(params, pos[None], E0, v0, v_table, E_table,
+                              no, ns, omega_0)[0]  # (3,)
+
+    def _curl_mag(params, pos):
+        J = jax.jacfwd(lambda p: _E_single(params, p))(pos)   # (3,3)  ∂Ei/∂posj
+        cx = J[2, 1] - J[1, 2]
+        cy = J[0, 2] - J[2, 0]
+        cz = J[1, 0] - J[0, 1]
+        return jnp.sqrt(cx**2 + cy**2 + cz**2 + 1e-30)
+
+    _n_scalar   = n_scalar
+    _n_weights  = n_weights
+    _unravel    = efield_unravel
+    _per_volume = per_volume
+
+    def curl_penalty_fn(p_n_vec):
+        params = _unravel(p_n_vec[_n_scalar : _n_scalar + _n_weights])
+        if _per_volume:
+            p0 = jax.tree.map(lambda x: x[0], params)
+            p1 = jax.tree.map(lambda x: x[1], params)
+            m0 = jax.vmap(lambda pos: _curl_mag(p0, pos))(sample_pts)
+            m1 = jax.vmap(lambda pos: _curl_mag(p1, pos))(sample_pts)
+            return (jnp.mean(m0) + jnp.mean(m1)) * 0.5
+        else:
+            return jnp.mean(jax.vmap(lambda pos: _curl_mag(params, pos))(sample_pts))
+
+    return jax.jit(curl_penalty_fn)
+
+
 def build_phase_fns(loss_name, simulator, setter, batches, *, return_per_track_loss=False,
                     return_hessian=False, adc_cutoff=0.0, active_planes=None,
-                    return_per_vol_loss=False):
+                    return_per_vol_loss=False, curl_penalty_fn=None):
     """Return one callable per batch in a phase.
 
     Default ``fn(p) -> (loss, grad)``. When ``return_per_track_loss=True``,
@@ -263,6 +322,8 @@ def build_phase_fns(loss_name, simulator, setter, batches, *, return_per_track_l
                         total = total + l1_loss(pred, gt_b)
                     else:
                         raise ValueError(f'Unknown loss {loss_name!r}')
+                if curl_penalty_fn is not None:
+                    total = total + curl_penalty_fn(p_n_vec)
                 return total
 
             _grad_fn = jax.grad(fn_scalar, argnums=0)
@@ -324,7 +385,10 @@ def build_phase_fns(loss_name, simulator, setter, batches, *, return_per_track_l
                     else:
                         loss_terms.append(lb)
                 losses_arr = jnp.stack(loss_terms)
-                return jnp.sum(losses_arr if not return_per_vol_loss else losses_arr[:, 0]), losses_arr
+                total = jnp.sum(losses_arr if not return_per_vol_loss else losses_arr[:, 0])
+                if curl_penalty_fn is not None:
+                    total = total + curl_penalty_fn(p_n_vec)
+                return total, losses_arr
 
             compiled = jax.jit(jax.value_and_grad(fn, argnums=0, has_aux=True))
         else:
@@ -351,6 +415,8 @@ def build_phase_fns(loss_name, simulator, setter, batches, *, return_per_track_l
                         total = total + l1_loss(pred, gt_b)
                     else:
                         raise ValueError(f'Unknown loss {loss_name!r}')
+                if curl_penalty_fn is not None:
+                    total = total + curl_penalty_fn(p_n_vec)
                 return total
 
             compiled = jax.jit(jax.value_and_grad(fn, argnums=0))
@@ -398,7 +464,8 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
               clip_grad_norm=0.0,
               rotating_phase_schedules=None,
               n_record_coords=None,
-              mlp_snapshot_interval=0):
+              mlp_snapshot_interval=0,
+              aux_metrics_fn=None):
     """Run one optimization trial from starting p_n vector p0 (any length).
 
     phase_schedule: list of (until_step, build_fn) sorted by until_step.
@@ -568,6 +635,8 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
         if freeze_enabled and param_names is not None:
             for i in range(n_named):
                 extra0[f'freeze/{param_names[i]}'] = (1.0 if frozen_np[i] else 0.0)
+        if aux_metrics_fn is not None:
+            extra0.update(aux_metrics_fn(p, lv_init))
         _wandb_log_step(start_step, lv_init, gv_init, p, param_names, scales, p_n_gts,
                         step_time_s=0.0, trial_idx=trial_idx, schedule_fn=schedule_fn,
                         lr_multipliers=lr_multipliers,
@@ -692,6 +761,7 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
                     freeze_metrics = {
                         f'freeze/{param_names[i]}': (1.0 if frozen_np[i] else 0.0)
                         for i in range(n_named)}
+                _aux = aux_metrics_fn(p, float(lv_new)) if aux_metrics_fn is not None else {}
                 _wandb_log_step(step + 1, float(lv_new), gv_new, p,
                                 param_names, scales, p_n_gts,
                                 step_time_s=step_time, trial_idx=trial_idx,
@@ -700,7 +770,8 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
                                 phase=ph_idx if multi_phase else None,
                                 extra_metrics={**(freeze_metrics or {}),
                                                **(newton_step_metrics or {}),
-                                               **(_pt_extra or {})})
+                                               **(_pt_extra or {}),
+                                               **_aux})
             if checkpoint_callback is not None:
                 checkpoint_callback(
                     step + 1, p, opt_state,
@@ -873,7 +944,7 @@ def main():
         _planes_per_param_spec = args.planes_per_param
 
     if args.N_random_tracks > 0:
-        _volumes = generate_detector(CONFIG_PATH).volumes
+        _volumes = create_sim_config(generate_detector(CONFIG_PATH), total_pad=100, response_chunk_size=100).volumes
         track_specs = generate_random_nice_tracks(
             _volumes, n=args.N_random_tracks, seed=args.tracks_random_seed)
     else:
@@ -1145,26 +1216,57 @@ def main():
     if args.gt_lifetime_us is not None:
         print(f'GT lifetime overridden: {gt_lifetime:.0f} μs ({gt_lifetime / 1000:.1f} ms)')
 
-    # Build the MLP field config + zero starting weights now that geometry is known.
+    # Build the SIREN config + zero starting weights now that geometry is known.
     efield_n_mlp = 0
     efield_unravel = None
     if efield_present:
-        import tools.nonlocal_efield as _nl
-        efield_cfg = build_efield_config(
-            gt_sim, gt_params, mode=args.efield_mode, hidden=args.efield_hidden)
-        _single_zero = _nl.zero_params(efield_cfg)
+        from tools.sce_siren import init_siren
+        from jax.flatten_util import ravel_pytree
+        efield_cfg = build_siren_config(
+            gt_sim, gt_params, hidden=args.efield_hidden)
+        _single_zero = jax.tree.map(
+            jnp.zeros_like,
+            init_siren(jax.random.PRNGKey(0),
+                       hidden_features=efield_cfg.hidden_features,
+                       hidden_layers=efield_cfg.hidden_layers,
+                       omega_0=efield_cfg.omega_0))
         if args.efield_per_volume:
-            # Stack two independent zero param sets (one per volume) with leading axis 2.
+            # Stack two identical zero param sets (one per volume) with leading axis 2.
             efield_zero_params = jax.tree.map(
                 lambda a, b: jnp.stack([a, b], axis=0), _single_zero, _single_zero)
         else:
             efield_zero_params = _single_zero
-        _flat0, efield_unravel = _nl.flatten_params(efield_zero_params)
+        _flat0, efield_unravel = ravel_pytree(efield_zero_params)
         efield_n_mlp = int(_flat0.size)
         _pv_tag = '  per_volume=True' if args.efield_per_volume else ''
-        print(f'Efield MLP    : mode={args.efield_mode}  hidden={tuple(args.efield_hidden)}  '
+        print(f'Efield SIREN  : hidden={tuple(args.efield_hidden)}  '
+              f'omega_0={efield_cfg.omega_0}  '
               f'weights={efield_n_mlp:,}  lr_mult={args.efield_lr_mult}'
               f'{_pv_tag}  GT map={args.electric_dist_path}')
+
+    # ── Curl (rotor) regulariser ───────────────────────────────────────────────
+    curl_penalty_fn = None
+    if efield_present and args.penalize_rotor > 0.0:
+        _curl_weight = args.penalize_rotor
+        _curl_base = make_curl_penalty_fn(
+            efield_cfg, efield_unravel,
+            n_scalar=len(param_names),
+            n_weights=efield_n_mlp,
+            vol=gt_sim._sim_config.volumes[0],
+            per_volume=args.efield_per_volume,
+        )
+        def curl_penalty_fn(p):
+            return _curl_weight * _curl_base(p)
+        print(f'Curl penalty  : weight={_curl_weight}  sample_pts≈200')
+    _rotor_aux_fn = None
+    if curl_penalty_fn is not None:
+        _cw, _cb = _curl_weight, _curl_base
+        def _rotor_aux_fn(p, total_loss):
+            curl_raw = float(_cb(p))
+            return {
+                'loss/rotor_unweighted': curl_raw,
+                'loss/sobolev': total_loss - _cw * curl_raw,
+            }
 
     if args.gt_param_multiplier != 1.0:
         for _pname in param_names:
@@ -1403,7 +1505,8 @@ def main():
                                 return_per_track_loss=False,
                                 return_hessian=False,
                                 adc_cutoff=cutoff_g,
-                                active_planes=planes_g)
+                                active_planes=planes_g,
+                                curl_penalty_fn=curl_penalty_fn)
                             for fn in fns_g:
                                 out = fn(p); jax.block_until_ready(out)
                                 out = fn(p); jax.block_until_ready(out)
@@ -1443,7 +1546,8 @@ def main():
                             return_hessian=is_newton,
                             adc_cutoff=args.sobolev_loss_cutoff,
                             active_planes=active_planes,
-                            return_per_vol_loss=log_track_losses_wandb and efield_present)
+                            return_per_vol_loss=log_track_losses_wandb and efield_present,
+                            curl_penalty_fn=curl_penalty_fn)
                         for fn in fns:
                             out = fn(p)
                             jax.block_until_ready(out)
@@ -1502,15 +1606,30 @@ def main():
     else:
         _p_n_scalar = np.zeros((args.N, 0))
     if efield_present:
-        # MLP block: random hidden + zeroed output layer ⇒ the field starts at
-        # nominal (no distortion) yet has nonzero gradient so it can learn.
+        # SIREN block: random hidden + zeroed output layer ⇒ starts at nominal
+        # (no distortion) yet has nonzero gradient so it can learn.
         # Distinct seed per trial so trials explore different hidden features.
-        import tools.nonlocal_efield as _nl
+        from tools.sce_siren import init_siren
+        from jax.flatten_util import ravel_pytree
+
+        def _make_nominal_siren(key):
+            p = init_siren(key,
+                           hidden_features=efield_cfg.hidden_features,
+                           hidden_layers=efield_cfg.hidden_layers,
+                           omega_0=efield_cfg.omega_0)
+            p['weights'][-1] = jnp.zeros_like(p['weights'][-1])
+            p['biases'][-1]  = jnp.zeros_like(p['biases'][-1])
+            return p
+
         mlp_blocks = []
         for _t in range(args.N):
             _k = jax.random.PRNGKey(int(effective_seed) + 7919 + _t)
-            _ip = _nl.nominal_start_params(efield_cfg, _k)
-            _flat, _ = _nl.flatten_params(_ip)
+            _ip = _make_nominal_siren(_k)
+            if args.efield_per_volume:
+                _k2 = jax.random.PRNGKey(int(effective_seed) + 7919 + _t + 1_000_000)
+                _ip2 = _make_nominal_siren(_k2)
+                _ip = jax.tree.map(lambda a, b: jnp.stack([a, b], axis=0), _ip, _ip2)
+            _flat, _ = ravel_pytree(_ip)
             mlp_blocks.append(np.asarray(_flat, dtype=np.float64))
         _p_n_scalar = np.hstack([_p_n_scalar, np.stack(mlp_blocks)])
     p_n_starts    = _p_n_scalar.tolist()
@@ -1682,18 +1801,20 @@ def main():
         # Everything needed to reconstruct the learned field from a trial's
         # `final_p` (the trailing block after the scalar coords).
         result['efield'] = dict(
-            present       = True,
-            mode          = efield_cfg.mode,
-            hidden        = list(efield_cfg.hidden),
-            n_weights     = efield_n_mlp,
-            n_scalar      = n_scalar,
-            lr_mult       = args.efield_lr_mult,
-            per_volume    = args.efield_per_volume,
-            gt_map_path   = args.electric_dist_path,
-            center_cm     = list(efield_cfg.center_cm),
-            half_cm       = list(efield_cfg.half_cm),
-            bg_field_Vcm  = list(efield_cfg.bg_field_Vcm),
-            out_scale     = efield_cfg.out_scale,
+            present           = True,
+            mode              = 'siren',
+            hidden            = args.efield_hidden,
+            n_weights         = efield_n_mlp,
+            n_scalar          = n_scalar,
+            lr_mult           = args.efield_lr_mult,
+            per_volume        = args.efield_per_volume,
+            gt_map_path       = args.electric_dist_path,
+            omega_0           = efield_cfg.omega_0,
+            norm_offsets      = [float(v) for v in efield_cfg.norm_offsets],
+            norm_scales       = [float(v) for v in efield_cfg.norm_scales],
+            E0                = efield_cfg.E0,
+            v0                = efield_cfg.v0,
+            penalize_rotor    = args.penalize_rotor,
         )
     preemption_state['result'] = result
 
@@ -1759,6 +1880,7 @@ def main():
             rotating_phase_schedules=(_rotating_phase_schedules if _rotate_n > 0 else None),
             n_record_coords=(n_scalar if efield_present else None),
             mlp_snapshot_interval=(args.mlp_snapshot_interval if efield_present else 0),
+            aux_metrics_fn=_rotor_aux_fn,
         )
         all_trials.append(trial)
         result.pop('live_checkpoint', None)

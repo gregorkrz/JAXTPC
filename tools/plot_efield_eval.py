@@ -118,10 +118,20 @@ def _build_vol3d(step_snap, gt_data, grid):
     return out
 
 
+def _curl(efield, spacing_cm):
+    """Numerical curl ∇×E from (Nx,Ny,Nz,3) grid. Returns (Nx,Ny,Nz,3) in V/cm²."""
+    dx, dy, dz = float(spacing_cm[0]), float(spacing_cm[1]), float(spacing_cm[2])
+    Ex, Ey, Ez = efield[..., 0], efield[..., 1], efield[..., 2]
+    curl_x = np.gradient(Ez, dy, axis=1) - np.gradient(Ey, dz, axis=2)
+    curl_y = np.gradient(Ex, dz, axis=2) - np.gradient(Ez, dx, axis=0)
+    curl_z = np.gradient(Ey, dx, axis=0) - np.gradient(Ex, dy, axis=1)
+    return np.stack([curl_x, curl_y, curl_z], axis=-1)
+
+
 def _build_quantities(step_snap, gt_data, grid):
     """Return {side: {type: {component: qty_entry}}}.
 
-    Types: 'E-field', 'Corrections', 'Potential'.
+    Types: 'E-field', 'Corrections', 'Potential', 'Curl |∇×E|'.
     Each component entry has: has_gt, learned, gt, diff, reldiff, vmin, vmax.
     """
     sides = {}
@@ -172,6 +182,22 @@ def _build_quantities(step_snap, gt_data, grid):
                     'vmin_g': None,   'vmax_g': None,
                 }
             }
+
+        # ── Curl |∇×E| — zero for a physical (conservative) field ────────────
+        if 'efield_Vcm' in lrn:
+            sp = np.array(grid[side]['spacing_cm'], dtype=np.float64)
+            curl_l = _curl(np.array(lrn['efield_Vcm'], dtype=np.float64), sp).astype(np.float32)
+            curl_g = _curl(np.array(gt_side['efield_Vcm'], dtype=np.float64), sp).astype(np.float32) \
+                     if gt_side and 'efield_Vcm' in gt_side else None
+            grp = {}
+            for ci, name in enumerate(['(∇×E)_x', '(∇×E)_y', '(∇×E)_z']):
+                cl = curl_l[..., ci]
+                cg = curl_g[..., ci] if curl_g is not None else None
+                grp[name] = _qty(cl, cg, xs, ys, zs)
+            mag_l = np.linalg.norm(curl_l, axis=-1)
+            mag_g = np.linalg.norm(curl_g, axis=-1) if curl_g is not None else None
+            grp['|∇×E|'] = _qty(mag_l, mag_g, xs, ys, zs)
+            groups['Curl'] = grp
 
         sides[side] = groups
     return sides

@@ -65,6 +65,39 @@ def make_nparam_setter(param_names, gt_params, recomb_model):
     return setter, gt_vals, scales, p_n_gts
 
 
+def build_siren_config(sim, gt_params, hidden=(64, 64, 64), omega_0=5.0, T=89.0):
+    """Build a ``SirenDistortionConfig`` from simulator geometry and GT params.
+
+    The SIREN operates in volume-local coordinates (anode at x=0, x increasing
+    toward cathode, yz centered).  Normalization maps the local volume to [-1,1]³
+    so that the anode BC factor ``(x_norm+1)=0`` at x=0 is automatic.
+    """
+    from tools.sce_siren import drift_velocity_jax, build_vinv_table
+    from tools.distortion import SirenDistortionConfig
+    vol0 = sim._sim_config.volumes[0]
+    E0 = float(gt_params.recomb_params.field_strength_Vcm)
+    v0 = float(drift_velocity_jax(E0, T=T))
+    # Local frame: x ∈ [0, max_drift_cm]; yz centered at 0
+    half_x = float(vol0.max_drift_cm) / 2.0
+    (_, _), (ylo, yhi), (zlo, zhi) = vol0.ranges_cm
+    half_y = abs(yhi - ylo) / 2.0
+    half_z = abs(zhi - zlo) / 2.0
+    norm_offsets = jnp.array([half_x, 0.0, 0.0])
+    norm_scales  = jnp.array([max(half_x, 1e-6), max(half_y, 1e-6), max(half_z, 1e-6)])
+    v_table, E_table = build_vinv_table(T=T)
+    return SirenDistortionConfig(
+        omega_0=omega_0,
+        norm_offsets=norm_offsets,
+        norm_scales=norm_scales,
+        E0=E0,
+        v0=v0,
+        v_table=v_table,
+        E_table=E_table,
+        hidden_features=int(hidden[0]) if hidden else 64,
+        hidden_layers=len(hidden),
+    )
+
+
 def build_efield_config(sim, gt_params, mode='potential', hidden=(64, 64, 64)):
     """Build a local-frame ``FieldConfig`` for the MLP SCE model.
 

@@ -413,9 +413,11 @@ def load_sce_per_volume(h5_path=_DEFAULT_SCE_PATH, volumes=None):
                 efield = efield[::-1, :, :, :].copy()
                 corr = corr[::-1, :, :, :].copy()
 
-            # Transform vector x-components to local frame
+            # Transform vector x-components to local frame.
+            # E-field is a true vector component: Ex_west < 0 in world → +E0 in local.
+            # Drift correction Δx = v₀(t_actual−t_nominal) is a scalar drift distance
+            # (positive = longer apparent drift) for both volumes — no sign flip needed.
             efield[:, :, :, 0] *= -dd
-            corr[:, :, :, 0] *= -dd
 
             # Origin in local frame: x starts at 0, yz centered
             origin = np.array([

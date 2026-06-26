@@ -30,10 +30,9 @@ def parse_args(doc=None):
                    help='Path to the ground-truth SCE distortion map (.npz from '
                         'tools.efield_distortions, or .h5). Required when "Efield" is in --params: '
                         'the GT simulator runs WITH this distortion and the MLP learns to match it.')
-    p.add_argument('--efield-mode', default='potential',
-                   choices=('potential', 'efield', 'correction'),
-                   help='MLP parameterization for the Efield model (default: potential, '
-                        'i.e. conservative E=-grad(phi)).')
+    p.add_argument('--efield-mode', default='siren',
+                   help='Deprecated — ignored. The Efield model now always uses the '
+                        'SIREN Δ-field representation (tools/sce_siren.py).')
     p.add_argument('--efield-hidden', type=int, nargs='+', default=[64, 64, 64],
                    help='Hidden layer widths for the Efield MLP (default: 64 64 64).')
     p.add_argument('--efield-lr-mult', type=float, default=1.0,
@@ -42,6 +41,11 @@ def parse_args(doc=None):
     p.add_argument('--efield-per-volume', action='store_true', default=False,
                    help='Use separate MLP weights for each drift volume (east + west) '
                         'instead of one shared model. Doubles the MLP parameter count.')
+    p.add_argument('--penalize-rotor', type=float, default=0.0, metavar='W',
+                   help='Weight for the curl regulariser loss W * mean(|∇×E|) that '
+                        'penalises non-physical (non-conservative) learned fields. '
+                        'Evaluated on a fixed ~200-point interior grid of the local volume. '
+                        'Default 0 (disabled).')
     p.add_argument('--mlp-snapshot-interval', type=int, default=0,
                    help='Save the full MLP weight vector every N steps into mlp_trajectory '
                         '(0 = disabled, only final_p is saved). Useful for visualising '

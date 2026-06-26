@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Submit the higher-angle diagonal pivot (theta, alpha) study as a SINGLE Slurm job.
 
-Bundles the same 4 invocations as pivot_theta_alpha_landscape_diagonal.sh
-(diffusion_trans/long x clean/noisy) into one sbatch job that runs them
-sequentially on one GPU via s3df_submit_multi, instead of running locally.
+Bundles 2 invocations (diffusion_trans/long, noisy) into one sbatch job that
+runs them sequentially on one GPU via s3df_submit_multi.
 
 Tracks: 6 diagonal (theta, alpha) pivot tracks at 25/30/35/40/45/50 deg,
 continuing the 0/10/20 diagonal already covered by the local script.
+Noise seeds: 0–49 (50 seeds). ADC cutoffs: 0 and 50. Wire response ON.
 
 Usage (default is dry-run: writes the job script under jobs/ but does not
 call sbatch):
@@ -36,28 +36,27 @@ TRACKS = (
 
 OUT_DIR = "$RESULTS_DIR/1d_gradients/cutoff_loss_landscape_20260611_pivot_ta_diag"
 
+NOISY_SEEDS = list(range(50))
+
 COMMON = dict(
     tracks=TRACKS,
-    factors=[0.75, 1.0, 1.25],
+    N=100,
+    range_frac=0.2,
     step_size=1.0,
     max_deposits=5000,
     sobolev_max_pad=128,
     results_dir=OUT_DIR,
-    adc_cutoff=50,
+    adc_cutoffs=[0, 50],
     store_per_plane_loss=True,
-    store_per_pixel_loss_and_grad=True,
-    store_arrays=True,
-    save_per_factor=True,
+    store_per_pixel_loss_and_grad=False,
+    store_arrays=False,
 )
 
 
-def build_commands():
-    return [
-        make_gradient_command(param="diffusion_trans_cm2_us", noise_scale=0.0, noise_seed=42, **COMMON),
-        make_gradient_command(param="diffusion_long_cm2_us", noise_scale=0.0, noise_seed=42, **COMMON),
-        make_gradient_command(param="diffusion_trans_cm2_us", noise_scale=1.0, noise_seeds=[42, 43], **COMMON),
-        make_gradient_command(param="diffusion_long_cm2_us", noise_scale=1.0, noise_seeds=[42, 43], **COMMON),
-    ]
+JOBS = [
+    ("diffusion_trans_cm2_us", "pivot_ta_diag_high_trans"),
+    ("diffusion_long_cm2_us",  "pivot_ta_diag_high_long"),
+]
 
 
 if __name__ == "__main__":
@@ -70,13 +69,17 @@ if __name__ == "__main__":
     p.add_argument("--time", default="08:00:00")
     args = p.parse_args()
 
-    commands = build_commands()
-    print(f"bundling {len(commands)} invocations into a single Slurm job")
-    s3df_submit_multi(
-        commands,
-        job_label="pivot_ta_diag_high",
-        time=args.time,
-        submit=args.submit,
-        print_sbatch_command=args.print_sbatch_command,
-        mem_gb=64,
-    )
+    for param, job_label in JOBS:
+        cmd = make_gradient_command(param=param, noise_scale=1.0, noise_seeds=NOISY_SEEDS, **COMMON)
+        print(f"submitting job: {job_label}")
+        s3df_submit_multi(
+            [cmd],
+            job_label=job_label,
+            time=args.time,
+            submit=args.submit,
+            print_sbatch_command=args.print_sbatch_command,
+            mem_gb=64,
+            account="neutrino:default",
+            partition="ampere",
+            qos="preemptable",
+        )

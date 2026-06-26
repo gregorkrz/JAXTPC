@@ -71,7 +71,9 @@ def s3df_submit(command: str, *, time: str = "02:00:00", gpus: int = 1,
                 mem_gb: int = 32, cpus_per_gpu: int = 1, submit: bool = False,
                 print_sbatch_command: bool = False,
                 sbatch_commands_out: Optional[List[str]] = None,
-                dependency: Optional[str] = None) -> Optional[str]:
+                dependency: Optional[str] = None,
+                partition: str = PARTITION, qos: str = QOS,
+                account: str = ACCOUNT) -> Optional[str]:
     JOBS_DIR.mkdir(exist_ok=True)
 
     command = _ensure_python_opt_command(command)
@@ -90,9 +92,9 @@ def s3df_submit(command: str, *, time: str = "02:00:00", gpus: int = 1,
     script = "\n".join([
         "#!/bin/bash",
         f"#SBATCH --job-name={name}",
-        f"#SBATCH --account={ACCOUNT}",
-        f"#SBATCH --partition={PARTITION}",
-        f"#SBATCH --qos={QOS}",
+        f"#SBATCH --account={account}",
+        f"#SBATCH --partition={partition}",
+        f"#SBATCH --qos={qos}",
         f"#SBATCH --time={time}",
         f"#SBATCH --gpus={gpus}",
         f"#SBATCH --cpus-per-gpu={cpus_per_gpu}",
@@ -192,6 +194,9 @@ def s3df_submit_multi(
     sbatch_commands_out: Optional[List[str]] = None,
     log_progress: bool = False,
     dependency: Optional[str] = None,
+    partition: str = PARTITION,
+    qos: str = QOS,
+    account: str = ACCOUNT,
 ) -> Optional[str]:
     """Submit one Slurm job that runs *commands* sequentially on a single GPU.
 
@@ -239,9 +244,9 @@ def s3df_submit_multi(
     script = "\n".join([
         "#!/bin/bash",
         f"#SBATCH --job-name={name}",
-        f"#SBATCH --account={ACCOUNT}",
-        f"#SBATCH --partition={PARTITION}",
-        f"#SBATCH --qos={QOS}",
+        f"#SBATCH --account={account}",
+        f"#SBATCH --partition={partition}",
+        f"#SBATCH --qos={qos}",
         f"#SBATCH --time={time}",
         f"#SBATCH --gpus={gpus}",
         f"#SBATCH --cpus-per-gpu={cpus_per_gpu}",

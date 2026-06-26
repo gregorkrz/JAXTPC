@@ -670,80 +670,81 @@ def load_angle_pivot_nwr_bias_data(mode, cache_path=None, recompute=False):
     return result
 
 
-def _compute_theta_alpha_bias(mode, subdir, pivot, verbose=True):
+def _compute_theta_alpha_bias(mode, subdir, pivot, verbose=True, diagonal_only=False):
     """Compute argmin-factor bias over the θ×α grid.
 
     pivot=True  → track name includes _pivot_x1000
     pivot=False → track name is the plain theta/alpha variant
+    diagonal_only=True → only process pairs where theta == alpha
     """
     flat = {}
     n_found = n_miss = 0
     all_seeds = list(range(mode.all_seeds))
     thetas = mode.ta_pivot_thetas if pivot else mode.ta_thetas
     alphas = mode.ta_pivot_alphas if pivot else mode.ta_alphas
-    n_total = len(PARAMS) * len(ADC_CUTOFFS) * len(thetas) * len(alphas)
+    pairs = [(t, a) for t in thetas for a in alphas if not diagonal_only or t == a]
+    n_total = len(PARAMS) * len(ADC_CUTOFFS) * len(pairs)
     done = 0
 
     for param in PARAMS:
         for adc in ADC_CUTOFFS:
             if verbose:
                 print(f"  {param}  |  adc={adc}")
-            for theta in thetas:
-                for alpha in alphas:
-                    done += 1
-                    if pivot:
-                        track_name = (f"Muon_400MeV_theta_{theta}_alpha_{alpha}"
-                                      f"_pivot_x1000_stepsize_1mm")
+            for theta, alpha in pairs:
+                done += 1
+                if pivot:
+                    track_name = (f"Muon_400MeV_theta_{theta}_alpha_{alpha}"
+                                  f"_pivot_x1000_stepsize_1mm")
+                else:
+                    track_name = f"Muon_400MeV_theta_{theta}_alpha_{alpha}_stepsize_1mm"
+                seed_factors = []
+                plane_seed_factors = {}
+                for seed in all_seeds:
+                    sources = []  # list of (seed_label, d, factors, losses)
+                    path = _pkl_path(subdir, param, track_name, seed, adc)
+                    if os.path.exists(path):
+                        try:
+                            with open(path, "rb") as f:
+                                d = pickle.load(f)
+                            sources.append((seed, d, np.array(d["factors"]), np.array(d["loss_values"])))
+                        except (EOFError, pickle.UnpicklingError):
+                            pass
+                    # Extra bundled sources (e.g. ad-hoc local diagonal runs) accumulate
+                    # on top of the primary per-track pkl instead of only filling gaps —
+                    # the same (theta, alpha) may have been run multiple times.
+                    # The diagonal bundle was generated with wire response enabled, so
+                    # it must only feed the "full" (wire-response) bias, never NWR.
+                    if pivot and mode.name == "full":
+                        d = _load_diag_ta_pkl(param, seed, adc)
+                        if d is not None and track_name in d.get("per_track_loss_values", {}):
+                            sources.append((f"diag{seed}", d,
+                                            np.array(d["factors"]),
+                                            np.array(d["per_track_loss_values"][track_name])))
+                    if sources:
+                        for seed_label, d, factors, losses in sources:
+                            seed_factors.append((seed_label, float(factors[np.argmin(losses)])))
+                            for grp, gf in _plane_group_argmins(d).items():
+                                plane_seed_factors.setdefault(grp, []).append((seed_label, gf))
+                        n_found += len(sources)
                     else:
-                        track_name = f"Muon_400MeV_theta_{theta}_alpha_{alpha}_stepsize_1mm"
-                    seed_factors = []
-                    plane_seed_factors = {}
-                    for seed in all_seeds:
-                        sources = []  # list of (seed_label, d, factors, losses)
-                        path = _pkl_path(subdir, param, track_name, seed, adc)
-                        if os.path.exists(path):
-                            try:
-                                with open(path, "rb") as f:
-                                    d = pickle.load(f)
-                                sources.append((seed, d, np.array(d["factors"]), np.array(d["loss_values"])))
-                            except (EOFError, pickle.UnpicklingError):
-                                pass
-                        # Extra bundled sources (e.g. ad-hoc local diagonal runs) accumulate
-                        # on top of the primary per-track pkl instead of only filling gaps —
-                        # the same (theta, alpha) may have been run multiple times.
-                        # The diagonal bundle was generated with wire response enabled, so
-                        # it must only feed the "full" (wire-response) bias, never NWR.
-                        if pivot and mode.name == "full":
-                            d = _load_diag_ta_pkl(param, seed, adc)
-                            if d is not None and track_name in d.get("per_track_loss_values", {}):
-                                sources.append((f"diag{seed}", d,
-                                                np.array(d["factors"]),
-                                                np.array(d["per_track_loss_values"][track_name])))
-                        if sources:
-                            for seed_label, d, factors, losses in sources:
-                                seed_factors.append((seed_label, float(factors[np.argmin(losses)])))
-                                for grp, gf in _plane_group_argmins(d).items():
-                                    plane_seed_factors.setdefault(grp, []).append((seed_label, gf))
-                            n_found += len(sources)
-                        else:
-                            n_miss += 1
-                    if verbose:
-                        print(f"    θ={theta:+3d}° α={alpha:+3d}°  [{done:3d}/{n_total}]  "
-                              f"{len(seed_factors)}/{len(all_seeds)} seeds found")
-                    if seed_factors:
-                        arr = np.array([v for _, v in seed_factors])
-                        entry = {
-                            "mean":   float(arr.mean()),
-                            "std":    float(arr.std()),
-                            "n":      len(seed_factors),
-                            "vals": [[s, round(v, 6)] for s, v in seed_factors],
+                        n_miss += 1
+                if verbose:
+                    print(f"    θ={theta:+3d}° α={alpha:+3d}°  [{done:3d}/{n_total}]  "
+                          f"{len(seed_factors)}/{len(all_seeds)} seeds found")
+                if seed_factors:
+                    arr = np.array([v for _, v in seed_factors])
+                    entry = {
+                        "mean":   float(arr.mean()),
+                        "std":    float(arr.std()),
+                        "n":      len(seed_factors),
+                        "vals": [[s, round(v, 6)] for s, v in seed_factors],
+                    }
+                    if plane_seed_factors:
+                        entry["plane_vals"] = {
+                            grp: [[s, round(v, 6)] for s, v in psf]
+                            for grp, psf in plane_seed_factors.items()
                         }
-                        if plane_seed_factors:
-                            entry["plane_vals"] = {
-                                grp: [[s, round(v, 6)] for s, v in psf]
-                                for grp, psf in plane_seed_factors.items()
-                            }
-                        flat[f"{param}|{adc}|{theta}|{alpha}"] = entry
+                    flat[f"{param}|{adc}|{theta}|{alpha}"] = entry
 
     tag = "pivot-" if pivot else ""
     print(f"  Theta-alpha {tag}bias done: {n_found} pkls read, {n_miss} missing")
@@ -754,14 +755,24 @@ def _compute_theta_alpha_bias(mode, subdir, pivot, verbose=True):
     }
 
 
-def load_theta_alpha_bias_data(mode, pivot, cache_path=None, recompute=False):
+def load_theta_alpha_bias_data(mode, pivot, cache_path=None, recompute=False,
+                               diagonal_only=False):
     subdir = mode.theta_alpha_pivot_subdir if pivot else mode.theta_alpha_subdir
     tag = "pivot-" if pivot else ""
     if cache_path and not recompute and os.path.exists(cache_path):
         print(f"  Loading theta-alpha {tag}bias cache: {cache_path}")
         with open(cache_path, "rb") as f:
             return pickle.load(f)
-    result = _compute_theta_alpha_bias(mode, subdir, pivot, verbose=True)
+    existing = None
+    if diagonal_only and cache_path and os.path.exists(cache_path):
+        print(f"  Loading theta-alpha {tag}bias cache for diagonal merge: {cache_path}")
+        with open(cache_path, "rb") as f:
+            existing = pickle.load(f)
+    result = _compute_theta_alpha_bias(mode, subdir, pivot, verbose=True,
+                                       diagonal_only=diagonal_only)
+    if existing is not None:
+        existing["data"].update(result["data"])
+        result = existing
     if cache_path:
         Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
         with open(cache_path, "wb") as f:
@@ -773,7 +784,7 @@ def load_theta_alpha_bias_data(mode, pivot, cache_path=None, recompute=False):
 def build_data(mode, drift_bias_cache=None, angle_bias_cache=None,
                angle_pivot_bias_cache=None, angle_pivot_nwr_bias_cache=None,
                theta_alpha_bias_cache=None, theta_alpha_pivot_bias_cache=None,
-               recompute_bias=False):
+               recompute_bias=False, diagonal_only=False):
     startx_tracks = [
         f"{base}_startx_{x}_stepsize_1mm"
         for base, xs in mode.startx_tracks_def
@@ -856,10 +867,12 @@ def build_data(mode, drift_bias_cache=None, angle_bias_cache=None,
     if mode.include_theta_alpha:
         print(f"Theta-alpha bias (all {mode.all_seeds} seeds) …")
         result["theta_alpha_bias"] = load_theta_alpha_bias_data(
-            mode, pivot=False, cache_path=theta_alpha_bias_cache, recompute=recompute_bias)
+            mode, pivot=False, cache_path=theta_alpha_bias_cache, recompute=recompute_bias,
+            diagonal_only=diagonal_only)
         print(f"Theta-alpha pivot bias (all {mode.all_seeds} seeds) …")
         result["theta_alpha_pivot_bias"] = load_theta_alpha_bias_data(
-            mode, pivot=True, cache_path=theta_alpha_pivot_bias_cache, recompute=recompute_bias)
+            mode, pivot=True, cache_path=theta_alpha_pivot_bias_cache, recompute=recompute_bias,
+            diagonal_only=diagonal_only)
         nn_ta_subdir       = mode.theta_alpha_subdir       + "_nonoise"
         nn_ta_pivot_subdir = mode.theta_alpha_pivot_subdir + "_nonoise"
         print(f"No-noise θ×α bias …")
@@ -2998,6 +3011,9 @@ def parse_args():
                    help='Cache pkl for θ×α pivot bias (no_wire_response mode only)')
     p.add_argument('--recompute-bias', action='store_true',
                    help='Ignore existing bias cache and recompute from individual pkl files')
+    p.add_argument('--diagonal-only', action='store_true',
+                   help='When recomputing θ×α bias, only process diagonal pairs (theta==alpha) '
+                        'and merge into the existing cache; faster when only diagonal data changed')
     return p.parse_args()
 
 
@@ -3018,6 +3034,7 @@ def main():
             theta_alpha_bias_cache=_default_cache(mode_full, "theta_alpha"),
             theta_alpha_pivot_bias_cache=_default_cache(mode_full, "theta_alpha_pivot"),
             recompute_bias=args.recompute_bias,
+            diagonal_only=args.diagonal_only,
         )
         print("=== Building no_wire_response-mode data ===")
         studies_nwr = build_data(
@@ -3029,6 +3046,7 @@ def main():
             theta_alpha_bias_cache=_default_cache(mode_nwr, "theta_alpha"),
             theta_alpha_pivot_bias_cache=_default_cache(mode_nwr, "theta_alpha_pivot"),
             recompute_bias=args.recompute_bias,
+            diagonal_only=args.diagonal_only,
         )
         emit_combined_html(studies_full, studies_nwr, output)
         return
@@ -3047,6 +3065,7 @@ def main():
         theta_alpha_pivot_bias_cache=(args.theta_alpha_pivot_bias_cache
                                       or _default_cache(mode, "theta_alpha_pivot")),
         recompute_bias=args.recompute_bias,
+        diagonal_only=args.diagonal_only,
     )
     emit_html(studies, output, mode)
 

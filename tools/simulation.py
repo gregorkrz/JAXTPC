@@ -347,20 +347,38 @@ class DetectorSimulator:
 
         # ── SCE factory (local frame) ──
         if efield_model is not None:
-            # Differentiable MLP SCE — field computed from sim_params.sce_models.
-            # The static FieldConfig is captured here; only weights flow through
-            # SimParams, so jax.grad reaches them.
-            # When per_volume=True, vol_params is the slice of sce_models for this
-            # volume (stacked leading axis sliced by scan/vmap); otherwise None and
-            # the full sim_params.sce_models (shared across volumes) is used.
-            from tools import nonlocal_efield as _nl
-            def sce_factory(sim_params, vol_params=None, fcfg=efield_model, nf=_nominal_field):
+            # Differentiable SIREN SCE — Δ(r) computed from sim_params.sce_models
+            # ({'weights': [...], 'biases': [...]}) with static metadata from
+            # SirenDistortionConfig captured in the closure.
+            # When per_volume=True, vol_params is the per-volume slice of sce_models.
+            from tools.distortion import SirenDistortionConfig, siren_delta, _X_HAT
+            from tools.sce_siren import efield_from_dDdx
+            if not isinstance(efield_model, SirenDistortionConfig):
+                raise TypeError(
+                    f"efield_model must be a SirenDistortionConfig, got {type(efield_model)}. "
+                    "The old FieldConfig path (nonlocal_efield) is no longer supported; "
+                    "use build_siren_config() from optlib.params instead.")
+            _fp_meta = {
+                'omega_0': efield_model.omega_0,
+                'norm_offsets': efield_model.norm_offsets,
+                'norm_scales': efield_model.norm_scales,
+                'E0': efield_model.E0,
+                'v0': efield_model.v0,
+            }
+            _vt = efield_model.v_table
+            _Et = efield_model.E_table
+            def sce_factory(sim_params, vol_params=None,
+                            _m=_fp_meta, _vt=_vt, _Et=_Et, nf=_nominal_field):
                 mlp_params = vol_params if vol_params is not None else sim_params.sce_models
+                fp = {**mlp_params, **_m}
                 def _sce(positions_cm):
-                    efield_corr, drift_corr = _nl.sce_outputs(
-                        mlp_params, positions_cm, fcfg, nf)
-                    return SCEOutputs(efield_correction=efield_corr,
-                                      drift_corr_cm=drift_corr)
+                    xyz = jnp.nan_to_num(positions_cm, nan=0.0, posinf=0.0, neginf=0.0)
+                    delta = jax.vmap(lambda p: siren_delta(fp, p))(xyz)
+                    dDdx = jax.vmap(
+                        lambda p: jax.jvp(lambda q: siren_delta(fp, q), (p,), (_X_HAT,))[1]
+                    )(xyz)
+                    E = efield_from_dDdx(dDdx, fp['E0'], fp['v0'], _vt, _Et)
+                    return SCEOutputs(efield_correction=E / nf, drift_corr_cm=delta)
                 return _sce
         elif sce_per_volume is not None:
             # Real SCE — maps already in local frame from load_sce_per_volume.

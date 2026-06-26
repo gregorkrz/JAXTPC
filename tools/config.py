@@ -521,6 +521,13 @@ class SCEOutputs(NamedTuple):
     drift_corr_cm: jnp.ndarray     # (N, 3) drift corrections [dx, dy, dz] in cm
 
 
+class DistortionOutputs(NamedTuple):
+    """Outputs from the unified distortion interface (tools/distortion.py)."""
+    efield_correction: jnp.ndarray   # (N, 3) dimensionless, E_local / |E_nominal|
+    drift_time_corr_us: jnp.ndarray  # (N,) drift time correction in μs
+    drift_yz_corr_cm: jnp.ndarray    # (N, 2) transverse displacement [dy, dz] in cm
+
+
 class VolumeGeometry(NamedTuple):
     """Static geometry for one detector volume.
 
