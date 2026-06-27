@@ -202,6 +202,87 @@ def generate_toy_efield_map(
 
 
 # =========================================================================
+# Conservative (curl-free) E-field from scalar potential
+# =========================================================================
+
+def generate_conservative_efield_map(
+    half_x_cm,
+    half_y_cm,
+    half_z_cm,
+    nominal_field_Vcm,
+    grid_shape=(22, 22, 22),
+    epsilon_max=0.05,
+    epsilon_trans=0.02,
+):
+    """
+    Generate per-side E-field maps derived analytically from a scalar potential,
+    guaranteeing ∇×E = 0 exactly.
+
+    Potential (east side, x ∈ [-L, 0]):
+        φ = -E0·[x(1+ε_l) + ε_l·x²/L + ε_t·(x+L)/(2L)·(y²/hy + z²/hz)]
+
+    Potential (west side, x ∈ [0, +L]):
+        φ = E0·[x(1+ε_l) - ε_l·x²/L] - E0·ε_t·(L-x)/(2L)·(y²/hy + z²/hz)
+
+    Ey and Ez are identical to ``generate_toy_efield_map``.  Ex gains a small
+    O(ε_t) coupling correction ``E0·ε_t·(y²/(2hy) + z²/(2hz))/L`` that
+    cancels the curl.
+
+    Parameters and return value are identical to ``generate_toy_efield_map``.
+    """
+    Nx, Ny, Nz = grid_shape
+    E0 = nominal_field_Vcm
+    L = half_x_cm
+    hy = half_y_cm
+    hz = half_z_cm
+
+    y = np.linspace(-hy, hy, Ny)
+    z = np.linspace(-hz, hz, Nz)
+
+    spacing_yz = np.array([
+        2.0 * hy / max(Ny - 1, 1),
+        2.0 * hz / max(Nz - 1, 1),
+    ], dtype=np.float64)
+
+    # coupling correction shared by both sides (positive definite, small)
+    def _yz_correction(Y, Z):
+        return E0 * epsilon_trans * (Y**2 / (2.0 * hy) + Z**2 / (2.0 * hz)) / L
+
+    # ---- East side: x ∈ [-L, 0] ----
+    x_east = np.linspace(-L, 0, Nx)
+    XE, YE, ZE = np.meshgrid(x_east, y, z, indexing='ij')
+    frac_east = (XE + L) / L  # 0 at anode (-L), 1 at cathode (0)
+
+    east_efield = np.zeros((Nx, Ny, Nz, 3), dtype=np.float32)
+    east_efield[..., 0] = (E0 * (1.0 + epsilon_max * (2.0 * XE + L) / L)
+                           + _yz_correction(YE, ZE))
+    east_efield[..., 1] = E0 * epsilon_trans * (YE / hy) * frac_east
+    east_efield[..., 2] = E0 * epsilon_trans * (ZE / hz) * frac_east
+
+    east_origin = np.array([-L, -hy, -hz], dtype=np.float64)
+    east_spacing = np.array([L / max(Nx - 1, 1), spacing_yz[0], spacing_yz[1]], dtype=np.float64)
+
+    # ---- West side: x ∈ [0, +L] ----
+    x_west = np.linspace(0, L, Nx)
+    XW, YW, ZW = np.meshgrid(x_west, y, z, indexing='ij')
+    frac_west = (L - XW) / L  # 0 at anode (+L), 1 at cathode (0)
+
+    west_efield = np.zeros((Nx, Ny, Nz, 3), dtype=np.float32)
+    west_efield[..., 0] = (-E0 * (1.0 + epsilon_max * (-2.0 * XW + L) / L)
+                           - _yz_correction(YW, ZW))
+    west_efield[..., 1] = E0 * epsilon_trans * (YW / hy) * frac_west
+    west_efield[..., 2] = E0 * epsilon_trans * (ZW / hz) * frac_west
+
+    west_origin = np.array([0.0, -hy, -hz], dtype=np.float64)
+    west_spacing = np.array([L / max(Nx - 1, 1), spacing_yz[0], spacing_yz[1]], dtype=np.float64)
+
+    return (
+        (east_efield, east_origin, east_spacing),
+        (west_efield, west_origin, west_spacing),
+    )
+
+
+# =========================================================================
 # Path integration: E-field → drift corrections (single side)
 # =========================================================================
 
@@ -456,6 +537,13 @@ if __name__ == "__main__":
     parser.add_argument("--Nxo", type=int, default=41, help="Grid points in x per TPC side.")
     parser.add_argument("--Nyo", type=int, default=41, help="Grid points in y.")
     parser.add_argument("--Nzo", type=int, default=41, help="Grid points in z.")
+    parser.add_argument("--model", choices=["toy", "conservative"], default="toy",
+                        help="toy: ad-hoc transverse terms (has curl); "
+                             "conservative: derived from scalar potential (curl-free).")
+    parser.add_argument("--epsilon-max", type=float, default=0.05,
+                        help="Fractional longitudinal distortion amplitude.")
+    parser.add_argument("--epsilon-trans", type=float, default=0.02,
+                        help="Fractional transverse distortion amplitude.")
     parser.add_argument("--output", required=True, help="Output .npz path.")
     args = parser.parse_args()
 
@@ -470,12 +558,16 @@ if __name__ == "__main__":
     drift_velocity_cm_us = float(config["simulation"]["drift"]["velocity"]) / 10.0
 
     grid_shape = (args.Nxo, args.Nyo, args.Nzo)
-    print(f"[efield_distortions] detector={args.detector}  "
+    print(f"[efield_distortions] detector={args.detector}  model={args.model}  "
           f"half_x={half_x} cm  half_y={half_y} cm  half_z={half_z} cm  "
-          f"E0={nominal_field} V/cm  v_drift={drift_velocity_cm_us} cm/μs  grid={grid_shape}")
+          f"E0={nominal_field} V/cm  v_drift={drift_velocity_cm_us} cm/μs  grid={grid_shape}  "
+          f"ε_l={args.epsilon_max}  ε_t={args.epsilon_trans}")
 
-    (east_ef, east_orig, east_sp), (west_ef, west_orig, west_sp) = generate_toy_efield_map(
-        half_x, half_y, half_z, nominal_field, grid_shape=grid_shape)
+    gen_fn = generate_conservative_efield_map if args.model == "conservative" else generate_toy_efield_map
+    (east_ef, east_orig, east_sp), (west_ef, west_orig, west_sp) = gen_fn(
+        half_x, half_y, half_z, nominal_field, grid_shape=grid_shape,
+        epsilon_max=args.epsilon_max, epsilon_trans=args.epsilon_trans,
+    )
 
     print("[efield_distortions] computing drift corrections (east)...")
     east_corr = compute_drift_corrections(

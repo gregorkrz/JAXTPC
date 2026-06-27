@@ -129,7 +129,4 @@ if __name__ == "__main__":
             submit=args.submit,
             print_sbatch_command=args.print_sbatch_command,
             mem_gb=64,
-            account="neutrino:default",
-            partition="ampere",
-            qos="preemptable",
         )
