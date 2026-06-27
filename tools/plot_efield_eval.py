@@ -70,12 +70,19 @@ def _qty(cl, cg, xs, ys, zs):
     cr = _reldiff(cg, cl)
     vmin_l, vmax_l = _vminmax(None, cl)
     vmin_g, vmax_g = _vminmax(cg, None)
+    hist_reldiff = None
+    if cr is not None:
+        counts, edges = np.histogram(np.clip(cr.ravel(), -3.0, 3.0), bins=80)
+        hist_reldiff = {'counts': counts.tolist(),
+                        'edges':  edges[:-1].round(5).tolist(),
+                        'width':  round(float(edges[1] - edges[0]), 6)}
     return {
-        'has_gt':  cg is not None,
-        'learned': _slices(cl, xs, ys, zs),
-        'gt':      _slices(cg, xs, ys, zs) if cg is not None else None,
-        'diff':    _slices(cd, xs, ys, zs) if cd is not None else None,
-        'reldiff': _slices(cr, xs, ys, zs) if cr is not None else None,
+        'has_gt':       cg is not None,
+        'learned':      _slices(cl, xs, ys, zs),
+        'gt':           _slices(cg, xs, ys, zs) if cg is not None else None,
+        'diff':         _slices(cd, xs, ys, zs) if cd is not None else None,
+        'reldiff':      _slices(cr, xs, ys, zs) if cr is not None else None,
+        'hist_reldiff': hist_reldiff,
         'vmin_l': vmin_l, 'vmax_l': vmax_l,
         'vmin_g': vmin_g, 'vmax_g': vmax_g,
     }
@@ -99,22 +106,54 @@ def _corrections_3d_data(co_arr, xs, ys, zs, step=2):
     }
 
 
+def _efield_3d_data(ef_arr, xs, ys, zs, step=5):
+    """Return subsampled grid + E-field vectors for Plotly cone trace."""
+    ef = np.asarray(ef_arr, dtype=np.float32)
+    xs_s = np.array(xs)[::step]
+    ys_s = np.array(ys)[::step]
+    zs_s = np.array(zs)[::step]
+    ef_s = ef[::step, ::step, ::step]
+    XG, YG, ZG = np.meshgrid(xs_s, ys_s, zs_s, indexing='ij')
+    return {
+        'x': XG.ravel().round(2).tolist(),
+        'y': YG.ravel().round(2).tolist(),
+        'z': ZG.ravel().round(2).tolist(),
+        'u': ef_s[..., 0].ravel().round(4).tolist(),
+        'v': ef_s[..., 1].ravel().round(4).tolist(),
+        'w': ef_s[..., 2].ravel().round(4).tolist(),
+    }
+
+
 def _build_vol3d(step_snap, gt_data, grid):
-    """Return {side: {learned:…, gt:… or null}} for 3D scatter displays."""
+    """Return {side: {corr: {learned, gt}, efield: {learned, gt} or None}}."""
     out = {}
     for side in ('east', 'west'):
         lrn     = step_snap['learned'].get(side, {})
         gt_side = (gt_data or {}).get(side)
-        if 'corrections_cm' not in lrn:
+        if not lrn:
             out[side] = None
             continue
         xs, ys, zs = _axes(grid[side])
-        co_l = np.array(lrn['corrections_cm'])
-        co_g = np.array(gt_side['corrections_cm']) if gt_side else None
-        out[side] = {
-            'learned': _corrections_3d_data(co_l, xs, ys, zs),
-            'gt':      _corrections_3d_data(co_g, xs, ys, zs) if co_g is not None else None,
-        }
+        side_data = {}
+
+        if 'corrections_cm' in lrn:
+            co_l = np.array(lrn['corrections_cm'])
+            co_g = np.array(gt_side['corrections_cm']) if gt_side else None
+            side_data['corr'] = {
+                'learned': _corrections_3d_data(co_l, xs, ys, zs),
+                'gt':      _corrections_3d_data(co_g, xs, ys, zs) if co_g is not None else None,
+            }
+
+        if 'efield_Vcm' in lrn:
+            ef_l = np.array(lrn['efield_Vcm'])
+            ef_g = np.array(gt_side['efield_Vcm']) \
+                   if gt_side and 'efield_Vcm' in gt_side else None
+            side_data['efield'] = {
+                'learned': _efield_3d_data(ef_l, xs, ys, zs),
+                'gt':      _efield_3d_data(ef_g, xs, ys, zs) if ef_g is not None else None,
+            }
+
+        out[side] = side_data if side_data else None
     return out
 
 
@@ -209,7 +248,9 @@ def _run_label(source_pkl, meta):
     m = re.search(r'result_(\w+)$', stem)
     seed = m.group(1) if m else stem
     parent = Path(source_pkl).parent.name
-    return f"{mode} | seed {seed} | {parent[:50]}"
+    rotor = meta.get('penalize_rotor', 0.0) or 0.0
+    rotor_str = f' | rotor={rotor:g}' if rotor else ' | rotor=off'
+    return f"{mode} | seed {seed} | {parent[:40]}{rotor_str}"
 
 
 def load_eval_pkl(path):
@@ -269,6 +310,7 @@ h2  { margin: 0 0 10px; font-size: 16px; }
                color: #444; margin-bottom: 2px; }
 .panel-info  { text-align: center; font-size: 10px; color: #999;
                margin-bottom: 4px; min-height: 14px; }
+.sub-controls { display: flex; gap: 10px; align-items: flex-end; margin: 6px 0 6px; }
 </style>
 </head>
 <body>
@@ -306,8 +348,16 @@ h2  { margin: 0 0 10px; font-size: 16px; }
     </select>
   </div>
   <div class="cg">
-    <label>3D source</label>
-    <select id="src3d-sel" onchange="render3d()">
+    <label>3D corr source</label>
+    <select id="src3d-sel" onchange="renderCorr3d()">
+      <option value="learned">Learned</option>
+      <option value="gt">GT</option>
+      <option value="diff">GT − Learned</option>
+    </select>
+  </div>
+  <div class="cg">
+    <label>E-field 3D source</label>
+    <select id="src-ef3d-sel" onchange="renderEfield3d()">
       <option value="learned">Learned</option>
       <option value="gt">GT</option>
       <option value="diff">GT − Learned</option>
@@ -320,12 +370,16 @@ h2  { margin: 0 0 10px; font-size: 16px; }
   <div class="panel"><div class="panel-title">Difference (GT − learned)</div><div class="panel-info" id="diff-info"></div><div id="diff-div"></div></div>
   <div class="panel"><div class="panel-title">Relative diff ((GT − learned) / |GT|)</div><div class="panel-info" id="reldiff-info"></div><div id="reldiff-div"></div></div>
 </div>
+<div class="section-title">Relative diff distribution (full volume)</div>
+<div class="panel"><div id="hist-div"></div></div>
 <div class="section-title">3D drift corrections [cm]</div>
 <div class="plots-3d">
   <div class="panel"><div class="panel-title">Δx</div><div id="3d-dx"></div></div>
   <div class="panel"><div class="panel-title">Δy</div><div id="3d-dy"></div></div>
   <div class="panel"><div class="panel-title">Δz</div><div id="3d-dz"></div></div>
 </div>
+<div class="section-title">3D E-field vectors [V/cm]</div>
+<div class="panel"><div id="3d-ef"></div></div>
 <script>
 const DATA = /*DATA_PLACEHOLDER*/null/*END*/;
 
@@ -336,9 +390,10 @@ const LAYOUT_BASE = {
   plot_bgcolor:  '#fff',
 };
 const PLOTLY_CFG = {displayModeBar: false, responsive: false};
+const CFG3D = {displayModeBar: true, responsive: false,
+               modeBarButtonsToRemove: ['toImage','sendDataToCloud']};
 
 function sliceZRange(z2d) {
-  // Compute [min, max] from a 2D z array, adding tiny epsilon if flat.
   const flat = z2d.flat();
   let lo = Infinity, hi = -Infinity;
   for (const v of flat) { if (v < lo) lo = v; if (v > hi) hi = v; }
@@ -348,10 +403,7 @@ function sliceZRange(z2d) {
 }
 
 function heatTrace(sl, zmin, zmax, cs) {
-  // If caller didn't supply a range, derive it from the slice itself.
-  if (zmin === null || zmax === null) {
-    [zmin, zmax] = sliceZRange(sl.z);
-  }
+  if (zmin === null || zmax === null) [zmin, zmax] = sliceZRange(sl.z);
   return {
     type: 'heatmap', z: sl.z, x: sl.x, y: sl.y,
     colorscale: cs, zmin: zmin, zmax: zmax,
@@ -374,13 +426,10 @@ function noData(id) {
                    x:0.5, y:0.5, showarrow:false, font:{size:13, color:'#bbb'}}]
   }, PLOTLY_CFG);
 }
-
 function safeRange(vmin, vmax) {
-  // Plotly renders blank when zmin===zmax; return null to let it auto-scale.
   if (vmin === null || vmax === null || vmin === vmax) return [null, null];
   return [vmin, vmax];
 }
-
 function sliceInfo(infoId, sl) {
   const el = document.getElementById(infoId);
   if (!sl || !sl.z || sl.z.length === 0) { el.textContent = ''; return; }
@@ -388,20 +437,26 @@ function sliceInfo(infoId, sl) {
   const nz = sl.z.flat().filter(v => v !== 0 && v !== null).length;
   el.textContent = `${w}×${h} | ${nz.toLocaleString()} nonzero`;
 }
-
 function plotHeat(id, sl, zmin, zmax, cs, lyt) {
   Plotly.newPlot(id, [heatTrace(sl, zmin, zmax, cs)], lyt, PLOTLY_CFG);
 }
-
-function noData3d(id) {
+function noData3d(id, h=420) {
   Plotly.newPlot(id, [], {
-    ...LAYOUT_BASE, height: 400,
+    ...LAYOUT_BASE, height: h,
     annotations: [{text: 'not available', xref:'paper', yref:'paper',
                    x:0.5, y:0.5, showarrow:false, font:{size:13, color:'#bbb'}}]
   }, PLOTLY_CFG);
 }
 
-function render3d() {
+const SCENE_AXES = {
+  xaxis: {title: {text:'x [cm]', font:{size:10}}, tickfont:{size:9}},
+  yaxis: {title: {text:'y [cm]', font:{size:10}}, tickfont:{size:9}},
+  zaxis: {title: {text:'z [cm]', font:{size:10}}, tickfont:{size:9}},
+  aspectmode: 'data',
+};
+
+// ── Corrections 3D ────────────────────────────────────────────────────────────
+function renderCorr3d() {
   const ri   = +document.getElementById('run-sel').value;
   const si   = +document.getElementById('step-sel').value;
   const side = document.getElementById('side-sel').value;
@@ -409,12 +464,10 @@ function render3d() {
 
   const step = DATA[ri].steps[si];
   const vd   = step.vol3d && step.vol3d[side];
-  if (!vd) { ['3d-dx','3d-dy','3d-dz'].forEach(noData3d); return; }
+  const cd   = vd && vd.corr;
+  if (!cd || !cd.learned) { ['3d-dx','3d-dy','3d-dz'].forEach(id => noData3d(id)); return; }
 
-  const lrn = vd.learned;
-  const gt  = vd.gt;
-  if (!lrn) { ['3d-dx','3d-dy','3d-dz'].forEach(noData3d); return; }
-
+  const lrn = cd.learned, gt = cd.gt;
   const COMPS = [['dx','Δx [cm]','3d-dx'], ['dy','Δy [cm]','3d-dy'], ['dz','Δz [cm]','3d-dz']];
   for (const [key, title, pid] of COMPS) {
     let vals;
@@ -427,40 +480,133 @@ function render3d() {
     } else {
       vals = lrn[key];
     }
-
     const absMax = Math.max(...vals.map(Math.abs));
-    const cRange = absMax > 1e-6
-      ? {cmin: -absMax, cmax: absMax}
-      : {cmin: -1e-6, cmax: 1e-6};
-
-    const trace = {
+    const cRange = absMax > 1e-6 ? {cmin:-absMax, cmax:absMax} : {cmin:-1e-6, cmax:1e-6};
+    Plotly.newPlot(pid, [{
       type: 'scatter3d', mode: 'markers',
       x: lrn.x, y: lrn.y, z: lrn.z,
-      marker: {
-        size: 2.5, opacity: 0.85,
-        color: vals, colorscale: 'RdBu', reversescale: true,
-        ...cRange,
-        colorbar: {thickness: 12, len: 0.7, tickfont: {size: 9},
-                   title: {text: title, font: {size: 10}}},
-      },
-      hovertemplate: `x:%{x:.1f} y:%{y:.1f} z:%{z:.1f}<br>${title}:%{marker.color:.3f}<extra></extra>`,
-    };
-
-    Plotly.newPlot(pid, [trace], {
-      margin: {l: 0, r: 0, t: 4, b: 0},
-      height: 420,
-      paper_bgcolor: '#fff',
-      scene: {
-        xaxis: {title: {text:'x [cm]', font:{size:10}}, tickfont:{size:9}},
-        yaxis: {title: {text:'y [cm]', font:{size:10}}, tickfont:{size:9}},
-        zaxis: {title: {text:'z [cm]', font:{size:10}}, tickfont:{size:9}},
-        aspectmode: 'data',
-      },
-    }, {displayModeBar: true, responsive: false,
-        modeBarButtonsToRemove: ['toImage','sendDataToCloud']});
+      marker: {size:2.5, opacity:0.85, color:vals, colorscale:'RdBu', reversescale:true,
+               ...cRange,
+               colorbar:{thickness:12, len:0.7, tickfont:{size:9},
+                         title:{text:title, font:{size:10}}}},
+      hovertemplate:`x:%{x:.1f} y:%{y:.1f} z:%{z:.1f}<br>${title}:%{marker.color:.3f}<extra></extra>`,
+    }], {margin:{l:0,r:0,t:4,b:0}, height:420, paper_bgcolor:'#fff',
+         scene:SCENE_AXES}, CFG3D);
   }
 }
 
+// ── E-field 3D cones ─────────────────────────────────────────────────────────
+function renderEfield3d() {
+  const ri   = +document.getElementById('run-sel').value;
+  const si   = +document.getElementById('step-sel').value;
+  const side = document.getElementById('side-sel').value;
+  const src  = document.getElementById('src-ef3d-sel').value;
+
+  const step = DATA[ri].steps[si];
+  const vd   = step.vol3d && step.vol3d[side];
+  const efd  = vd && vd.efield;
+  if (!efd || !efd.learned) { noData3d('3d-ef', 500); return; }
+
+  const lrn = efd.learned, gt = efd.gt;
+  let u, v, w;
+  if (src === 'gt') {
+    if (!gt) { noData3d('3d-ef', 500); return; }
+    u = gt.u; v = gt.v; w = gt.w;
+  } else if (src === 'diff') {
+    if (!gt) { noData3d('3d-ef', 500); return; }
+    u = lrn.u.map((val, i) => gt.u[i] - val);
+    v = lrn.v.map((val, i) => gt.v[i] - val);
+    w = lrn.w.map((val, i) => gt.w[i] - val);
+  } else {
+    u = lrn.u; v = lrn.v; w = lrn.w;
+  }
+
+  const maxMag = Math.max(...u.map((_, i) => Math.sqrt(u[i]**2 + v[i]**2 + w[i]**2))) || 1;
+  Plotly.newPlot('3d-ef', [{
+    type: 'cone',
+    x: lrn.x, y: lrn.y, z: lrn.z,
+    u, v, w,
+    colorscale: 'Viridis',
+    sizemode: 'scaled',
+    sizeref: maxMag,
+    showscale: true,
+    colorbar: {thickness:12, len:0.7, tickfont:{size:9},
+               title:{text:'|E| [V/cm]', font:{size:10}}},
+    hovertemplate: 'x:%{x:.1f} y:%{y:.1f} z:%{z:.1f}<br>' +
+                   'E:(%{u:.3f},%{v:.3f},%{w:.3f})<extra></extra>',
+  }], {margin:{l:0,r:0,t:4,b:0}, height:520, paper_bgcolor:'#fff',
+       scene:SCENE_AXES}, CFG3D);
+}
+
+// ── Reldiff histogram ─────────────────────────────────────────────────────────
+function renderHist() {
+  const ri   = +document.getElementById('run-sel').value;
+  const si   = +document.getElementById('step-sel').value;
+  const side = document.getElementById('side-sel').value;
+  const type = document.getElementById('type-sel').value;
+  const comp = document.getElementById('comp-sel').value;
+
+  const step = DATA[ri].steps[si];
+  const grp  = (step.sides[side] || {})[type];
+  const qd   = grp ? grp[comp] : null;
+  const h    = qd && qd.hist_reldiff;
+  if (!h) { noData('hist-div'); return; }
+
+  Plotly.newPlot('hist-div', [{
+    type: 'bar',
+    x: h.edges,
+    y: h.counts,
+    width: Array(h.counts.length).fill(h.width * 0.92),
+    marker: {color: '#4477bb', line: {width: 0}},
+  }], {
+    margin: {l:60, r:20, t:6, b:50},
+    height: 210,
+    paper_bgcolor: '#fff',
+    plot_bgcolor: '#fff',
+    bargap: 0,
+    xaxis: {title: {text:'(GT − learned) / (|GT| + ε)', font:{size:11}}, tickfont:{size:10},
+            zeroline:true, zerolinecolor:'#e44', zerolinewidth:2},
+    yaxis: {title: {text:'count', font:{size:11}}, tickfont:{size:10}},
+  }, PLOTLY_CFG);
+}
+
+// ── URL query-string state ────────────────────────────────────────────────────
+function pushState() {
+  const g = id => document.getElementById(id).value;
+  const p = new URLSearchParams({
+    run:      g('run-sel'),
+    step:     g('step-sel'),
+    side:     g('side-sel'),
+    type:     g('type-sel'),
+    comp:     g('comp-sel'),
+    slice:    g('slice-sel'),
+    src3d:    g('src3d-sel'),
+    src_ef3d: g('src-ef3d-sel'),
+  });
+  history.replaceState(null, '', '?' + p.toString());
+}
+
+function restoreState() {
+  const p   = new URLSearchParams(location.search);
+  const set = (id, val) => {
+    if (!val) return;
+    const el = document.getElementById(id);
+    if ([...el.options].some(o => o.value === val)) el.value = val;
+  };
+  set('run-sel',  p.get('run'));
+  onRunChange(true);           // populate step + type selects without rendering
+  set('step-sel', p.get('step'));
+  set('side-sel', p.get('side'));
+  set('type-sel', p.get('type'));
+  onTypeChange(true);          // populate comp select without rendering
+  set('comp-sel',      p.get('comp'));
+  set('slice-sel',     p.get('slice'));
+  set('src3d-sel',     p.get('src3d'));
+  set('src-ef3d-sel',  p.get('src_ef3d'));
+  render();
+}
+
+// ── Main render ───────────────────────────────────────────────────────────────
 function render() {
   const ri   = +document.getElementById('run-sel').value;
   const si   = +document.getElementById('step-sel').value;
@@ -472,44 +618,51 @@ function render() {
   const step = DATA[ri].steps[si];
   const grp  = (step.sides[side] || {})[type];
   const qd   = grp ? grp[comp] : null;
-  if (!qd) { ['gt-div','lrn-div','diff-div','reldiff-div'].forEach(noData); return; }
+  if (!qd) {
+    ['gt-div','lrn-div','diff-div','reldiff-div'].forEach(noData);
+    noData('hist-div');
+  } else {
+    const {vmin_l, vmax_l, vmin_g, vmax_g} = qd;
+    const csFor = (lo, hi) => (lo !== null && lo < 0 && hi > 0) ? 'RdBu' : 'Viridis';
+    const [zlmin, zlmax] = safeRange(vmin_l, vmax_l);
+    const [zgmin, zgmax] = safeRange(vmin_g, vmax_g);
+    const slL = qd.learned[slk];
+    const lyt = axLayout(slL);
 
-  const {vmin_l, vmax_l, vmin_g, vmax_g} = qd;
-  const csFor = (lo, hi) => (lo !== null && lo < 0 && hi > 0) ? 'RdBu' : 'Viridis';
-  const [zlmin, zlmax] = safeRange(vmin_l, vmax_l);
-  const [zgmin, zgmax] = safeRange(vmin_g, vmax_g);
-  const slL = qd.learned[slk];
-  const lyt = axLayout(slL);
+    plotHeat('lrn-div', slL, zlmin, zlmax, csFor(vmin_l, vmax_l), lyt);
+    sliceInfo('lrn-info', slL);
 
-  plotHeat('lrn-div', slL, zlmin, zlmax, csFor(vmin_l, vmax_l), lyt);
-  sliceInfo('lrn-info', slL);
+    if (qd.has_gt && qd.gt) {
+      const slG = qd.gt[slk];
+      plotHeat('gt-div', slG, zgmin, zgmax, csFor(vmin_g, vmax_g), lyt);
+      sliceInfo('gt-info', slG);
+    } else { noData('gt-div'); document.getElementById('gt-info').textContent = ''; }
 
-  if (qd.has_gt && qd.gt) {
-    const slG = qd.gt[slk];
-    plotHeat('gt-div', slG, zgmin, zgmax, csFor(vmin_g, vmax_g), lyt);
-    sliceInfo('gt-info', slG);
-  } else { noData('gt-div'); document.getElementById('gt-info').textContent = ''; }
+    if (qd.has_gt && qd.diff) {
+      const slD = qd.diff[slk];
+      const dmax = Math.max(...slD.z.flat().map(v => Math.abs(v)));
+      const [dmin2, dmax2] = safeRange(-dmax, dmax);
+      plotHeat('diff-div', slD, dmin2, dmax2, 'RdBu', lyt);
+      sliceInfo('diff-info', slD);
+    } else { noData('diff-div'); document.getElementById('diff-info').textContent = ''; }
 
-  if (qd.has_gt && qd.diff) {
-    const slD = qd.diff[slk];
-    const dmax = Math.max(...slD.z.flat().map(v => Math.abs(v)));
-    const [dmin2, dmax2] = safeRange(-dmax, dmax);
-    plotHeat('diff-div', slD, dmin2, dmax2, 'RdBu', lyt);
-    sliceInfo('diff-info', slD);
-  } else { noData('diff-div'); document.getElementById('diff-info').textContent = ''; }
+    if (qd.has_gt && qd.reldiff) {
+      const slR = qd.reldiff[slk];
+      const rmax = Math.max(...slR.z.flat().map(v => Math.abs(v)));
+      const [rmin2, rmax2] = safeRange(-rmax, rmax);
+      plotHeat('reldiff-div', slR, rmin2, rmax2, 'RdBu', lyt);
+      sliceInfo('reldiff-info', slR);
+    } else { noData('reldiff-div'); document.getElementById('reldiff-info').textContent = ''; }
 
-  if (qd.has_gt && qd.reldiff) {
-    const slR = qd.reldiff[slk];
-    const rmax = Math.max(...slR.z.flat().map(v => Math.abs(v)));
-    const [rmin2, rmax2] = safeRange(-rmax, rmax);
-    plotHeat('reldiff-div', slR, rmin2, rmax2, 'RdBu', lyt);
-    sliceInfo('reldiff-info', slR);
-  } else { noData('reldiff-div'); document.getElementById('reldiff-info').textContent = ''; }
+    renderHist();
+  }
 
-  render3d();
+  renderCorr3d();
+  renderEfield3d();
+  pushState();
 }
 
-function onTypeChange() {
+function onTypeChange(noRender = false) {
   const ri   = +document.getElementById('run-sel').value;
   const si   = +document.getElementById('step-sel').value;
   const side = document.getElementById('side-sel').value;
@@ -520,19 +673,16 @@ function onTypeChange() {
   compSel.innerHTML = '';
   Object.keys(grp).forEach(c => {
     const o = document.createElement('option');
-    o.value = c; o.text = c;
-    compSel.appendChild(o);
+    o.value = c; o.text = c; compSel.appendChild(o);
   });
-  // preserve component selection if still valid
   if ([...compSel.options].some(o => o.value === prev)) compSel.value = prev;
-  render();
+  if (!noRender) render();
 }
 
-function onRunChange() {
+function onRunChange(noRender = false) {
   const ri  = +document.getElementById('run-sel').value;
   const run = DATA[ri];
 
-  // Steps — default to last
   const stepSel = document.getElementById('step-sel');
   stepSel.innerHTML = '';
   run.steps.forEach((s, i) => {
@@ -541,7 +691,6 @@ function onRunChange() {
   });
   stepSel.value = run.steps.length - 1;
 
-  // Types from first step, east side
   const types = Object.keys(run.steps[0].sides.east || {});
   const typeSel = document.getElementById('type-sel');
   typeSel.innerHTML = '';
@@ -550,7 +699,7 @@ function onRunChange() {
     o.value = t; o.text = t; typeSel.appendChild(o);
   });
 
-  onTypeChange();
+  if (!noRender) onTypeChange();
 }
 
 // Init
@@ -559,7 +708,7 @@ DATA.forEach((run, i) => {
   const o = document.createElement('option');
   o.value = i; o.text = run.label; runSel.appendChild(o);
 });
-onRunChange();
+restoreState();
 </script>
 </body>
 </html>
@@ -575,16 +724,16 @@ def main():
     )
     parser.add_argument('eval_pkls', nargs='*',
                         help='*_efield_eval.pkl files to include')
-    parser.add_argument('--results-dir', default=None,
-                        help='Scan recursively for *_efield_eval.pkl')
+    parser.add_argument('--results-dir', nargs='+', default=[], metavar='DIR',
+                        help='Scan recursively for *_efield_eval.pkl (repeatable)')
     parser.add_argument('--output', default='efield_eval.html',
                         help='Output HTML path (default: efield_eval.html)')
     args = parser.parse_args()
 
     pkls = list(args.eval_pkls)
-    if args.results_dir:
+    for rd in args.results_dir:
         pkls += sorted(glob.glob(
-            os.path.join(args.results_dir, '**', '*_efield_eval.pkl'),
+            os.path.join(rd, '**', '*_efield_eval.pkl'),
             recursive=True))
     pkls = sorted(set(pkls))
 

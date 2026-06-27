@@ -50,6 +50,16 @@ def parse_args(doc=None):
                    help='Save the full MLP weight vector every N steps into mlp_trajectory '
                         '(0 = disabled, only final_p is saved). Useful for visualising '
                         'how the learned field evolves during training.')
+    p.add_argument('--mlp-snapshot-steps', default='',
+                   help='Comma-separated list of steps at which to always snapshot the MLP '
+                        'weights, e.g. "0,50,100,200,400". Combines with '
+                        '--mlp-snapshot-interval: snapshot is taken when step is in this list '
+                        'OR when step %% interval == 0.')
+    p.add_argument('--efield-dropout-rate', type=float, default=0.0, metavar='P',
+                   help='DropConnect regularisation rate for SIREN MLP weights during '
+                        'training (0 = off). Each step, each MLP weight is independently '
+                        'zeroed with probability P (inverted-dropout scaling applied). '
+                        'Weights are never dropped during eval.')
     p.add_argument('--tracks', default='diagonal',
                    help='"+"-separated track presets or name:dx,dy,dz:mom_mev specs '
                         '("+" separates tracks, "," separates direction components). '

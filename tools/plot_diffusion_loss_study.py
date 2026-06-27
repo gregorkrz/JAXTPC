@@ -186,7 +186,7 @@ def _load_diag_ta_pkl(param, seed, adc_cutoff):
     """Load the bundled 6-track diagonal high-angle pkl (cached per call site)."""
     cutoff_tag = f"_cutoff{adc_cutoff:.3g}".replace(".", "p") if adc_cutoff > 0.0 else ""
     fname = (f"sobolev_loss_geomean_log1p_N100_range0p2_{param}"
-             f"_6tracks_noise1_seed{seed}{cutoff_tag}.pkl")
+             f"_6tracks_noise1_seed{seed}{cutoff_tag}_perplane.pkl")
     path = os.path.join(RESULTS_DIR, "1d_gradients", _DIAG_TA_SUBDIR, fname)
     if not os.path.exists(path):
         return None
@@ -784,7 +784,7 @@ def load_theta_alpha_bias_data(mode, pivot, cache_path=None, recompute=False,
 def build_data(mode, drift_bias_cache=None, angle_bias_cache=None,
                angle_pivot_bias_cache=None, angle_pivot_nwr_bias_cache=None,
                theta_alpha_bias_cache=None, theta_alpha_pivot_bias_cache=None,
-               recompute_bias=False, diagonal_only=False):
+               recompute_bias=False, diagonal_only=False, theta_alpha_only=False):
     startx_tracks = [
         f"{base}_startx_{x}_stepsize_1mm"
         for base, xs in mode.startx_tracks_def
@@ -819,10 +819,11 @@ def build_data(mode, drift_bias_cache=None, angle_bias_cache=None,
     nn_angle_data  = load_nonoise_landscape_data(nn_angle_subdir, angle_tracks)
 
     print(f"Drift bias (all {mode.all_seeds} seeds) …")
-    bias_data = load_bias_data(mode, cache_path=drift_bias_cache, recompute=recompute_bias)
+    bias_data = load_bias_data(mode, cache_path=drift_bias_cache,
+                               recompute=recompute_bias and not theta_alpha_only)
     print(f"Angle bias (all {mode.all_seeds} seeds) …")
     angle_bias_data = load_angle_bias_data(mode, cache_path=angle_bias_cache,
-                                           recompute=recompute_bias)
+                                           recompute=recompute_bias and not theta_alpha_only)
 
     # No-noise bias reference
     print(f"No-noise drift bias …")
@@ -851,7 +852,8 @@ def build_data(mode, drift_bias_cache=None, angle_bias_cache=None,
     if mode.include_angle_pivot:
         print(f"Angle-pivot bias (all {mode.all_seeds} seeds) …")
         result["angle_pivot_bias"] = load_angle_pivot_bias_data(
-            mode, cache_path=angle_pivot_bias_cache, recompute=recompute_bias)
+            mode, cache_path=angle_pivot_bias_cache,
+            recompute=recompute_bias and not theta_alpha_only)
         nn_pivot_subdir = mode.angle_pivot_subdir + "_nonoise"
         print(f"No-noise angle-pivot bias …")
         result["nonoise_angle_pivot_bias"] = compute_nonoise_angle_pivot_bias(
@@ -859,7 +861,8 @@ def build_data(mode, drift_bias_cache=None, angle_bias_cache=None,
     if mode.include_pivot_nwr:
         print(f"Angle-pivot NWR bias (all {mode.all_seeds} seeds) …")
         result["angle_pivot_nwr_bias"] = load_angle_pivot_nwr_bias_data(
-            mode, cache_path=angle_pivot_nwr_bias_cache, recompute=recompute_bias)
+            mode, cache_path=angle_pivot_nwr_bias_cache,
+            recompute=recompute_bias and not theta_alpha_only)
         nn_pivot_nwr_subdir = mode.angle_pivot_nwr_subdir + "_nonoise"
         print(f"No-noise angle-pivot-NWR bias …")
         result["nonoise_angle_pivot_nwr_bias"] = compute_nonoise_angle_pivot_bias(
@@ -3014,6 +3017,9 @@ def parse_args():
     p.add_argument('--diagonal-only', action='store_true',
                    help='When recomputing θ×α bias, only process diagonal pairs (theta==alpha) '
                         'and merge into the existing cache; faster when only diagonal data changed')
+    p.add_argument('--theta-alpha-only', action='store_true',
+                   help='With --recompute-bias, only recompute the θ×α (pivot) bias caches; '
+                        'all other bias caches (drift, angle, angle-pivot) are loaded from disk')
     return p.parse_args()
 
 
@@ -3035,6 +3041,7 @@ def main():
             theta_alpha_pivot_bias_cache=_default_cache(mode_full, "theta_alpha_pivot"),
             recompute_bias=args.recompute_bias,
             diagonal_only=args.diagonal_only,
+            theta_alpha_only=args.theta_alpha_only,
         )
         print("=== Building no_wire_response-mode data ===")
         studies_nwr = build_data(
@@ -3047,6 +3054,7 @@ def main():
             theta_alpha_pivot_bias_cache=_default_cache(mode_nwr, "theta_alpha_pivot"),
             recompute_bias=args.recompute_bias,
             diagonal_only=args.diagonal_only,
+            theta_alpha_only=args.theta_alpha_only,
         )
         emit_combined_html(studies_full, studies_nwr, output)
         return
@@ -3066,6 +3074,7 @@ def main():
                                       or _default_cache(mode, "theta_alpha_pivot")),
         recompute_bias=args.recompute_bias,
         diagonal_only=args.diagonal_only,
+        theta_alpha_only=args.theta_alpha_only,
     )
     emit_html(studies, output, mode)
 

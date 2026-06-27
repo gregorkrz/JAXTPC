@@ -93,9 +93,11 @@ TRACKS = [
     ("Muon_400MeV_theta90",  _angle_dir(90),   _ANGLE_ENERGY, _ANGLE_START),
     ("Muon_400MeV_pivot1000_theta10", _angle_dir(10), _ANGLE_ENERGY, _pivot_start(10)),
     ("Muon_400MeV_pivot1000_theta30", _angle_dir(30), _ANGLE_ENERGY, _pivot_start(30)),
+    ("Muon_400MeV_pivot1000_theta50", _angle_dir(50), _ANGLE_ENERGY, _pivot_start(50)),
     ("Muon_400MeV_pivot1000_theta90", _angle_dir(90), _ANGLE_ENERGY, _pivot_start(90)),
     ("Muon_400MeV_pivot1000_theta0_alpha30",  _angle_dir( 0, 30), _ANGLE_ENERGY, _pivot_start( 0, 30)),
     ("Muon_400MeV_pivot1000_theta20_alpha30", _angle_dir(20, 30), _ANGLE_ENERGY, _pivot_start(20, 30)),
+    ("Muon_400MeV_pivot1000_theta0_alpha50",  _angle_dir( 0, 50), _ANGLE_ENERGY, _pivot_start( 0, 50)),
 ]
 
 _LABELS = {
@@ -107,9 +109,11 @@ _LABELS = {
     "Muon_400MeV_theta90":      "400 MeV  θ=90° (transverse)",
     "Muon_400MeV_pivot1000_theta10": "400 MeV  pivot x=1000 mm  θ=10° (nearly along drift)",
     "Muon_400MeV_pivot1000_theta30": "400 MeV  pivot x=1000 mm  θ=30°",
+    "Muon_400MeV_pivot1000_theta50": "400 MeV  pivot x=1000 mm  θ=50°",
     "Muon_400MeV_pivot1000_theta90": "400 MeV  pivot x=1000 mm  θ=90° (transverse)",
     "Muon_400MeV_pivot1000_theta0_alpha30":  "400 MeV  pivot x=1000 mm  θ=0°  α=30°",
     "Muon_400MeV_pivot1000_theta20_alpha30": "400 MeV  pivot x=1000 mm  θ=20°  α=30°",
+    "Muon_400MeV_pivot1000_theta0_alpha50":  "400 MeV  pivot x=1000 mm  θ=0°  α=50°",
 }
 
 # Short labels used in the ADC retention legend
@@ -122,9 +126,11 @@ _SHORT_LABELS = {
     "Muon_400MeV_theta90":      "400 MeV θ=90°",
     "Muon_400MeV_pivot1000_theta10": "400 MeV piv1000 θ=10°",
     "Muon_400MeV_pivot1000_theta30": "400 MeV piv1000 θ=30°",
+    "Muon_400MeV_pivot1000_theta50": "400 MeV piv1000 θ=50°",
     "Muon_400MeV_pivot1000_theta90": "400 MeV piv1000 θ=90°",
     "Muon_400MeV_pivot1000_theta0_alpha30":  "400 MeV piv1000 θ=0° α=30°",
     "Muon_400MeV_pivot1000_theta20_alpha30": "400 MeV piv1000 θ=20° α=30°",
+    "Muon_400MeV_pivot1000_theta0_alpha50":  "400 MeV piv1000 θ=0° α=50°",
 }
 
 

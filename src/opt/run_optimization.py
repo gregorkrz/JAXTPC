@@ -465,6 +465,11 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
               rotating_phase_schedules=None,
               n_record_coords=None,
               mlp_snapshot_interval=0,
+              mlp_snapshot_steps=None,
+              efield_dropout_rate=0.0,
+              efield_n_scalar=0,
+              efield_n_mlp=0,
+              efield_dropout_seed=0,
               aux_metrics_fn=None):
     """Run one optimization trial from starting p_n vector p0 (any length).
 
@@ -545,8 +550,27 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
     param_traj = []
     loss_traj  = []
     grad_traj  = []
-    mlp_traj   = []   # [(step, flat_p)] snapshots; populated when mlp_snapshot_interval > 0
-    _mlp_snap  = int(mlp_snapshot_interval) if mlp_snapshot_interval and mlp_snapshot_interval > 0 else 0
+    mlp_traj   = []   # [(step, flat_p)] snapshots
+    _mlp_snap_interval = int(mlp_snapshot_interval) if mlp_snapshot_interval and mlp_snapshot_interval > 0 else 0
+    _mlp_snap_steps    = frozenset(
+        int(s.strip()) for s in (mlp_snapshot_steps or '').split(',') if s.strip()
+    )
+    _any_snaps = bool(_mlp_snap_interval or _mlp_snap_steps)
+
+    def _should_snap(step):
+        if step in _mlp_snap_steps:
+            return True
+        if _mlp_snap_interval and step % _mlp_snap_interval == 0:
+            return True
+        return False
+
+    # ── DropConnect setup ──────────────────────────────────────────────────────
+    _do_enabled = efield_dropout_rate > 0.0 and efield_n_mlp > 0
+    if _do_enabled:
+        _do_key   = jax.random.PRNGKey(efield_dropout_seed or 0)
+        _mlp_lo   = efield_n_scalar
+        _mlp_hi   = efield_n_scalar + efield_n_mlp
+        _do_scale = 1.0 / max(1.0 - float(efield_dropout_rate), 1e-9)
 
     _freeze_eps = 1e-30
 
@@ -626,7 +650,7 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
     param_traj.append(p[:n_rec].tolist())
     loss_traj.append(lv_init)
     grad_traj.append(gv_init[:n_rec].tolist())
-    if _mlp_snap:
+    if _any_snaps and _should_snap(start_step):
         mlp_traj.append((start_step, np.asarray(p).tolist()))
 
     # Skip initial W&B row when resuming — that step was already logged before checkpoint.
@@ -688,14 +712,28 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
             jax.block_until_ready((lv_new, gv_new))
         else:
             # Adam / SGD path
+            if _do_enabled:
+                # DropConnect: generate per-step mask once, shared across microbatches.
+                # Forward uses masked+scaled weights; gradient is zeroed for dropped weights.
+                _do_mask = jax.random.bernoulli(
+                    jax.random.fold_in(_do_key, step),
+                    1.0 - efield_dropout_rate, (_mlp_hi - _mlp_lo,),
+                ).astype(p.dtype)
+                _p_fwd = p.at[_mlp_lo:_mlp_hi].set(
+                    p[_mlp_lo:_mlp_hi] * _do_mask * _do_scale)
+            else:
+                _p_fwd = p
             for micro in range(eff_bs):
                 batch_idx = (step * eff_bs + micro) % len(batch_fns)
                 fn = batch_fns[batch_idx]
-                lv, gv, _ = _unpack_batch_fn_ret(fn(p))
+                lv, gv, _ = _unpack_batch_fn_ret(fn(_p_fwd))
                 #jax.block_until_ready((lv, gv))
                 gv_acc = gv_acc + gv
                 last_batch_idx = batch_idx
             gv = gv_acc / float(eff_bs)
+            if _do_enabled:
+                # Chain rule: ∂loss/∂p[mlp] = ∂loss/∂p_fwd[mlp] * mask * scale
+                gv = gv.at[_mlp_lo:_mlp_hi].mul(_do_mask * _do_scale)
             if freeze_enabled:
                 active = jnp.asarray(~frozen_np, dtype=jnp.float32)
                 gv = gv * active
@@ -711,7 +749,7 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
         param_traj.append(p[:n_rec].tolist())
         loss_traj.append(float(lv_new))
         grad_traj.append(gv_new[:n_rec].tolist())
-        if _mlp_snap and (step + 1) % _mlp_snap == 0:
+        if _any_snaps and _should_snap(step + 1):
             mlp_traj.append((step + 1, np.asarray(p).tolist()))
 
         _pt_extra = None
@@ -780,7 +818,7 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
             _wandb.log(_pt_extra, step=step + 1)
 
     # Ensure the final step is always included in mlp_traj (avoid duplicate if already there).
-    if _mlp_snap:
+    if _any_snaps:
         final_step = len(param_traj) - 1 + start_step
         if not mlp_traj or mlp_traj[-1][0] != final_step:
             mlp_traj.append((final_step, np.asarray(p).tolist()))
@@ -795,7 +833,7 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
         final_opt_state  = (_serialize_opt_state(opt_state) if opt_state is not None else None),
         final_p          = np.asarray(p).tolist(),  # full vector incl. any MLP block
     )
-    if _mlp_snap:
+    if _any_snaps:
         out['mlp_trajectory'] = mlp_traj  # list of (step, flat_p) pairs
     if freeze_enabled:
         out['frozen_mask_final'] = frozen_np.tolist()
@@ -1246,8 +1284,8 @@ def main():
 
     # ── Curl (rotor) regulariser ───────────────────────────────────────────────
     curl_penalty_fn = None
-    if efield_present and args.penalize_rotor > 0.0:
-        _curl_weight = args.penalize_rotor
+    _curl_base = None
+    if efield_present:
         _curl_base = make_curl_penalty_fn(
             efield_cfg, efield_unravel,
             n_scalar=len(param_names),
@@ -1255,17 +1293,20 @@ def main():
             vol=gt_sim._sim_config.volumes[0],
             per_volume=args.efield_per_volume,
         )
-        def curl_penalty_fn(p):
-            return _curl_weight * _curl_base(p)
-        print(f'Curl penalty  : weight={_curl_weight}  sample_pts≈200')
+        if args.penalize_rotor > 0.0:
+            _curl_weight = args.penalize_rotor
+            def curl_penalty_fn(p):
+                return _curl_weight * _curl_base(p)
+            print(f'Curl penalty  : weight={_curl_weight}  sample_pts≈200')
     _rotor_aux_fn = None
-    if curl_penalty_fn is not None:
-        _cw, _cb = _curl_weight, _curl_base
+    if _curl_base is not None:
+        _cw = args.penalize_rotor if args.penalize_rotor > 0.0 else 0.0
+        _cb = _curl_base
         def _rotor_aux_fn(p, total_loss):
             curl_raw = float(_cb(p))
             return {
                 'loss/rotor_unweighted': curl_raw,
-                'loss/sobolev': total_loss - _cw * curl_raw,
+                'loss/sobolev': total_loss - _cw * curl_raw,  # equals total_loss when _cw=0
             }
 
     if args.gt_param_multiplier != 1.0:
@@ -1880,6 +1921,11 @@ def main():
             rotating_phase_schedules=(_rotating_phase_schedules if _rotate_n > 0 else None),
             n_record_coords=(n_scalar if efield_present else None),
             mlp_snapshot_interval=(args.mlp_snapshot_interval if efield_present else 0),
+            mlp_snapshot_steps=(args.mlp_snapshot_steps if efield_present else ''),
+            efield_dropout_rate=(args.efield_dropout_rate if efield_present else 0.0),
+            efield_n_scalar=(n_scalar if efield_present else 0),
+            efield_n_mlp=(efield_n_mlp if efield_present else 0),
+            efield_dropout_seed=(args.seed or 0),
             aux_metrics_fn=_rotor_aux_fn,
         )
         all_trials.append(trial)
