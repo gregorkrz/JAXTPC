@@ -34,4 +34,11 @@ $PY tools/plot_efield_eval.py \
   --results-dir "$RESULTS_DIR_1" "$RESULTS_DIR_2" \
   --output "$OUT_HTML"
 
-echo "Viewer: $OUT_HTML"
+# ── Step 3: loss curves HTML (fetches from W&B) ───────────────────────────────
+LOSS_HTML="$PLOTS_DIR/opt/efield_siren_local/loss_curves.html"
+$PY tools/plot_loss_curves.py \
+  --results-dir "$RESULTS_DIR_1" "$RESULTS_DIR_2" \
+  --output "$LOSS_HTML"
+
+echo "Viewer:      $OUT_HTML"
+echo "Loss curves: $LOSS_HTML"

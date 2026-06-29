@@ -362,7 +362,12 @@ def main():
                              'ignoring mlp_trajectory even if present')
     args = parser.parse_args()
 
-    pkls = list(args.result_pkls)
+    pkls = []
+    for p in args.result_pkls:
+        if os.path.isdir(p):
+            pkls += sorted(glob.glob(os.path.join(p, '**', 'result_*.pkl'), recursive=True))
+        else:
+            pkls.append(p)
     if args.results_dir:
         pkls += sorted(glob.glob(
             os.path.join(args.results_dir, '**', 'result_*.pkl'), recursive=True))

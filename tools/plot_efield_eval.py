@@ -2,15 +2,16 @@
 """
 Generate an interactive HTML visualization from *_efield_eval.pkl files.
 
-Quantities are organized by type (E-field / Corrections / Potential) and
-component (Ex/Ey/Ez/|E|, dx/dy/dz/|d|, phi).  For potential and efield
-modes the corrections are derived from the learned E-field via Euler
-integration, so all three types are available regardless of MLP mode.
+Produces one small HTML index file + a '<stem>_data/' directory with per-run
+JS data files that are lazy-loaded when selected — keeping the HTML tiny even
+for large sweeps.
 
 Usage
 -----
   python tools/plot_efield_eval.py --results-dir $RESULTS_DIR/opt/E_debug
+  python tools/plot_efield_eval.py /path/to/sweep/dir --output out.html
   python tools/plot_efield_eval.py path/to/*_efield_eval.pkl --output out.html
+  python tools/plot_efield_eval.py --all-steps ...   # include full step history
 """
 import argparse
 import glob
@@ -22,6 +23,49 @@ import sys
 from pathlib import Path
 
 import numpy as np
+
+
+# ── Sweep parameter extraction ────────────────────────────────────────────────
+
+_PARAM_PATTERNS = [
+    ('sce_map',  r'/sce_maps_([^/]+)/'),
+    ('arch',     r'[/_]arch([\dx]+)[/_]'),
+    ('n_tracks', r'[/_](\d+)tracks[/_]'),
+    ('trk_seed', r'[/_]trk(\d+)[/_]'),
+    ('nn',       r'[/_]nn(\d+)[/_]'),
+    ('dropout',  r'[/_]do([\d.]+)[/_]'),
+    ('curl_w',   r'[/_]rot(-?[\d.]+)[/_]'),
+    ('N',        r'_N(\d+)_'),
+    ('noise',    r'[/_]noise([\d.]+)[/_]'),
+    ('steps',    r'_s(\d{4,})_'),
+    ('lr',       r'_lr([\d.e+-]+)_'),
+    ('seed',     r'/result_(\w+?)_efield_eval\.pkl$'),
+]
+
+_PARAM_LABELS = {
+    'sce_map':  'SCE map',
+    'arch':     'Architecture',
+    'n_tracks': 'N tracks',
+    'trk_seed': 'Track seed',
+    'nn':       'NN seed',
+    'dropout':  'Dropout',
+    'curl_w':   'Curl weight',
+    'N':        'N',
+    'noise':    'Noise',
+    'steps':    'Steps',
+    'lr':       'LR',
+    'seed':     'Seed',
+}
+
+
+def _parse_path_params(pkl_path):
+    s = str(pkl_path)
+    params = {}
+    for key, pat in _PARAM_PATTERNS:
+        m = re.search(pat, s)
+        if m:
+            params[key] = m.group(1)
+    return params
 
 
 # ── Data helpers ──────────────────────────────────────────────────────────────
@@ -88,7 +132,7 @@ def _qty(cl, cg, xs, ys, zs):
     }
 
 
-def _corrections_3d_data(co_arr, xs, ys, zs, step=2):
+def _corrections_3d_data(co_arr, xs, ys, zs, step=3):
     """Return subsampled grid + correction values for Plotly Scatter3d."""
     co = np.asarray(co_arr, dtype=np.float32)
     xs_s = np.array(xs)[::step]
@@ -168,11 +212,7 @@ def _curl(efield, spacing_cm):
 
 
 def _build_quantities(step_snap, gt_data, grid):
-    """Return {side: {type: {component: qty_entry}}}.
-
-    Types: 'E-field', 'Corrections', 'Potential', 'Curl |∇×E|'.
-    Each component entry has: has_gt, learned, gt, diff, reldiff, vmin, vmax.
-    """
+    """Return {side: {type: {component: qty_entry}}}."""
     sides = {}
     for side in ('east', 'west'):
         lrn = step_snap['learned'].get(side, {})
@@ -253,7 +293,7 @@ def _run_label(source_pkl, meta):
     return f"{mode} | seed {seed} | {parent[:40]}{rotor_str}"
 
 
-def load_eval_pkl(path):
+def load_eval_pkl(path, last_step_only=True):
     with open(path, 'rb') as f:
         ev = pickle.load(f)
     meta    = ev['efield_meta']
@@ -273,11 +313,15 @@ def load_eval_pkl(path):
         })
     if not steps_out:
         return None
+    if last_step_only:
+        steps_out = steps_out[-1:]
     return {
-        'label':      _run_label(ev['source_pkl'], meta),
-        'mode':       meta.get('mode', '?'),
-        'source_pkl': ev['source_pkl'],
-        'steps':      steps_out,
+        'label':       _run_label(ev['source_pkl'], meta),
+        'mode':        meta.get('mode', '?'),
+        'source_pkl':  ev['source_pkl'],
+        'params':      _parse_path_params(path),
+        'step_labels': [s['label'] for s in steps_out],
+        'steps':       steps_out,
     }
 
 
@@ -311,14 +355,24 @@ h2  { margin: 0 0 10px; font-size: 16px; }
 .panel-info  { text-align: center; font-size: 10px; color: #999;
                margin-bottom: 4px; min-height: 14px; }
 .sub-controls { display: flex; gap: 10px; align-items: flex-end; margin: 6px 0 6px; }
+#loading-ind { display:none; padding: 4px 12px; background: #fff3cd;
+               border: 1px solid #ffc107; border-radius: 5px;
+               font-size: 12px; align-self: center; }
 </style>
 </head>
 <body>
 <h2>E-field MLP evaluation</h2>
 <div class="controls">
+  <div id="filter-dropdowns" style="display:contents"></div>
   <div class="cg">
     <label>Run</label>
     <select id="run-sel" style="max-width:380px" onchange="onRunChange()"></select>
+  </div>
+  <div id="loading-ind">Loading…</div>
+  <div id="companion-btn-wrap" style="align-self:flex-end">
+    <button onclick="openCompanion()" style="background:#f0f7ff;border-color:#cce;color:#558">
+      Loss curves ↗
+    </button>
   </div>
   <div class="cg">
     <label>Step</label>
@@ -381,7 +435,36 @@ h2  { margin: 0 0 10px; font-size: 16px; }
 <div class="section-title">3D E-field vectors [V/cm]</div>
 <div class="panel"><div id="3d-ef"></div></div>
 <script>
-const DATA = /*DATA_PLACEHOLDER*/null/*END*/;
+const RUN_META     = /*RUN_META*/null/*END_RUN_META*/;
+const PARAM_KEYS   = /*PARAM_KEYS*/null/*END_PARAM_KEYS*/;
+const PARAM_LABELS = /*PARAM_LABELS*/null/*END_PARAM_LABELS*/;
+const COMPANION_URL = /*COMPANION_URL*/null/*END_COMPANION_URL*/;
+
+// Fixed type→component mapping (avoids needing data before populating selects)
+const TYPE_COMPS = {
+  'E-field':     ['Ex', 'Ey', 'Ez', '|E|'],
+  'Corrections': ['Δx', 'Δy', 'Δz', '|Δ|'],
+  'Curl':        ['(∇×E)_x', '(∇×E)_y', '(∇×E)_z', '|∇×E|'],
+  'Potential':   ['δφ'],
+};
+const TYPE_ORDER = ['E-field', 'Corrections', 'Curl', 'Potential'];
+
+const runCache = {};
+
+// ── Lazy loading ──────────────────────────────────────────────────────────────
+function loadRunData(ri) {
+  return new Promise((resolve) => {
+    if (runCache[ri]) { resolve(runCache[ri]); return; }
+    const meta = RUN_META[ri];
+    const key  = meta.data_key;
+    if (window[key]) { runCache[ri] = window[key]; resolve(runCache[ri]); return; }
+    const script = document.createElement('script');
+    script.src = meta.data_file;
+    script.onload  = () => { runCache[ri] = window[key]; resolve(runCache[ri]); };
+    script.onerror = () => resolve(null);
+    document.head.appendChild(script);
+  });
+}
 
 const LAYOUT_BASE = {
   margin: {l:60, r:20, t:10, b:55},
@@ -456,13 +539,16 @@ const SCENE_AXES = {
 };
 
 // ── Corrections 3D ────────────────────────────────────────────────────────────
-function renderCorr3d() {
+async function renderCorr3d() {
   const ri   = +document.getElementById('run-sel').value;
   const si   = +document.getElementById('step-sel').value;
   const side = document.getElementById('side-sel').value;
   const src  = document.getElementById('src3d-sel').value;
 
-  const step = DATA[ri].steps[si];
+  const runData = await loadRunData(ri);
+  if (!runData) { ['3d-dx','3d-dy','3d-dz'].forEach(id => noData3d(id)); return; }
+
+  const step = runData.steps[si];
   const vd   = step.vol3d && step.vol3d[side];
   const cd   = vd && vd.corr;
   if (!cd || !cd.learned) { ['3d-dx','3d-dy','3d-dz'].forEach(id => noData3d(id)); return; }
@@ -496,13 +582,16 @@ function renderCorr3d() {
 }
 
 // ── E-field 3D cones ─────────────────────────────────────────────────────────
-function renderEfield3d() {
+async function renderEfield3d() {
   const ri   = +document.getElementById('run-sel').value;
   const si   = +document.getElementById('step-sel').value;
   const side = document.getElementById('side-sel').value;
   const src  = document.getElementById('src-ef3d-sel').value;
 
-  const step = DATA[ri].steps[si];
+  const runData = await loadRunData(ri);
+  if (!runData) { noData3d('3d-ef', 500); return; }
+
+  const step = runData.steps[si];
   const vd   = step.vol3d && step.vol3d[side];
   const efd  = vd && vd.efield;
   if (!efd || !efd.learned) { noData3d('3d-ef', 500); return; }
@@ -539,14 +628,14 @@ function renderEfield3d() {
 }
 
 // ── Reldiff histogram ─────────────────────────────────────────────────────────
-function renderHist() {
-  const ri   = +document.getElementById('run-sel').value;
+async function renderHist(runData) {
   const si   = +document.getElementById('step-sel').value;
   const side = document.getElementById('side-sel').value;
   const type = document.getElementById('type-sel').value;
   const comp = document.getElementById('comp-sel').value;
 
-  const step = DATA[ri].steps[si];
+  if (!runData) { noData('hist-div'); return; }
+  const step = runData.steps[si];
   const grp  = (step.sides[side] || {})[type];
   const qd   = grp ? grp[comp] : null;
   const h    = qd && qd.hist_reldiff;
@@ -570,9 +659,75 @@ function renderHist() {
   }, PLOTLY_CFG);
 }
 
+// ── Companion cross-link ──────────────────────────────────────────────────────
+function openCompanion() {
+  if (!COMPANION_URL) return;
+  const ri   = +document.getElementById('run-sel').value;
+  const meta = RUN_META[ri];
+  if (!meta) return;
+  const p = new URLSearchParams();
+  for (const [k, v] of Object.entries(meta.params || {})) {
+    if (v != null) p.set('f_' + k, v);
+  }
+  window.open(COMPANION_URL + '?' + p.toString(), '_blank');
+}
+
+// ── Parameter filter dropdowns ────────────────────────────────────────────────
+function buildFilterDropdowns() {
+  const container = document.getElementById('filter-dropdowns');
+  container.innerHTML = '';
+  for (const key of PARAM_KEYS) {
+    const label = PARAM_LABELS[key] || key;
+    const vals = [...new Set(RUN_META.map(r => (r.params || {})[key]).filter(v => v !== undefined))];
+    if (vals.length < 2) continue;
+    const allNum = vals.every(v => !isNaN(v));
+    vals.sort(allNum ? (a, b) => +a - +b : (a, b) => a.localeCompare(b));
+    const div = document.createElement('div');
+    div.className = 'cg';
+    div.innerHTML = `<label>${label}</label>`;
+    const sel = document.createElement('select');
+    sel.id = 'filter-' + key;
+    sel.onchange = () => filterRuns();
+    const allOpt = document.createElement('option');
+    allOpt.value = '__all__'; allOpt.text = 'All';
+    sel.appendChild(allOpt);
+    for (const v of vals) {
+      const o = document.createElement('option');
+      o.value = v; o.text = v; sel.appendChild(o);
+    }
+    div.appendChild(sel);
+    container.appendChild(div);
+  }
+}
+
+function getFilteredRunIndices() {
+  return RUN_META.map((_, i) => i).filter(i => {
+    const params = RUN_META[i].params || {};
+    return PARAM_KEYS.every(key => {
+      const el = document.getElementById('filter-' + key);
+      if (!el) return true;
+      const val = el.value;
+      return val === '__all__' || (params[key] ?? '__missing__') === val;
+    });
+  });
+}
+
+function filterRuns(noRender = false) {
+  const indices = getFilteredRunIndices();
+  const runSel = document.getElementById('run-sel');
+  const prev = runSel.value;
+  runSel.innerHTML = '';
+  for (const i of indices) {
+    const o = document.createElement('option');
+    o.value = i; o.text = RUN_META[i].label; runSel.appendChild(o);
+  }
+  if ([...runSel.options].some(o => o.value === prev)) runSel.value = prev;
+  if (!noRender) onRunChange();
+}
+
 // ── URL query-string state ────────────────────────────────────────────────────
 function pushState() {
-  const g = id => document.getElementById(id).value;
+  const g = id => document.getElementById(id)?.value;
   const p = new URLSearchParams({
     run:      g('run-sel'),
     step:     g('step-sel'),
@@ -583,6 +738,10 @@ function pushState() {
     src3d:    g('src3d-sel'),
     src_ef3d: g('src-ef3d-sel'),
   });
+  for (const key of PARAM_KEYS) {
+    const val = g('filter-' + key);
+    if (val) p.set('f_' + key, val);
+  }
   history.replaceState(null, '', '?' + p.toString());
 }
 
@@ -591,14 +750,16 @@ function restoreState() {
   const set = (id, val) => {
     if (!val) return;
     const el = document.getElementById(id);
-    if ([...el.options].some(o => o.value === val)) el.value = val;
+    if (el && [...el.options].some(o => o.value === val)) el.value = val;
   };
+  for (const key of PARAM_KEYS) set('filter-' + key, p.get('f_' + key));
+  filterRuns(true);
   set('run-sel',  p.get('run'));
-  onRunChange(true);           // populate step + type selects without rendering
+  onRunChange(true);
   set('step-sel', p.get('step'));
   set('side-sel', p.get('side'));
   set('type-sel', p.get('type'));
-  onTypeChange(true);          // populate comp select without rendering
+  onTypeChange(true);
   set('comp-sel',      p.get('comp'));
   set('slice-sel',     p.get('slice'));
   set('src3d-sel',     p.get('src3d'));
@@ -607,7 +768,7 @@ function restoreState() {
 }
 
 // ── Main render ───────────────────────────────────────────────────────────────
-function render() {
+async function render() {
   const ri   = +document.getElementById('run-sel').value;
   const si   = +document.getElementById('step-sel').value;
   const side = document.getElementById('side-sel').value;
@@ -615,12 +776,22 @@ function render() {
   const comp = document.getElementById('comp-sel').value;
   const slk  = document.getElementById('slice-sel').value;
 
-  const step = DATA[ri].steps[si];
+  document.getElementById('loading-ind').style.display = 'block';
+  const runData = await loadRunData(ri);
+  document.getElementById('loading-ind').style.display = 'none';
+
+  if (!runData) {
+    ['gt-div','lrn-div','diff-div','reldiff-div'].forEach(noData);
+    await renderHist(null);
+    return;
+  }
+
+  const step = runData.steps[si];
   const grp  = (step.sides[side] || {})[type];
   const qd   = grp ? grp[comp] : null;
   if (!qd) {
     ['gt-div','lrn-div','diff-div','reldiff-div'].forEach(noData);
-    noData('hist-div');
+    await renderHist(null);
   } else {
     const {vmin_l, vmax_l, vmin_g, vmax_g} = qd;
     const csFor = (lo, hi) => (lo !== null && lo < 0 && hi > 0) ? 'RdBu' : 'Viridis';
@@ -654,7 +825,7 @@ function render() {
       sliceInfo('reldiff-info', slR);
     } else { noData('reldiff-div'); document.getElementById('reldiff-info').textContent = ''; }
 
-    renderHist();
+    await renderHist(runData);
   }
 
   renderCorr3d();
@@ -663,15 +834,12 @@ function render() {
 }
 
 function onTypeChange(noRender = false) {
-  const ri   = +document.getElementById('run-sel').value;
-  const si   = +document.getElementById('step-sel').value;
-  const side = document.getElementById('side-sel').value;
-  const type = document.getElementById('type-sel').value;
-  const grp  = (DATA[ri].steps[si].sides[side] || {})[type] || {};
+  const type    = document.getElementById('type-sel').value;
+  const comps   = TYPE_COMPS[type] || [];
   const compSel = document.getElementById('comp-sel');
-  const prev = compSel.value;
+  const prev    = compSel.value;
   compSel.innerHTML = '';
-  Object.keys(grp).forEach(c => {
+  comps.forEach(c => {
     const o = document.createElement('option');
     o.value = c; o.text = c; compSel.appendChild(o);
   });
@@ -680,34 +848,32 @@ function onTypeChange(noRender = false) {
 }
 
 function onRunChange(noRender = false) {
-  const ri  = +document.getElementById('run-sel').value;
-  const run = DATA[ri];
+  const ri   = +document.getElementById('run-sel').value;
+  const meta = RUN_META[ri];
+  if (!meta) return;
 
   const stepSel = document.getElementById('step-sel');
   stepSel.innerHTML = '';
-  run.steps.forEach((s, i) => {
+  (meta.step_labels || []).forEach((lbl, i) => {
     const o = document.createElement('option');
-    o.value = i; o.text = s.label; stepSel.appendChild(o);
+    o.value = i; o.text = lbl; stepSel.appendChild(o);
   });
-  stepSel.value = run.steps.length - 1;
+  stepSel.value = (meta.step_labels || []).length - 1;
 
-  const types = Object.keys(run.steps[0].sides.east || {});
   const typeSel = document.getElementById('type-sel');
+  const prevType = typeSel.value;
   typeSel.innerHTML = '';
-  types.forEach(t => {
+  TYPE_ORDER.forEach(t => {
     const o = document.createElement('option');
     o.value = t; o.text = t; typeSel.appendChild(o);
   });
+  if ([...typeSel.options].some(o => o.value === prevType)) typeSel.value = prevType;
 
   if (!noRender) onTypeChange();
 }
 
 // Init
-const runSel = document.getElementById('run-sel');
-DATA.forEach((run, i) => {
-  const o = document.createElement('option');
-  o.value = i; o.text = run.label; runSel.appendChild(o);
-});
+buildFilterDropdowns();
 restoreState();
 </script>
 </body>
@@ -723,14 +889,21 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument('eval_pkls', nargs='*',
-                        help='*_efield_eval.pkl files to include')
+                        help='*_efield_eval.pkl files or directories to include')
     parser.add_argument('--results-dir', nargs='+', default=[], metavar='DIR',
                         help='Scan recursively for *_efield_eval.pkl (repeatable)')
     parser.add_argument('--output', default='efield_eval.html',
                         help='Output HTML path (default: efield_eval.html)')
+    parser.add_argument('--all-steps', action='store_true',
+                        help='Include full step history (default: last step only)')
     args = parser.parse_args()
 
-    pkls = list(args.eval_pkls)
+    pkls = []
+    for p in args.eval_pkls:
+        if os.path.isdir(p):
+            pkls += sorted(glob.glob(os.path.join(p, '**', '*_efield_eval.pkl'), recursive=True))
+        else:
+            pkls.append(p)
     for rd in args.results_dir:
         pkls += sorted(glob.glob(
             os.path.join(rd, '**', '*_efield_eval.pkl'),
@@ -740,11 +913,12 @@ def main():
     if not pkls:
         sys.exit('No *_efield_eval.pkl files found.')
 
+    last_step_only = not args.all_steps
     runs = []
     for p in pkls:
         print(f'Loading {p}')
         try:
-            run = load_eval_pkl(p)
+            run = load_eval_pkl(p, last_step_only=last_step_only)
             if run is None:
                 print(f'  [skip] no usable data')
             else:
@@ -758,12 +932,57 @@ def main():
     if not runs:
         sys.exit('Nothing to plot.')
 
-    json_data = json.dumps(runs, separators=(',', ':'))
-    html = _HTML.replace('/*DATA_PLACEHOLDER*/null/*END*/', json_data)
-
+    # ── Write per-run JS data files ───────────────────────────────────────────
     out = Path(args.output)
+    data_dir = out.parent / (out.stem + '_data')
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    run_meta = []
+    for i, run in enumerate(runs):
+        data_key  = f'__EFIELD_DATA_{i}__'
+        data_file = f'{out.stem}_data/run_{i}.js'
+        data_path = out.parent / f'{out.stem}_data' / f'run_{i}.js'
+        run_data  = {'steps': run['steps']}
+        data_path.write_text(
+            f'window.{data_key}=' + json.dumps(run_data, separators=(',', ':')) + ';',
+            encoding='utf-8',
+        )
+        run_meta.append({
+            'label':       run['label'],
+            'mode':        run['mode'],
+            'params':      run['params'],
+            'step_labels': run['step_labels'],
+            'data_file':   data_file,
+            'data_key':    data_key,
+        })
+
+    # ── Compute param filter keys ─────────────────────────────────────────────
+    param_values: dict = {}
+    for rm in run_meta:
+        for k, v in (rm.get('params') or {}).items():
+            param_values.setdefault(k, set()).add(v)
+    param_keys = [k for k, _ in _PARAM_PATTERNS
+                  if k in param_values and len(param_values[k]) > 1]
+    param_labels_used = {k: _PARAM_LABELS.get(k, k) for k in param_keys}
+    print(f'Filter dropdowns: {param_keys}')
+
+    # ── Write HTML ────────────────────────────────────────────────────────────
+    companion_url = 'loss_curves.html'
+
+    html = _HTML
+    html = html.replace('/*RUN_META*/null/*END_RUN_META*/',
+                        json.dumps(run_meta, separators=(',', ':')))
+    html = html.replace('/*PARAM_KEYS*/null/*END_PARAM_KEYS*/',
+                        json.dumps(param_keys))
+    html = html.replace('/*PARAM_LABELS*/null/*END_PARAM_LABELS*/',
+                        json.dumps(param_labels_used))
+    html = html.replace('/*COMPANION_URL*/null/*END_COMPANION_URL*/',
+                        json.dumps(companion_url))
+
     out.write_text(html, encoding='utf-8')
+    total_kb = sum((data_dir / f'run_{i}.js').stat().st_size for i in range(len(runs))) // 1024
     print(f'\nWrote {out}  ({out.stat().st_size / 1024:.0f} KB)')
+    print(f'Data: {data_dir}/  ({len(runs)} files, {total_kb} KB total)')
 
 
 if __name__ == '__main__':
