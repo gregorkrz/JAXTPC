@@ -6,5 +6,5 @@ results/
 tools/data
 *.txt
 .claude
-jobs/
+/jobs/
 wandb
