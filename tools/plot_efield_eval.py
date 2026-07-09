@@ -28,6 +28,7 @@ import numpy as np
 # ── Sweep parameter extraction ────────────────────────────────────────────────
 
 _PARAM_PATTERNS = [
+    ('sweep',    r'/efield_calib/([^/]+)/'),
     ('sce_map',  r'/sce_maps_([^/]+)/'),
     ('arch',     r'[/_]arch([\dx]+)[/_]'),
     ('n_tracks', r'[/_](\d+)tracks[/_]'),
@@ -39,10 +40,12 @@ _PARAM_PATTERNS = [
     ('noise',    r'[/_]noise([\d.]+)[/_]'),
     ('steps',    r'_s(\d{4,})_'),
     ('lr',       r'_lr([\d.e+-]+)_'),
+    ('t_range',  r'[/_]ke([\d.]+-[\d.]+)[/_]'),
     ('seed',     r'/result_(\w+?)_efield_eval\.pkl$'),
 ]
 
 _PARAM_LABELS = {
+    'sweep':    'Sweep',
     'sce_map':  'SCE map',
     'arch':     'Architecture',
     'n_tracks': 'N tracks',
@@ -54,8 +57,15 @@ _PARAM_LABELS = {
     'noise':    'Noise',
     'steps':    'Steps',
     'lr':       'LR',
+    't_range':  'T range (MeV)',
     'seed':     'Seed',
 }
+
+# Default kinetic-energy range for sweeps that don't encode it in their path
+# (e.g. conservative_curl_sweep, predating the ke{lo}-{hi} directory convention
+# used by 100_tracks_sweep/1k_tracks_sweep) — matches run_optimization.py's
+# --track-energy-range-mev default.
+_DEFAULT_T_RANGE = '100-1000'
 
 
 def _parse_path_params(pkl_path):
@@ -65,6 +75,7 @@ def _parse_path_params(pkl_path):
         m = re.search(pat, s)
         if m:
             params[key] = m.group(1)
+    params.setdefault('t_range', _DEFAULT_T_RANGE)
     return params
 
 
@@ -315,13 +326,25 @@ def load_eval_pkl(path, last_step_only=True):
         return None
     if last_step_only:
         steps_out = steps_out[-1:]
+
+    wandb_run_id = None
+    try:
+        src_pkl = ev.get('source_pkl')
+        if src_pkl and os.path.exists(src_pkl):
+            with open(src_pkl, 'rb') as f2:
+                src = pickle.load(f2)
+            wandb_run_id = src.get('wandb_run_id')
+    except Exception:
+        pass
+
     return {
-        'label':       _run_label(ev['source_pkl'], meta),
-        'mode':        meta.get('mode', '?'),
-        'source_pkl':  ev['source_pkl'],
-        'params':      _parse_path_params(path),
-        'step_labels': [s['label'] for s in steps_out],
-        'steps':       steps_out,
+        'label':         _run_label(ev['source_pkl'], meta),
+        'mode':          meta.get('mode', '?'),
+        'source_pkl':    ev['source_pkl'],
+        'params':        _parse_path_params(path),
+        'step_labels':   [s['label'] for s in steps_out],
+        'steps':         steps_out,
+        'wandb_run_id':  wandb_run_id,
     }
 
 
@@ -369,10 +392,16 @@ h2  { margin: 0 0 10px; font-size: 16px; }
     <select id="run-sel" style="max-width:380px" onchange="onRunChange()"></select>
   </div>
   <div id="loading-ind">Loading…</div>
-  <div id="companion-btn-wrap" style="align-self:flex-end">
+  <div id="companion-btn-wrap" style="align-self:flex-end;display:flex;gap:6px">
     <button onclick="openCompanion()" style="background:#f0f7ff;border-color:#cce;color:#558">
       Loss curves ↗
     </button>
+    <a id="wandb-run-btn" href="#" target="_blank"
+       style="display:none;padding:4px 10px;font-size:11px;border-radius:4px;
+              border:1px solid #fca;background:#fff8f0;color:#a55;text-decoration:none;
+              line-height:1.8">
+      W&B ↗
+    </a>
   </div>
   <div class="cg">
     <label>Step</label>
@@ -687,7 +716,7 @@ function buildFilterDropdowns() {
     div.innerHTML = `<label>${label}</label>`;
     const sel = document.createElement('select');
     sel.id = 'filter-' + key;
-    sel.onchange = () => filterRuns();
+    sel.onchange = () => { updateFilterAvailability(); filterRuns(); };
     const allOpt = document.createElement('option');
     allOpt.value = '__all__'; allOpt.text = 'All';
     sel.appendChild(allOpt);
@@ -697,6 +726,40 @@ function buildFilterDropdowns() {
     }
     div.appendChild(sel);
     container.appendChild(div);
+  }
+}
+
+// Disable options in each filter dropdown that don't co-occur with the
+// currently-selected values in the *other* dropdowns, so users can't select
+// a combination of params for which no run exists.
+function updateFilterAvailability() {
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const key of PARAM_KEYS) {
+      const sel = document.getElementById('filter-' + key);
+      if (!sel) continue;
+      const validRuns = RUN_META.map((_, i) => i).filter(i => {
+        const params = RUN_META[i].params || {};
+        return PARAM_KEYS.every(k => {
+          if (k === key) return true;
+          const el = document.getElementById('filter-' + k);
+          if (!el) return true;
+          const val = el.value;
+          return val === '__all__' || (params[k] ?? '__missing__') === val;
+        });
+      });
+      const validVals = new Set(validRuns.map(i => (RUN_META[i].params || {})[key]).filter(v => v !== undefined));
+      for (const opt of sel.options) {
+        if (opt.value === '__all__') continue;
+        const shouldDisable = !validVals.has(opt.value);
+        if (opt.disabled !== shouldDisable) opt.disabled = shouldDisable;
+      }
+      if (sel.value !== '__all__' && !validVals.has(sel.value)) {
+        sel.value = '__all__';
+        changed = true;
+      }
+    }
   }
 }
 
@@ -753,6 +816,7 @@ function restoreState() {
     if (el && [...el.options].some(o => o.value === val)) el.value = val;
   };
   for (const key of PARAM_KEYS) set('filter-' + key, p.get('f_' + key));
+  updateFilterAvailability();
   filterRuns(true);
   set('run-sel',  p.get('run'));
   onRunChange(true);
@@ -852,6 +916,12 @@ function onRunChange(noRender = false) {
   const meta = RUN_META[ri];
   if (!meta) return;
 
+  const wbBtn = document.getElementById('wandb-run-btn');
+  if (wbBtn) {
+    if (meta.wandb_url) { wbBtn.href = meta.wandb_url; wbBtn.style.display = ''; }
+    else wbBtn.style.display = 'none';
+  }
+
   const stepSel = document.getElementById('step-sel');
   stepSel.innerHTML = '';
   (meta.step_labels || []).forEach((lbl, i) => {
@@ -932,6 +1002,16 @@ def main():
     if not runs:
         sys.exit('Nothing to plot.')
 
+    # ── Resolve W&B entity for run links ─────────────────────────────────────
+    wandb_entity = None
+    wandb_project = 'jaxtpc-optimization'
+    try:
+        import wandb as _wandb
+        wandb_entity = _wandb.Api(timeout=15).default_entity
+        print(f'W&B entity: {wandb_entity}')
+    except Exception as exc:
+        print(f'[wandb] could not resolve entity: {exc}')
+
     # ── Write per-run JS data files ───────────────────────────────────────────
     out = Path(args.output)
     data_dir = out.parent / (out.stem + '_data')
@@ -947,6 +1027,11 @@ def main():
             f'window.{data_key}=' + json.dumps(run_data, separators=(',', ':')) + ';',
             encoding='utf-8',
         )
+        wid = run.get('wandb_run_id')
+        wandb_url = (
+            f"https://wandb.ai/{wandb_entity}/{wandb_project}/runs/{wid}"
+            if wandb_entity and wid else None
+        )
         run_meta.append({
             'label':       run['label'],
             'mode':        run['mode'],
@@ -954,6 +1039,7 @@ def main():
             'step_labels': run['step_labels'],
             'data_file':   data_file,
             'data_key':    data_key,
+            'wandb_url':   wandb_url,
         })
 
     # ── Compute param filter keys ─────────────────────────────────────────────

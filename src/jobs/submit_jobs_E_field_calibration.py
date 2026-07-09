@@ -499,7 +499,7 @@ def profile_1k_tracks_gt_precompute(*, submit, print_sbatch_only, results_base_p
             tag = f'{profile_tag}/ke{ke_lo:g}-{ke_hi:g}/shard{shard_idx}of{n_gt_shards}'
             results_base = f'{results_base_prefix}/{tag}'
             cmd = make_efield_calib_command(
-                electric_dist_path=REMOTE_EFIELD_NPZ,
+                electric_dist_path=REMOTE_CONSERVATIVE_EFIELD_NPZ,
                 tracks_random_seed=42,
                 nn_seed=0,
                 hidden=(32, 32, 32),
@@ -539,7 +539,7 @@ def profile_1k_tracks_gt_precompute(*, submit, print_sbatch_only, results_base_p
 
 def _submit_efield_tracks_sweep(*, submit, print_sbatch_only, results_base_prefix, time, mem_gb,
                                  chain, use_gt_cache, n_gt_shards, profile_tag, n_active_tracks,
-                                 n_total_tracks=1000, effective_batch_size=16, batch_size=2):
+                                 n_total_tracks=1000, effective_batch_size=8, batch_size=2):
     """Shared body for profile_1k_tracks_sweep / profile_100_tracks_sweep.
 
     Runs the same N_random_tracks=n_total_tracks ensemble (tracks_random_seed=42) as the
@@ -561,17 +561,22 @@ def _submit_efield_tracks_sweep(*, submit, print_sbatch_only, results_base_prefi
             if use_gt_cache else None
         )
         for rw in [0.0, 1.0]:
-            tag = f'{profile_tag}/arch32x3/trk42_nn0_do0_rot{rw:g}_ke{ke_lo:g}-{ke_hi:g}'
+            # 'conservative' in the tag keeps this distinct from any pre-existing
+            # non-conservative-field run at the same rot/ke combo — otherwise
+            # run_optimization.py would find that old result_0.pkl at the same
+            # results_base and resume from its live_checkpoint instead of starting
+            # fresh against the (different) conservative GT field.
+            tag = f'{profile_tag}/arch32x3/trk42_nn0_do0_rot{rw:g}_ke{ke_lo:g}-{ke_hi:g}_conservative'
             results_base = f'{results_base_prefix}/{tag}'
             cmd = make_efield_calib_command(
-                electric_dist_path=REMOTE_EFIELD_NPZ,
+                electric_dist_path=REMOTE_CONSERVATIVE_EFIELD_NPZ,
                 tracks_random_seed=42,
                 nn_seed=0,
                 hidden=(32, 32, 32),
                 dropout_rate=0.0,
                 penalize_rotor=rw,
                 results_base=results_base,
-                wandb_tags=[profile_tag],
+                wandb_tags=[profile_tag, 'conservative'],
                 n_random_tracks=n_total_tracks,
                 effective_batch_size=effective_batch_size,
                 batch_size=batch_size,
@@ -601,10 +606,14 @@ def _submit_efield_tracks_sweep(*, submit, print_sbatch_only, results_base_prefi
 
 def profile_1k_tracks_sweep(*, submit, print_sbatch_only, results_base_prefix, time, mem_gb,
                              chain=True, use_gt_cache=True, n_gt_shards=50, **_):
-    """1000-track run, batch_size=2, effective batch size 16, no dropout, arch 32x3.
+    """1000-track run, batch_size=2, effective batch size 8, no dropout, arch 32x3.
 
     Only 2 tracks are held on GPU at once (--batch-size 2); gradients accumulate over
-    16 microbatches (--effective-batch-size 16) before each optimizer step. Sweeps
+    8 microbatches (--effective-batch-size 8) before each optimizer step — kept below
+    the GT cache's 10-batches-per-shard span (20-track shards / batch_size 2) so each
+    step's LazyGtCache window fits within max_open_shards=2 instead of spilling into a
+    3rd shard every step (see optlib.gt_signals.LazyGtCache / run_optimization.py's
+    --gt-cache-load sizing). Sweeps
     2 rotor weights (0, 1) x 2 kinetic-energy ranges (the default T~U[100,1000] MeV and
     a shifted T~U[500,1500] MeV) = 4 jobs, all with tracks_random_seed=42, nn_seed=0.
 

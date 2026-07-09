@@ -63,7 +63,8 @@ _PIVOT_TA_ALPHAS   = (0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50)  # α values for
 # (param, noise seed, adc_cutoff) instead of one pkl per (theta, alpha).
 # Seeds found here accumulate on top of (rather than only filling gaps in)
 # the official per-(theta, alpha) pkls in _compute_theta_alpha_bias.
-_DIAG_TA_SUBDIR = "cutoff_loss_landscape_20260611_pivot_ta_diag"
+_DIAG_TA_SUBDIR     = "cutoff_loss_landscape_20260611_pivot_ta_diag"
+_FULLGRID_TA_SUBDIR = "cutoff_loss_landscape_20260611_pivot_ta_fullgrid"
 
 # Pivot-angle study: 400 MeV muon, midpoint fixed at (1000, 0, 0) mm (west volume).
 # CSDA range of 400 MeV muon in LAr ≈ 1700.6 mm → half-length 850.3 mm.
@@ -670,15 +671,17 @@ def load_angle_pivot_nwr_bias_data(mode, cache_path=None, recompute=False):
     return result
 
 
-def _compute_theta_alpha_bias(mode, subdir, pivot, verbose=True, diagonal_only=False):
+def _compute_theta_alpha_bias(mode, subdir, pivot, verbose=True, diagonal_only=False,
+                              skip_keys=None):
     """Compute argmin-factor bias over the θ×α grid.
 
     pivot=True  → track name includes _pivot_x1000
     pivot=False → track name is the plain theta/alpha variant
     diagonal_only=True → only process pairs where theta == alpha
+    skip_keys → set of "param|adc|theta|alpha" strings to skip (already cached)
     """
     flat = {}
-    n_found = n_miss = 0
+    n_found = n_miss = n_skipped = 0
     all_seeds = list(range(mode.all_seeds))
     thetas = mode.ta_pivot_thetas if pivot else mode.ta_thetas
     alphas = mode.ta_pivot_alphas if pivot else mode.ta_alphas
@@ -692,6 +695,9 @@ def _compute_theta_alpha_bias(mode, subdir, pivot, verbose=True, diagonal_only=F
                 print(f"  {param}  |  adc={adc}")
             for theta, alpha in pairs:
                 done += 1
+                if skip_keys and f"{param}|{adc}|{theta}|{alpha}" in skip_keys:
+                    n_skipped += 1
+                    continue
                 if pivot:
                     track_name = (f"Muon_400MeV_theta_{theta}_alpha_{alpha}"
                                   f"_pivot_x1000_stepsize_1mm")
@@ -709,17 +715,28 @@ def _compute_theta_alpha_bias(mode, subdir, pivot, verbose=True, diagonal_only=F
                             sources.append((seed, d, np.array(d["factors"]), np.array(d["loss_values"])))
                         except (EOFError, pickle.UnpicklingError):
                             pass
-                    # Extra bundled sources (e.g. ad-hoc local diagonal runs) accumulate
-                    # on top of the primary per-track pkl instead of only filling gaps —
+                    # Extra sources accumulate on top of the primary per-track pkl —
                     # the same (theta, alpha) may have been run multiple times.
-                    # The diagonal bundle was generated with wire response enabled, so
-                    # it must only feed the "full" (wire-response) bias, never NWR.
+                    # Both sources below have wire response ON and must only feed
+                    # the "full" (wire-response) bias, never NWR.
                     if pivot and mode.name == "full":
+                        # Bundled 6-track diagonal pkl.
                         d = _load_diag_ta_pkl(param, seed, adc)
                         if d is not None and track_name in d.get("per_track_loss_values", {}):
                             sources.append((f"diag{seed}", d,
                                             np.array(d["factors"]),
                                             np.array(d["per_track_loss_values"][track_name])))
+                        # Per-track pkls from the full 81-pair grid job.
+                        fg_path = _pkl_path(_FULLGRID_TA_SUBDIR, param, track_name, seed, adc)
+                        if os.path.exists(fg_path):
+                            try:
+                                with open(fg_path, "rb") as f:
+                                    fg_d = pickle.load(f)
+                                sources.append((f"fg{seed}", fg_d,
+                                                np.array(fg_d["factors"]),
+                                                np.array(fg_d["loss_values"])))
+                            except (EOFError, pickle.UnpicklingError):
+                                pass
                     if sources:
                         for seed_label, d, factors, losses in sources:
                             seed_factors.append((seed_label, float(factors[np.argmin(losses)])))
@@ -747,7 +764,8 @@ def _compute_theta_alpha_bias(mode, subdir, pivot, verbose=True, diagonal_only=F
                     flat[f"{param}|{adc}|{theta}|{alpha}"] = entry
 
     tag = "pivot-" if pivot else ""
-    print(f"  Theta-alpha {tag}bias done: {n_found} pkls read, {n_miss} missing")
+    print(f"  Theta-alpha {tag}bias done: {n_found} pkls read, {n_miss} missing"
+          + (f", {n_skipped} skipped (cached)" if n_skipped else ""))
     return {
         "thetas": list(thetas),
         "alphas": list(alphas),
@@ -759,20 +777,30 @@ def load_theta_alpha_bias_data(mode, pivot, cache_path=None, recompute=False,
                                diagonal_only=False):
     subdir = mode.theta_alpha_pivot_subdir if pivot else mode.theta_alpha_subdir
     tag = "pivot-" if pivot else ""
-    if cache_path and not recompute and os.path.exists(cache_path):
+
+    existing = None
+    if cache_path and os.path.exists(cache_path):
         print(f"  Loading theta-alpha {tag}bias cache: {cache_path}")
         with open(cache_path, "rb") as f:
-            return pickle.load(f)
-    existing = None
-    if diagonal_only and cache_path and os.path.exists(cache_path):
-        print(f"  Loading theta-alpha {tag}bias cache for diagonal merge: {cache_path}")
-        with open(cache_path, "rb") as f:
             existing = pickle.load(f)
+
+    if existing is not None and not recompute:
+        # Skip entries already in the cache (diagonal_only still recomputes all diagonal pairs).
+        skip = None if diagonal_only else set(existing["data"].keys())
+        result = _compute_theta_alpha_bias(mode, subdir, pivot, verbose=True,
+                                           diagonal_only=diagonal_only, skip_keys=skip)
+        if result["data"]:
+            existing["data"].update(result["data"])
+            if cache_path:
+                Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+                with open(cache_path, "wb") as f:
+                    pickle.dump(existing, f)
+                print(f"  Updated theta-alpha {tag}bias cache → {cache_path}")
+        return existing
+
+    # recompute=True or no cache yet: compute everything.
     result = _compute_theta_alpha_bias(mode, subdir, pivot, verbose=True,
                                        diagonal_only=diagonal_only)
-    if existing is not None:
-        existing["data"].update(result["data"])
-        result = existing
     if cache_path:
         Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
         with open(cache_path, "wb") as f:

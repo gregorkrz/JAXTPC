@@ -228,7 +228,7 @@ def _random_nice_face_entry_mm(rng, volumes):
         return (x, float(rng.uniform(y0, y1)), z0), (0.0,  0.0, -1.0)
 
 
-def generate_random_nice_tracks(volumes, n=10, seed=7):
+def generate_random_nice_tracks(volumes, n=10, seed=7, ke_min_mev=100.0, ke_max_mev=1000.0):
     """Generate n near-cathode muon tracks entering through y/z faces with |x| < 1000 mm.
 
     Entry points are sampled uniformly on the four y/z faces of the combined TPC
@@ -241,7 +241,8 @@ def generate_random_nice_tracks(volumes, n=10, seed=7):
     because the angle range is symmetric around 90°, so negation maps θ → π−θ,
     which stays in [30°, 150°].
 
-    Energy is drawn uniformly (continuous float) from [100, 1000] MeV.
+    Energy is drawn uniformly (continuous float) from [ke_min_mev, ke_max_mev] MeV
+    (default [100, 1000]).
 
     Returns list[dict] with keys: name, direction, momentum_mev, start_position_mm.
     """
@@ -253,7 +254,7 @@ def generate_random_nice_tracks(volumes, n=10, seed=7):
         dot = d[0]*outward_normal[0] + d[1]*outward_normal[1] + d[2]*outward_normal[2]
         if dot > 0.0:
             d = (-d[0], -d[1], -d[2])
-        t_mev = float(rng.uniform(100.0, 1000.0))
+        t_mev = float(rng.uniform(ke_min_mev, ke_max_mev))
         specs.append(dict(
             name=f'NiceMuon{i}_{int(round(t_mev))}MeV',
             direction=d,

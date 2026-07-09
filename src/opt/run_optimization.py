@@ -106,6 +106,7 @@ from optlib.constants import (  # noqa: E402  (constants live in optlib now)
     EFIELD_PARAM, VALID_PARAMS, _BETA_VARIANTS, _BASE_PARAMS,
     VALID_LOSSES, VALID_OPTIMIZERS, TYPICAL_SCALES, TRACK_PRESETS,
     ADAM_BETA1, ADAM_BETA2, ADAM_EPS, MOMENTUM, PLANE_NAME_MAP,
+    _RESULTS_DIR,
 )
 from optlib.paths import (  # noqa: E402
     make_folder_name, next_result_path,
@@ -129,6 +130,7 @@ from optlib.wandb_utils import (  # noqa: E402
     _write_wandb_sidecar, _collect_gpu_metrics, _wandb_log_step,
     fetch_init_params_from_wandb,
 )
+from optlib.gt_signals import save_gt_cache_h5, load_gt_cache_lazy  # noqa: E402
 
 # JAX compilation cache (side-effectful config stays here).
 _JAX_CACHE_DIR = os.environ.get('JAX_COMPILATION_CACHE_DIR',
@@ -243,7 +245,7 @@ def make_curl_penalty_fn(efield_cfg, efield_unravel, n_scalar, n_weights, vol,
 
 def build_phase_fns(loss_name, simulator, setter, batches, *, return_per_track_loss=False,
                     return_hessian=False, adc_cutoff=0.0, active_planes=None,
-                    return_per_vol_loss=False, curl_penalty_fn=None):
+                    return_per_vol_loss=False, curl_penalty_fn=None, gt_lookup=None):
     """Return one callable per batch in a phase.
 
     Default ``fn(p) -> (loss, grad)``. When ``return_per_track_loss=True``,
@@ -262,7 +264,13 @@ def build_phase_fns(loss_name, simulator, setter, batches, *, return_per_track_l
 
     active_planes: tuple of global plane indices to include in the loss, or None for all.
 
-    batches: list of (batch_deposits, batch_gts, batch_wts)
+    batches: list of (batch_deposits, batch_gts, batch_wts). When ``gt_lookup`` is
+    given, each batch's ``batch_gts`` is instead a list of track NAMES (str) —
+    resolved to arrays via ``gt_lookup(name)`` freshly on every call, inside the
+    returned closure, rather than once here. This is what lets a 1000-track lazy
+    GT cache (optlib.gt_signals.LazyGtCache) back training without ever holding
+    every track's signal in host RAM at once — only as many as get touched by
+    calls in flight.
     """
     if return_hessian and return_per_track_loss:
         raise ValueError('return_hessian and return_per_track_loss are mutually exclusive')
@@ -425,17 +433,28 @@ def build_phase_fns(loss_name, simulator, setter, batches, *, return_per_track_l
         return compiled
 
     def _make_fn(compiled, deps, gts, wts):
+        # gts is a list of track names (str) when gt_lookup is given — resolved to
+        # arrays fresh on every call instead of once here, so no batch ever holds a
+        # real signal array outside of the moment it's actually being used.
+        if gt_lookup is not None:
+            names = gts
+            def _resolve_gts():
+                return [gt_lookup[n] for n in names]
+        else:
+            def _resolve_gts():
+                return gts
+
         if return_hessian:
             def call(p):
-                val, grad, hess = compiled(p, deps, gts, wts)
+                val, grad, hess = compiled(p, deps, _resolve_gts(), wts)
                 return val, grad, hess
             return call
         if return_per_track_loss:
             def call(p):
-                (lv, pt), gv = compiled(p, deps, gts, wts)
+                (lv, pt), gv = compiled(p, deps, _resolve_gts(), wts)
                 return lv, gv, pt
             return call
-        return lambda p: compiled(p, deps, gts, wts)
+        return lambda p: compiled(p, deps, _resolve_gts(), wts)
 
     return [_make_fn(_get_compiled(bs), d, g, w) for bs, d, g, w in processed]
 
@@ -745,6 +764,9 @@ def run_trial(p0, phase_schedule, optimizer, max_steps, tol=1e-5, patience=20,
             lv_new, gv_new, pt_new = _unpack_batch_fn_ret(fn_eval(p))
             jax.block_until_ready((lv_new, gv_new))
         step_time = time.time() - step_start
+        if (step + 1) % 10 == 0:
+            print(f'[step {step + 1}] loss={float(lv_new):.4e}  step_time={step_time:.2f}s',
+                  flush=True)
 
         param_traj.append(p[:n_rec].tolist())
         loss_traj.append(float(lv_new))
@@ -881,6 +903,17 @@ def main():
     args = parse_args(__doc__)
     is_newton = args.optimizer == 'newton'
 
+    # Relative --gt-cache-save/--gt-cache-load paths resolve under $RESULTS_DIR (same
+    # convention as --results-base), not the process cwd. Absolute paths (e.g. the
+    # S3DF job paths built by submit_jobs_E_field_calibration.py) pass through unchanged.
+    if args.gt_cache_save and not os.path.isabs(args.gt_cache_save):
+        args.gt_cache_save = os.path.join(_RESULTS_DIR, args.gt_cache_save)
+    if args.gt_cache_load:
+        args.gt_cache_load = [
+            p if os.path.isabs(p) else os.path.join(_RESULTS_DIR, p)
+            for p in args.gt_cache_load
+        ]
+
     if args.effective_batch_size < 1:
         print('error: --effective-batch-size must be >= 1.', file=sys.stderr)
         raise SystemExit(2)
@@ -984,7 +1017,10 @@ def main():
     if args.N_random_tracks > 0:
         _volumes = create_sim_config(generate_detector(CONFIG_PATH), total_pad=100, response_chunk_size=100).volumes
         track_specs = generate_random_nice_tracks(
-            _volumes, n=args.N_random_tracks, seed=args.tracks_random_seed)
+            _volumes, n=args.N_random_tracks, seed=args.tracks_random_seed,
+            ke_min_mev=args.track_energy_range_mev[0], ke_max_mev=args.track_energy_range_mev[1])
+        if args.track_shard is not None:
+            track_specs = track_specs[args.track_shard[0]:args.track_shard[1]]
     else:
         track_specs = parse_tracks(args.tracks)
     _range_vals = list(getattr(args, 'range'))
@@ -1210,7 +1246,7 @@ def main():
     efield_cfg = None
     efield_zero_params = None
 
-    def _get_sim(n_seg, role='diff'):
+    def _get_sim(n_seg, role='diff', warm_up=True):
         # role 'gt' uses the static GT distortion map; role 'diff' uses the
         # differentiable MLP SCE model (when Efield is being optimized).
         key = (n_seg, role)
@@ -1238,14 +1274,24 @@ def main():
             if efield_present and role == 'diff':
                 sim._default_sim_params = sim._default_sim_params._replace(
                     sce_models=efield_zero_params)
-            print('Warming up JIT...')
-            t0 = time.time()
-            sim.warm_up()
-            print(f'Done ({time.time() - t0:.1f} s)')
+            if warm_up:
+                print('Warming up JIT...')
+                t0 = time.time()
+                sim.warm_up()
+                print(f'Done ({time.time() - t0:.1f} s)')
+            else:
+                print('Skipping JIT warm-up (role unused — see --gt-cache-load).')
             _sim_cache[key] = sim
         return _sim_cache[key]
 
-    gt_sim = _get_sim(args.gt_max_deposits, role='gt')
+    # The 'gt' role sim's differentiable forward is never actually called when
+    # --gt-cache-load is set (the whole per-track GT generate/forward loop below is
+    # skipped in that case — see _using_lazy_gt_cache) — only its cheap config/geometry
+    # metadata (recomb_model, volumes, num_wires, ...) is still needed. Its warm-up
+    # forces a full XLA compile of the differentiable simulator at gt_max_deposits, which
+    # is pure waste in that path (confirmed: this roughly doubled startup time on wandb
+    # run 6c7vx5s6's dep7k config, compiling the same static shape twice for no reason).
+    gt_sim = _get_sim(args.gt_max_deposits, role='gt', warm_up=not bool(args.gt_cache_load))
     gt_lifetime = args.gt_lifetime_us if args.gt_lifetime_us is not None else GT_LIFETIME_US
     gt_params = gt_sim.default_sim_params._replace(
         lifetime_us    = jnp.array(gt_lifetime),
@@ -1347,6 +1393,19 @@ def main():
     gt_weights_per_track = []   # weights for the global/simple path
     sig_rms_acc = []
     noi_rms_acc = []
+    # Each track's full-res signal set is large (~100+ MB at 1969x2701x6 planes), so at
+    # N_random_tracks in the hundreds-to-thousands these per-track lists dominate host
+    # memory. Two savings that don't change behavior:
+    #  - gt_signals_clean_per_track is only read by noise rotation (rotate_noise_seeds > 0);
+    #    skip retaining it otherwise (~1/3 of the memory, freed per-track instead of held
+    #    for the whole run). --gt-cache-save no longer needs it either — see below, the
+    #    cache now stores the (noisy) training target directly.
+    #  - Sobolev weights depend only on (shape, max_pad, s, freq_cutoff) — identical
+    #    across all tracks unless --fourier-cutoff masks per-track content — so cache by
+    #    shape and store the SAME array objects in every slot instead of N independent
+    #    copies (another ~1/3, down to O(1) instead of O(N_tracks)).
+    _retain_clean_gt = args.noise_scale > 0.0 and args.rotate_noise_seeds > 0
+    _wts_cache_by_shape: dict = {}
     # For per-param weight keys: dict {(fc_mag, fc_pwr) -> list[tuple[np.array,...]]}
     _unique_wt_keys = (
         list({(fc_mag, fc_pwr) for _, _, fc_mag, fc_pwr, _ in _param_groups})
@@ -1355,8 +1414,83 @@ def main():
     )
     gt_weights_per_track_per_key: dict = {k: [] for k in _unique_wt_keys}
 
+    # ── --gt-cache-load: lazy path (avoids ever holding all N_random_tracks' signals
+    # in host RAM — see optlib.gt_signals.LazyGtCache). The cache stores the NOISY
+    # signal already (baked in at --gt-cache-save time with this same noise_seed), so
+    # there's nothing left to compute here beyond validating coverage/seed and deriving
+    # weights from geometry (no real sample array needed, since weights are shape-only
+    # unless --fourier-cutoff, which --gt-cache-load doesn't support — see below).
+    _gt_cache = None
+    _using_lazy_gt_cache = bool(args.gt_cache_load)
+    if _using_lazy_gt_cache:
+        if args.gt_cache_save:
+            raise ValueError('--gt-cache-load and --gt-cache-save are mutually exclusive '
+                              '(load reads an already-baked cache; save computes fresh).')
+        if args.rotate_noise_seeds > 0:
+            raise ValueError('--gt-cache-load is incompatible with --rotate-noise-seeds '
+                              '(the cache bakes in one fixed noise realization).')
+        if args.fourier_cutoff > 0.0:
+            raise ValueError('--gt-cache-load is incompatible with --fourier-cutoff '
+                              "(per-track Fourier masking needs each track's own signal, "
+                              'defeating the point of not touching it here).')
+        # Hold every shard given to --gt-cache-load resident for the whole run — no LRU
+        # eviction, no re-reads, ever. This is deliberately NOT scaled down to "just what
+        # one step's accumulation window touches": batch cycling (batch_idx =
+        # (step*eff_bs+micro) % n_batches) with --effective-batch-size not a clean multiple
+        # of a shard's batch count (shard_tracks / --batch-size) means the touched-shard set
+        # drifts across the whole cycle over time, not just within one step, so any cap
+        # below len(args.gt_cache_load) can still eventually evict and re-read (confirmed on
+        # wandb run 6c7vx5s6: --batch-size 2/--effective-batch-size 16 against 20-track/2.1GB
+        # shards — see CLAUDE.md). Memory cost is len(args.gt_cache_load) * shard size (e.g.
+        # ~10.5GB for the 5-shard 100_tracks_sweep case); for a profile that passes ALL of a
+        # large n_gt_shards (e.g. 1k_tracks_sweep's 50 shards, ~105GB), size --mem-gb
+        # accordingly when submitting — this trades memory for guaranteeing zero re-reads.
+        _max_open_shards = len(args.gt_cache_load)
+        _gt_cache = load_gt_cache_lazy(args.gt_cache_load, expected_noise_seed=noise_seed,
+                                        max_open_shards=_max_open_shards)
+        _missing = [ts['name'] for ts in track_specs if ts['name'] not in _gt_cache]
+        if _missing:
+            raise ValueError(
+                f'--gt-cache-load ({args.gt_cache_load}) is missing {len(_missing)} track(s): '
+                f'{_missing[:10]}{"..." if len(_missing) > 10 else ""}')
+        print(f'Validated lazy GT cache for all {len(track_specs)} tracks from '
+              f'{args.gt_cache_load} (noise_seed={noise_seed})')
+
+        # simulator.forward() pads every plane's wire dim to max(num_wires) within its
+        # volume before stacking (see tools/simulation.py's _diff_volume_body), so the
+        # returned/cached array width is that per-volume max, not each plane's true
+        # (possibly smaller) wire count — match that here or the weight/signal shapes
+        # won't line up.
+        _shape_key = tuple(
+            (max(gt_sim.config.volumes[v].num_wires), gt_sim.config.num_time_steps)
+            for v in range(gt_sim.config.n_volumes)
+            for p in range(gt_sim.config.volumes[v].n_planes)
+        )
+        _wts_shared = tuple(
+            np.array(make_sobolev_weight(h, w, max_pad=SOBOLEV_MAX_PAD,
+                                          s=args.sobolev_exponent, freq_cutoff=args.freq_cutoff))
+            for h, w in _shape_key
+        )
+        gt_weights_per_track = [_wts_shared] * len(track_specs)
+        gt_signals_per_track = None  # sentinel: "Building deposits" loop reads _gt_cache directly
+
+        # Lightweight signal-RMS sample for the printed diagnostic — reads a few tracks
+        # from the (shard-LRU-bounded) cache and discards them, no per-track retention.
+        _sample_names = [ts['name'] for ts in track_specs[:min(10, len(track_specs))]]
+        for name in _sample_names:
+            sig_rms_acc.append(float(np.mean([float(np.std(a)) for a in _gt_cache[name]])))
+        print(f'Done ({time.time() - t0:.1f} s) — Signal RMS (sample of {len(_sample_names)}): '
+              f'{float(np.mean(sig_rms_acc)):.4g} (noise already baked into cache)')
+
+    # Compiled once, reused for every track — the un-batched per-track forward call
+    # below would otherwise run eagerly (no fused XLA program) and be needlessly slow.
+    _jitted_gt_forward = jax.jit(gt_sim.forward)
+
+    # Runs once per track computing GT fresh (generate_muon_track -> build_deposit_data ->
+    # forward -> noise). Never executes when _using_lazy_gt_cache (loop is empty above) —
+    # everything needed in that case was already handled in the lazy branch above.
     noise_base_key = jax.random.PRNGKey(noise_seed)
-    for track_idx, ts in enumerate(track_specs):
+    for track_idx, ts in enumerate([] if _using_lazy_gt_cache else track_specs):
         print(f'  track {ts["name"]}  dir={ts["direction"]}  T={ts["momentum_mev"]} MeV')
         track_gt = generate_muon_track(
             start_position_mm=ts['start_position_mm'] if ts['start_position_mm'] is not None else track_start_mm,
@@ -1373,9 +1507,10 @@ def main():
         n_total = sum(v.n_actual for v in deposits_gt.volumes)
         print(f'    {n_total:,} deposits')
 
-        gt = tuple(gt_sim.forward(gt_params, deposits_gt))
+        gt = tuple(_jitted_gt_forward(gt_params, deposits_gt))
         jax.block_until_ready(gt)
-        gt_signals_clean_per_track.append(tuple(np.array(a) for a in gt))
+        if _retain_clean_gt:
+            gt_signals_clean_per_track.append(tuple(np.array(a) for a in gt))
 
         if args.noise_scale > 0.0:
             track_noise_key = jax.random.fold_in(noise_base_key, track_idx)
@@ -1387,15 +1522,27 @@ def main():
         else:
             sig_rms_acc.append(float(np.mean([float(jnp.std(a)) for a in gt])))
 
-        wts = tuple(make_sobolev_weight(a.shape[0], a.shape[1], max_pad=SOBOLEV_MAX_PAD,
-                                        s=args.sobolev_exponent, freq_cutoff=args.freq_cutoff)
-                    for a in gt)
         if args.fourier_cutoff > 0.0:
+            # Fourier-masked weights depend on this track's own GT content — can't dedupe.
+            wts = tuple(make_sobolev_weight(a.shape[0], a.shape[1], max_pad=SOBOLEV_MAX_PAD,
+                                            s=args.sobolev_exponent, freq_cutoff=args.freq_cutoff)
+                        for a in gt)
             wts = tuple(apply_fourier_power_mask(w, a, SOBOLEV_MAX_PAD, args.fourier_cutoff)
                         for w, a in zip(wts, gt))
+            wts_np = tuple(np.array(a) for a in wts)
+        else:
+            # Shape-only weights: identical for every track sharing the same signal shape.
+            shape_key = tuple(a.shape for a in gt)
+            wts_np = _wts_cache_by_shape.get(shape_key)
+            if wts_np is None:
+                wts = tuple(make_sobolev_weight(a.shape[0], a.shape[1], max_pad=SOBOLEV_MAX_PAD,
+                                                s=args.sobolev_exponent, freq_cutoff=args.freq_cutoff)
+                            for a in gt)
+                wts_np = tuple(np.array(a) for a in wts)
+                _wts_cache_by_shape[shape_key] = wts_np
         # Move to CPU after computation to free GPU memory; JAX JIT transfers back per call.
         gt_signals_per_track.append(tuple(np.array(a) for a in gt))
-        gt_weights_per_track.append(tuple(np.array(a) for a in wts))
+        gt_weights_per_track.append(wts_np)
         for (fc_mag, fc_pwr) in _unique_wt_keys:
             wts_k = tuple(make_sobolev_weight(a.shape[0], a.shape[1], max_pad=SOBOLEV_MAX_PAD,
                                               s=args.sobolev_exponent, freq_cutoff=fc_mag)
@@ -1405,14 +1552,29 @@ def main():
                               for w, a in zip(wts_k, gt))
             gt_weights_per_track_per_key[(fc_mag, fc_pwr)].append(tuple(np.array(a) for a in wts_k))
 
-    signal_rms = float(np.mean(sig_rms_acc))
-    if args.noise_scale > 0.0:
-        noise_rms = float(np.mean(noi_rms_acc))
-        print(f'Done ({time.time() - t0:.1f} s) — '
-              f'Signal RMS: {signal_rms:.4g}  Noise RMS: {noise_rms:.4g}  '
-              f'SNR ≈ {signal_rms / max(noise_rms, 1e-30):.2f}')
-    else:
-        print(f'Done ({time.time() - t0:.1f} s) — Signal RMS: {signal_rms:.4g}')
+    if not _using_lazy_gt_cache:
+        signal_rms = float(np.mean(sig_rms_acc))
+        if args.noise_scale > 0.0:
+            noise_rms = float(np.mean(noi_rms_acc))
+            print(f'Done ({time.time() - t0:.1f} s) — '
+                  f'Signal RMS: {signal_rms:.4g}  Noise RMS: {noise_rms:.4g}  '
+                  f'SNR ≈ {signal_rms / max(noise_rms, 1e-30):.2f}')
+        else:
+            print(f'Done ({time.time() - t0:.1f} s) — Signal RMS: {signal_rms:.4g}')
+
+    if args.gt_cache_save:
+        # Saves the (noisy) training target directly — see optlib.gt_signals's module
+        # docstring: the cache is now tied to this run's noise_seed (stored + validated
+        # on load), not a seed-agnostic clean signal.
+        save_gt_cache_h5(args.gt_cache_save, track_specs, gt_signals_per_track,
+                          noise_seed=noise_seed, compress=not args.gt_cache_no_compress)
+        print(f'Saved GT cache ({len(track_specs)} tracks) to {args.gt_cache_save}')
+
+    if args.exit_after_gt_cache:
+        print('--exit-after-gt-cache: skipping training, exiting now.')
+        if use_wandb:
+            _wandb.finish()
+        return
 
     # ── Pre-generate rotating noisy GT arrays ────────────────────────────────
     # _rotate_n > 0: at step s use noise seed index s % _rotate_n.
@@ -1478,7 +1640,10 @@ def main():
             print(f'  track {ts["name"]}  {n_total:,} fwd deposits')
 
             _deps.append(deposits_ph)
-            _gts.append(gt_signals_per_track[ti])
+            # Lazy mode: store the track NAME, not the array — build_phase_fns resolves
+            # it from _gt_cache (a shard-LRU-bounded reader) at call time, per microbatch,
+            # instead of every batch holding a real array for the whole run.
+            _gts.append(ts['name'] if _using_lazy_gt_cache else gt_signals_per_track[ti])
             _wts.append(gt_weights_per_track[ti])
 
             if len(_deps) == phase['batch_size']:
@@ -1534,6 +1699,23 @@ def main():
                           flush=True)
                     t0 = time.time()
 
+                    def _warm_up(fns_to_warm, batches_for_sizes):
+                        # Compilation is cached per unique batch size (see
+                        # build_phase_fns' compiled_cache), so running every batch
+                        # would just repeat real forward+backward passes the
+                        # training loop will do anyway — warm up one batch per
+                        # unique size instead.
+                        seen_sizes = set()
+                        for fn, (batch_deps, _, _) in zip(fns_to_warm, batches_for_sizes):
+                            bs = len(batch_deps)
+                            if bs in seen_sizes:
+                                continue
+                            seen_sizes.add(bs)
+                            out = fn(p)
+                            jax.block_until_ready(out)
+                            out = fn(p)
+                            jax.block_until_ready(out)
+
                     if _param_groups is not None and len(_param_groups) > 1:
                         # Per-parameter cutoff/planes/freq/fourier: build one fn set per group.
                         # Per-track loss and Hessian are not supported with per-param groups.
@@ -1547,10 +1729,9 @@ def main():
                                 return_hessian=False,
                                 adc_cutoff=cutoff_g,
                                 active_planes=planes_g,
-                                curl_penalty_fn=curl_penalty_fn)
-                            for fn in fns_g:
-                                out = fn(p); jax.block_until_ready(out)
-                                out = fn(p); jax.block_until_ready(out)
+                                curl_penalty_fn=curl_penalty_fn,
+                                gt_lookup=(_gt_cache if _using_lazy_gt_cache else None))
+                            _warm_up(fns_g, batches_g)
                             all_group_fns.append(fns_g)
 
                         # Build boolean masks for gradient assembly: mask[k][i] is True
@@ -1588,12 +1769,9 @@ def main():
                             adc_cutoff=args.sobolev_loss_cutoff,
                             active_planes=active_planes,
                             return_per_vol_loss=log_track_losses_wandb and efield_present,
-                            curl_penalty_fn=curl_penalty_fn)
-                        for fn in fns:
-                            out = fn(p)
-                            jax.block_until_ready(out)
-                            out = fn(p)
-                            jax.block_until_ready(out)
+                            curl_penalty_fn=curl_penalty_fn,
+                            gt_lookup=(_gt_cache if _using_lazy_gt_cache else None))
+                        _warm_up(fns, batches)
 
                     print(f'  done ({time.time() - t0:.1f} s) — {len(fns)} batches',
                           flush=True)

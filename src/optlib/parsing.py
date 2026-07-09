@@ -67,9 +67,36 @@ def parse_args(doc=None):
     p.add_argument('--N-random-tracks', type=int, default=0, metavar='N',
                    help='If > 0, ignore --tracks and generate N random near-cathode tracks '
                         'via generate_random_nice_tracks: y/z-face entries with |x| < 1000 mm, '
-                        'polar angle from x-axis in [30°, 150°], T ~ U[100, 1000] MeV.')
+                        'polar angle from x-axis in [30°, 150°], T ~ U[100, 1000] MeV by '
+                        'default (see --track-energy-range-mev).')
     p.add_argument('--tracks-random-seed', type=int, default=7, metavar='SEED',
                    help='RNG seed for --N-random-tracks (default: 7).')
+    p.add_argument('--track-energy-range-mev', type=float, nargs=2, default=[100.0, 1000.0],
+                   metavar=('MIN', 'MAX'),
+                   help='Kinetic-energy sampling bounds (MeV) for --N-random-tracks '
+                        '(generate_random_nice_tracks). Default: 100 1000.')
+    p.add_argument('--track-shard', type=int, nargs=2, default=None, metavar=('START', 'END'),
+                   help='Restrict --N-random-tracks to track_specs[START:END] (global indices '
+                        'into the full N-track ensemble). Used to split GT-signal precompute '
+                        'across parallel jobs; has no effect on --tracks.')
+    p.add_argument('--gt-cache-save', default=None, metavar='PATH.h5',
+                   help='After computing clean GT signals for the active track_specs '
+                        '(see --track-shard), save them to this h5 file (see optlib.gt_signals).')
+    p.add_argument('--gt-cache-no-compress', action='store_true',
+                   help='Store --gt-cache-save datasets uncompressed (raw float32) instead of '
+                        'gzip level 4. The cached signal has real noise baked in everywhere so '
+                        'gzip barely shrinks it (~16%% smaller on a real shard) while still '
+                        'costing real decompression time on every read (~46%% of cold-read '
+                        'wall-clock, measured); uncompressed trades ~19%% more disk for removing '
+                        'that CPU cost entirely.')
+    p.add_argument('--gt-cache-load', nargs='+', default=None, metavar='PATH.h5',
+                   help='Load clean GT signals from one or more h5 files (accepts glob '
+                        'patterns) instead of recomputing generate_muon_track/build_deposit_data/'
+                        'forward for the active track_specs. All track names must be present '
+                        'across the given file(s).')
+    p.add_argument('--exit-after-gt-cache', action='store_true',
+                   help='Exit immediately after the GT-signal computation/caching step, '
+                        'skipping training entirely. Used by GT precompute jobs.')
     p.add_argument('--loss', default='sobolev_loss_geomean_log1p', choices=VALID_LOSSES,
                    help='Loss function (default: sobolev_loss_geomean_log1p)')
     p.add_argument('--optimizer', default='adam', choices=VALID_OPTIMIZERS,

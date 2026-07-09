@@ -41,6 +41,7 @@ sys.path.insert(0, str(_ROOT))
 # ── Sweep parameter extraction (shared with plot_efield_eval.py) ──────────────
 
 _PARAM_PATTERNS = [
+    ('sweep',    r'/efield_calib/([^/]+)/'),
     ('sce_map',  r'/sce_maps_([^/]+)/'),
     ('arch',     r'[/_]arch([\dx]+)[/_]'),
     ('n_tracks', r'[/_](\d+)tracks[/_]'),
@@ -52,10 +53,12 @@ _PARAM_PATTERNS = [
     ('noise',    r'[/_]noise([\d.]+)[/_]'),
     ('steps',    r'_s(\d{4,})_'),
     ('lr',       r'_lr([\d.e+-]+)_'),
+    ('t_range',  r'[/_]ke([\d.]+-[\d.]+)[/_]'),
     ('seed',     r'/result_(\w+?)\.pkl$'),
 ]
 
 _PARAM_LABELS = {
+    'sweep':    'Sweep',
     'sce_map':  'SCE map',
     'arch':     'Architecture',
     'n_tracks': 'N tracks',
@@ -67,8 +70,15 @@ _PARAM_LABELS = {
     'noise':    'Noise',
     'steps':    'Steps',
     'lr':       'LR',
+    't_range':  'T range (MeV)',
     'seed':     'Seed',
 }
+
+# Default kinetic-energy range for sweeps that don't encode it in their path
+# (e.g. conservative_curl_sweep, predating the ke{lo}-{hi} directory convention
+# used by 100_tracks_sweep/1k_tracks_sweep) — matches run_optimization.py's
+# --track-energy-range-mev default.
+_DEFAULT_T_RANGE = '100-1000'
 
 
 def _parse_path_params(pkl_path):
@@ -78,6 +88,7 @@ def _parse_path_params(pkl_path):
         m = re.search(pat, s)
         if m:
             params[key] = m.group(1)
+    params.setdefault('t_range', _DEFAULT_T_RANGE)
     return params
 
 
@@ -129,10 +140,11 @@ def _fetch_wandb_losses(run_id, project='jaxtpc-optimization', samples=500):
             vals = [_safe(row.get(k)) for row in rows]
             return vals if any(v is not None for v in vals) else None
         return {
-            'steps':   [int(row.get('_step', i)) for i, row in enumerate(rows)],
-            'total':   _col('loss'),
-            'sobolev': _col('loss/sobolev'),
-            'rotor':   _col('loss/rotor_unweighted'),
+            'steps':    [int(row.get('_step', i)) for i, row in enumerate(rows)],
+            'total':    _col('loss'),
+            'sobolev':  _col('loss/sobolev'),
+            'rotor':    _col('loss/rotor_unweighted'),
+            'wandb_url': f"https://wandb.ai/{run.entity}/{run.project}/runs/{run_id}",
         }
     except Exception as exc:
         print(f"  [wandb] {run_id}: {exc}")
@@ -189,6 +201,7 @@ def load_losses(pkl_path, wandb_project='jaxtpc-optimization',
         'label':      label,
         'params':     params,
         'wandb_id':   run_id,
+        'wandb_url':  losses.get('wandb_url'),
         'steps':      losses['steps'],
         'total':      losses['total'],
         'sobolev':    losses['sobolev'],
@@ -221,6 +234,8 @@ body { font-family: system-ui, sans-serif; margin: 0; background: #f0f0f0;
 .run-list { flex: 1 1 auto; overflow-y: auto; min-height: 80px; }
 .run-item { display: flex; align-items: flex-start; gap: 6px; padding: 3px 0;
             font-size: 11px; line-height: 1.3; border-bottom: 1px solid #f0f0f0; }
+.run-item.pinned { background: #fffbe6; border-left: 3px solid #f5a623;
+                   padding-left: 4px; margin-bottom: 1px; }
 .run-item input { margin-top: 2px; flex-shrink: 0; }
 .run-color { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; margin-top: 3px; }
 .run-label { color: #333; word-break: break-all; flex: 1 1 auto; }
@@ -249,22 +264,30 @@ button.active { background: #dde8ff; border-color: #99b; }
   <div class="btn-row">
     <button onclick="selectAll()">All</button>
     <button onclick="selectNone()">None</button>
-    <button id="log-btn" onclick="toggleLog()">Log scale</button>
   </div>
   <div class="run-list" id="run-list"></div>
 </div>
 <div class="main">
   <div id="no-data" style="display:none">No runs selected.</div>
   <div class="chart-panel">
-    <div class="section-title">Total loss</div>
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+      <div class="section-title">Total loss</div>
+      <button id="log-btn-total" onclick="toggleLog('total')">Log</button>
+    </div>
     <div id="plot-total"></div>
   </div>
   <div class="chart-panel">
-    <div class="section-title">Sobolev loss</div>
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+      <div class="section-title">Sobolev loss</div>
+      <button id="log-btn-sobolev" onclick="toggleLog('sobolev')">Log</button>
+    </div>
     <div id="plot-sobolev"></div>
   </div>
   <div class="chart-panel">
-    <div class="section-title">E-field curl (rotor) loss — unweighted</div>
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+      <div class="section-title">E-field curl (rotor) loss — unweighted</div>
+      <button id="log-btn-rotor" onclick="toggleLog('rotor')">Log</button>
+    </div>
     <div id="plot-rotor"></div>
   </div>
 </div>
@@ -284,13 +307,14 @@ const PALETTE = [
 function color(i) { return PALETTE[i % PALETTE.length]; }
 
 // ── state ─────────────────────────────────────────────────────────────────────
-let logScale  = false;
+const LOG_KEYS = ['total', 'sobolev', 'rotor'];
+let logScale  = {total: false, sobolev: false, rotor: false};
 let selected  = new Set();  // indices into ALL_DATA
 
 // ── URL state ─────────────────────────────────────────────────────────────────
 function _pushState() {
   const p = new URLSearchParams();
-  if (logScale) p.set('log', '1');
+  for (const k of LOG_KEYS) { if (logScale[k]) p.set('log_' + k, '1'); }
   p.set('sel', [...selected].join(','));
   for (const k of PARAM_KEYS) {
     const el = document.getElementById('f_' + k);
@@ -300,8 +324,12 @@ function _pushState() {
 }
 function _loadState() {
   const p = new URLSearchParams(location.search);
-  logScale = p.get('log') === '1';
-  if (logScale) document.getElementById('log-btn').classList.add('active');
+  // legacy: old ?log=1 sets all three
+  const legacyAll = p.get('log') === '1';
+  for (const k of LOG_KEYS) {
+    logScale[k] = legacyAll || p.get('log_' + k) === '1';
+    if (logScale[k]) document.getElementById('log-btn-' + k).classList.add('active');
+  }
   const selStr = p.get('sel');
   if (selStr) selStr.split(',').map(Number).forEach(i => selected.add(i));
   return p;
@@ -347,34 +375,41 @@ function _filteredIndices() {
 }
 
 function filterRuns() {
-  const visible = new Set(_filteredIndices());
-  // keep selected only within visible set
-  for (const i of [...selected]) {
-    if (!visible.has(i)) selected.delete(i);
-  }
-  _buildRunList(visible);
+  const filtered = new Set(_filteredIndices());
+  // keep checked runs pinned (visible + in plots) even if they don't match the new filter
+  const visible = new Set([...filtered, ...selected]);
+  _buildRunList(visible, filtered);
   _render();
   _pushState();
 }
 
 // ── run list ──────────────────────────────────────────────────────────────────
-function _buildRunList(visible) {
+function _buildRunList(visible, filtered) {
+  if (filtered === undefined) filtered = visible;
   const container = document.getElementById('run-list');
   container.innerHTML = '';
-  for (const i of visible) {
+  // pinned (checked but outside current filter) shown first
+  const pinned = [...selected].filter(i => visible.has(i) && !filtered.has(i));
+  const rest   = [...visible].filter(i => !pinned.includes(i));
+  for (const i of [...pinned, ...rest]) {
     const r = ALL_DATA[i];
     const checked = selected.has(i) ? 'checked' : '';
+    const isPinned = pinned.includes(i);
     const linkUrl = _companionUrl(r);
     const linkHtml = linkUrl
       ? `<a class="run-link" href="${linkUrl}" target="_blank" title="Open in E-field viewer">E-field ↗</a>`
       : '';
+    const wbHtml = r.wandb_url
+      ? `<a class="run-link" href="${r.wandb_url}" target="_blank" title="Open run in W&B"
+            style="background:#fff8f0;border-color:#fca;color:#a55">W&B ↗</a>`
+      : '';
     const div = document.createElement('div');
-    div.className = 'run-item';
+    div.className = 'run-item' + (isPinned ? ' pinned' : '');
     div.innerHTML = `
       <input type="checkbox" id="cb_${i}" ${checked} onchange="toggleRun(${i})">
       <div class="run-color" style="background:${color(i)}"></div>
       <label for="cb_${i}" class="run-label">${r.label}</label>
-      ${linkHtml}`;
+      ${linkHtml}${wbHtml}`;
     container.appendChild(div);
   }
 }
@@ -387,20 +422,23 @@ function toggleRun(i) {
 }
 
 function selectAll() {
-  _filteredIndices().forEach(i => selected.add(i));
-  _buildRunList(new Set(_filteredIndices()));
+  const filtered = new Set(_filteredIndices());
+  filtered.forEach(i => selected.add(i));
+  const visible = new Set([...filtered, ...selected]);
+  _buildRunList(visible, filtered);
   _render();
   _pushState();
 }
 function selectNone() {
   selected.clear();
-  _buildRunList(new Set(_filteredIndices()));
+  const filtered = new Set(_filteredIndices());
+  _buildRunList(filtered, filtered);
   _render();
   _pushState();
 }
-function toggleLog() {
-  logScale = !logScale;
-  document.getElementById('log-btn').classList.toggle('active', logScale);
+function toggleLog(key) {
+  logScale[key] = !logScale[key];
+  document.getElementById('log-btn-' + key).classList.toggle('active', logScale[key]);
   _render();
   _pushState();
 }
@@ -436,13 +474,13 @@ function _traces(key) {
   return traces;
 }
 
-function _layout(yLabel) {
+function _layout(yLabel, key) {
   return {
     ...LAYOUT_BASE,
     yaxis: {
       ...LAYOUT_BASE.yaxis,
       title: {text: yLabel, font:{size:11}},
-      type: logScale ? 'log' : 'linear',
+      type: logScale[key] ? 'log' : 'linear',
     },
   };
 }
@@ -458,7 +496,7 @@ function _render() {
   ];
   for (const {id, key, ylabel} of plots) {
     const traces = _traces(key);
-    Plotly.react(id, traces, _layout(ylabel), PLOTLY_CFG);
+    Plotly.react(id, traces, _layout(ylabel, key), PLOTLY_CFG);
   }
 }
 
@@ -472,12 +510,13 @@ function _render() {
   const urlP = _loadState();
   _buildFilterDropdowns(urlP);
 
-  const visible = new Set(_filteredIndices());
+  const filtered = new Set(_filteredIndices());
   // if no selection saved, select first run
-  if (selected.size === 0 && visible.size > 0) {
-    selected.add([...visible][0]);
+  if (selected.size === 0 && filtered.size > 0) {
+    selected.add([...filtered][0]);
   }
-  _buildRunList(visible);
+  const visible = new Set([...filtered, ...selected]);
+  _buildRunList(visible, filtered);
   _render();
 })();
 </script>
@@ -521,7 +560,8 @@ def main():
             first_dir = args.results_dir
         pkls += sorted(glob.glob(
             os.path.join(args.results_dir, '**', 'result_*.pkl'), recursive=True))
-    pkls = [p for p in pkls if not p.endswith('_efield_eval.pkl')]
+    pkls = [p for p in pkls
+            if not p.endswith('_efield_eval.pkl') and not p.endswith('_wireplanes.pkl')]
     pkls = list(dict.fromkeys(pkls))  # deduplicate, preserve order
 
     if not pkls:

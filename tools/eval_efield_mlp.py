@@ -203,8 +203,11 @@ def process_pkl(pkl_path, overwrite=False, last_only=False):
     out_path = pkl_path.parent / (pkl_path.stem + '_efield_eval.pkl')
 
     if out_path.exists() and not overwrite:
-        print(f'  [skip] {out_path.name} already exists')
-        return
+        if out_path.stat().st_mtime >= pkl_path.stat().st_mtime:
+            print(f'  [skip] {out_path.name} already exists (up to date)')
+            return
+        print(f'  [stale] {pkl_path.name} changed since {out_path.name} was '
+              f'written; re-evaluating')
 
     with open(pkl_path, 'rb') as f:
         result = pickle.load(f)
@@ -371,7 +374,8 @@ def main():
     if args.results_dir:
         pkls += sorted(glob.glob(
             os.path.join(args.results_dir, '**', 'result_*.pkl'), recursive=True))
-    pkls = [p for p in pkls if not p.endswith('_efield_eval.pkl')]
+    pkls = [p for p in pkls
+            if not p.endswith('_efield_eval.pkl') and not p.endswith('_wireplanes.pkl')]
 
     if not pkls:
         print('No PKLs found.')
